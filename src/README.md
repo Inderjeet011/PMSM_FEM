@@ -6,10 +6,10 @@ This directory contains the Python source code for the Permanent Magnet Synchron
 
 ```
 src/
-├── pm_motor_mesh_generator.py   # Step 1: Generate motor geometry mesh
-├── mesh_viewer.py                # Step 2: Visualize and analyze mesh
-├── maxwell_solver_2d.py          # Step 3: Run FEM simulation
-└── airgap_field_extractor.py    # Step 4: Extract airgap magnetic field
+├── pm_mesh_generator_2d.py      # Step 1: Generate motor geometry mesh
+├── mesh_viewer.py               # Step 2: Visualize and analyze mesh
+├── solver_2d.py                 # Step 3: Run FEM simulation
+└── airgap_field_extractor.py   # Step 4: Extract airgap magnetic field
 ```
 
 ## Usage
@@ -23,7 +23,7 @@ All scripts should be run **from within the `src/` directory**. They will automa
 #### 1. Generate the Motor Mesh
 ```bash
 cd src
-python3 pm_motor_mesh_generator.py
+python3 pm_mesh_generator_2d.py
 ```
 **Output:** `../motor.msh` (mesh file in root directory)
 
@@ -33,11 +33,10 @@ python3 mesh_viewer.py
 ```
 **Output:** 
 - `../results/motor_mesh_visualization.png`
-- `../results/motor_mesh_quality.png`
 
 #### 3. Run the FEM Solver
 ```bash
-python3 maxwell_solver_2d.py
+python3 solver_2d.py
 ```
 **Output:**
 - `../results/results_2d_mixed.h5`

@@ -2,7 +2,7 @@
 """
 Motor Mesh Viewer
 =================
-Visualize and analyze PM motor mesh created by pm_motor_mesh_generator.py
+Visualize and analyze PM motor mesh created by pm_mesh_generator_2d.py
 
 Features:
 - Domain color visualization
