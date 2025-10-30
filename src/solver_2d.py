@@ -38,10 +38,10 @@ class SimulationConfig:
     
     # Electrical parameters
     frequency = 50.0  # Hz
-    J_peak = 1413810.0970277672  # A/m² (peak current density)
+    J_peak = 3000000.0  # A/m² (peak current density) - INCREASED from 1.4 MA/m²
     
     # PM parameters
-    B_rem = 1.05  # Tesla (remanent flux density)
+    B_rem = 1.4  # Tesla (remanent flux density) - INCREASED from 1.05 T
     
     # Time stepping
     dt = 0.002  # 2 ms timestep
@@ -163,10 +163,10 @@ class MaxwellSolver2D:
             self.tags.OUTER_AIR: 1/mu0,
             self.tags.AIRGAP_INNER: 1/mu0,
             self.tags.AIRGAP_OUTER: 1/mu0,
-            self.tags.ROTOR: 1/(mu0*100),  # High permeability
+            self.tags.ROTOR: 1/(mu0*1000),  # High permeability - INCREASED from 100
             self.tags.PM_N: 1/(mu0*1.05),
             self.tags.PM_S: 1/(mu0*1.05),
-            self.tags.STATOR: 1/(mu0*100),  # High permeability
+            self.tags.STATOR: 1/(mu0*1000),  # High permeability - INCREASED from 100
             self.tags.COIL_AP: 1/(mu0*0.999991),
             self.tags.COIL_AM: 1/(mu0*0.999991),
             self.tags.COIL_BP: 1/(mu0*0.999991),
@@ -379,10 +379,10 @@ class MaxwellSolver2D:
         for coil in Omega_coils:
             L += self.J_z * v * self.dx(coil)
         
-        # PM source term
+        # PM source term (FIXED: removed incorrect dt factor)
         curl_v = ufl.as_vector((v.dx(1), -v.dx(0)))
         M_vec = ufl.as_vector((self.M_x, self.M_y))
-        L += -(dt * mu0/self.nu) * ufl.inner(M_vec, curl_v) * dxc(Omega_pm)
+        L += -(mu0/self.nu) * ufl.inner(M_vec, curl_v) * dxc(Omega_pm)
         
         # V-equation RHS (motional term)
         vXB_prev = omega * (y*ufl.grad(Az_prev)[0] - x*ufl.grad(Az_prev)[1])
