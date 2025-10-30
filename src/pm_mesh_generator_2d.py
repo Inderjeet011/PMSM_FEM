@@ -2,19 +2,19 @@
 """
 Permanent Magnet Motor Mesh Generator
 =====================================
-Professional mesh generation for PM motor using TEAM 30 techniques:
 - Area-based domain classification
 - Air gap splitting for robust meshing
 - Fragment-based conforming mesh
 - Distance field refinement
-
-Author: Generated for FEniCS simulation
 """
 
 import gmsh
 import math
 import numpy as np
 from mpi4py import MPI
+
+
+
 
 
 # ============================================================================
@@ -59,6 +59,9 @@ class DomainMarkers:
     STATOR = 7
     COIL_BASE = 8  # Coils: 8, 9, 10, 11, 12, 13
     EXTERIOR = 100  # Outer boundary for BC
+
+
+
 
 
 # ============================================================================
@@ -561,6 +564,10 @@ class PMMotorMeshGenerator:
         print("   - Fragment-based conforming mesh")
         print("   - Distance field refinement")
         print("=" * 70)
+
+
+
+
 
 
 # ============================================================================
