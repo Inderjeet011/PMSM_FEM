@@ -13,6 +13,13 @@ __pycache__/
 # Mesh files (can be large)
 *.msh
 
+# Exclude directories
+latest_fem/
+team_30/
+
+# Exclude specific files
+motor_mesh_quality.png
+
 # Virtual environment
 venv/
 env/
