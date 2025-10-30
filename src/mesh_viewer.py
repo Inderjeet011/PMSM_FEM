@@ -57,7 +57,7 @@ DOMAIN_COLORS = {
 class MotorMeshViewer:
     """Interactive motor mesh viewer and analyzer"""
     
-    def __init__(self, mesh_file="motor.msh"):
+    def __init__(self, mesh_file="../motor.msh"):
         self.mesh_file = mesh_file
         self.node_coords = None
         self.element_types = None
@@ -281,8 +281,10 @@ class MotorMeshViewer:
         ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig('motor_mesh_quality.png', dpi=150, bbox_inches='tight')
-        print("   ✅ Saved: motor_mesh_quality.png")
+        import os
+        os.makedirs('../results', exist_ok=True)
+        plt.savefig('../results/motor_mesh_quality.png', dpi=150, bbox_inches='tight')
+        print("   ✅ Saved: ../results/motor_mesh_quality.png")
         
     def visualize(self):
         """Create all visualizations"""
@@ -296,8 +298,8 @@ class MotorMeshViewer:
         self.plot_node_density(axes[2])
         
         plt.tight_layout()
-        plt.savefig('motor_mesh_visualization.png', dpi=150, bbox_inches='tight')
-        print("   ✅ Saved: motor_mesh_visualization.png")
+        plt.savefig('../results/motor_mesh_visualization.png', dpi=150, bbox_inches='tight')
+        print("   ✅ Saved: ../results/motor_mesh_visualization.png")
         
         # Quality distribution plot
         self.plot_quality_distribution()
@@ -316,7 +318,7 @@ class MotorMeshViewer:
         print(" ✅ VISUALIZATION COMPLETE")
         print("=" * 70)
         print("\n💡 Options:")
-        print("   1. View saved images:")
+        print("   1. View saved images in results/ folder:")
         print("      - motor_mesh_visualization.png")
         print("      - motor_mesh_quality.png")
         print("   2. Launch interactive Gmsh GUI: add 'gmsh.fltk.run()' before finalize")
@@ -328,6 +330,6 @@ class MotorMeshViewer:
 # ============================================================================
 
 if __name__ == "__main__":
-    viewer = MotorMeshViewer(mesh_file="motor.msh")
+    viewer = MotorMeshViewer(mesh_file="../motor.msh")
     viewer.run()
 

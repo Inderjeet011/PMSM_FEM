@@ -507,7 +507,7 @@ class PMMotorMeshGenerator:
         print(f"   ✅ Air gap: Uniform fine mesh ({res*0.3*1000:.2f} mm)")
         print(f"   ✅ PM boundaries: Extra fine ({res*0.25*1000:.2f} mm)")
     
-    def generate_mesh(self, output_file="motor.msh"):
+    def generate_mesh(self, output_file="../motor.msh"):
         """Main mesh generation workflow"""
         self.print_info()
         
@@ -569,5 +569,5 @@ class PMMotorMeshGenerator:
 
 if __name__ == "__main__":
     generator = PMMotorMeshGenerator()
-    generator.generate_mesh(output_file="motor.msh")
+    generator.generate_mesh(output_file="../motor.msh")
 

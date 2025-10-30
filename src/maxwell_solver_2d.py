@@ -438,7 +438,7 @@ class MaxwellSolver2D:
                 self.M_x.x.array[c] = sign * self.config.M_rem * np.cos(theta_now)
                 self.M_y.x.array[c] = sign * self.config.M_rem * np.sin(theta_now)
     
-    def solve(self, output_file="results_2d_mixed.xdmf"):
+    def solve(self, output_file="../results/results_2d_mixed.xdmf"):
         """Main time-stepping solver"""
         print("\n⏱️  Starting time-stepping simulation...")
         
@@ -447,7 +447,9 @@ class MaxwellSolver2D:
         print(f"   Duration: {self.config.T_end*1000:.1f} ms")
         print()
         
-        # Output file
+        # Output file - create results directory if it doesn't exist
+        import os
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
         out = io.XDMFFile(self.mesh.comm, output_file, "w")
         out.write_mesh(self.mesh)
         
@@ -521,6 +523,6 @@ class MaxwellSolver2D:
 # ============================================================================
 
 if __name__ == "__main__":
-    solver = MaxwellSolver2D(mesh_file="motor.msh")
+    solver = MaxwellSolver2D(mesh_file="../motor.msh")
     solver.run()
 

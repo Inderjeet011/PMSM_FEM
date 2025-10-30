@@ -25,9 +25,9 @@ import ufl
 
 class Config:
     """Configuration for field extraction"""
-    MESH_FILE = "motor.msh"
-    RESULTS_FILE = "results_2d_mixed.h5"
-    OUTPUT_FILE = "airgap_B_only.xdmf"
+    MESH_FILE = "../motor.msh"
+    RESULTS_FILE = "../results/results_2d_mixed.h5"
+    OUTPUT_FILE = "../results/airgap_B_only.xdmf"
     
     # Domain tags
     AIRGAP_INNER = 5
