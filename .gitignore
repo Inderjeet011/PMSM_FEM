@@ -13,6 +13,12 @@ __pycache__/
 # Mesh files (can be large)
 *.msh
 
+# Results directory - ignore large data files but keep structure
+results/*.h5
+results/*.xdmf
+results/*.msh
+!results/.gitkeep
+
 # Exclude directories
 latest_fem/
 team_30/
