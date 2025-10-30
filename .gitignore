@@ -1,0 +1,35 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# FEniCS output files (large data files)
+*.h5
+*.xdmf
+
+# Mesh files (can be large)
+*.msh
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+
