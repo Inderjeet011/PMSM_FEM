@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Motor Mesh Viewer and Quality Inspector
-========================================
+Motor Mesh Viewer
+=================
 Visualize and analyze PM motor mesh created by pm_motor_mesh_generator.py
 
 Features:
 - Domain color visualization
 - Mesh structure display
 - Node density plots
-- Quality analysis and statistics
 """
 
 import gmsh
@@ -301,15 +300,11 @@ class MotorMeshViewer:
         plt.savefig('../results/motor_mesh_visualization.png', dpi=150, bbox_inches='tight')
         print("   ✅ Saved: ../results/motor_mesh_visualization.png")
         
-        # Quality distribution plot
-        self.plot_quality_distribution()
-        
     def run(self):
         """Execute full analysis"""
         self.load_mesh()
         self.get_statistics()
         self.get_physical_groups()
-        self.analyze_quality()
         self.visualize()
         
         gmsh.finalize()
@@ -318,9 +313,7 @@ class MotorMeshViewer:
         print(" ✅ VISUALIZATION COMPLETE")
         print("=" * 70)
         print("\n💡 Options:")
-        print("   1. View saved images in results/ folder:")
-        print("      - motor_mesh_visualization.png")
-        print("      - motor_mesh_quality.png")
+        print("   1. View saved image: ../results/motor_mesh_visualization.png")
         print("   2. Launch interactive Gmsh GUI: add 'gmsh.fltk.run()' before finalize")
         print("   3. Mesh is ready for FEniCS simulation!")
 
