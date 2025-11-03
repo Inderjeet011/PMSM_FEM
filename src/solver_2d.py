@@ -37,15 +37,15 @@ class SimulationConfig:
     n_poles = 8  # 2 * pole_pairs * 2 (N-S alternating)
     
     # Electrical parameters
-    frequency = 50.0  # Hz
-    J_peak = 3000000.0  # A/m² (peak current density) - INCREASED from 1.4 MA/m²
+    frequency = 50  # Hz (set 0 for static PM validation)
+    J_peak = 7.07e6  # A/m² (peak current density) ≈ 5 A/mm² RMS
     
     # PM parameters
-    B_rem = 1.4  # Tesla (remanent flux density) - INCREASED from 1.05 T
+    B_rem = 1.4 # Tesla (remanent flux density) - INCREASED from 1.05 T
     
     # Time stepping
     dt = 0.002  # 2 ms timestep
-    T_end = 0.04  # 2 electrical periods at 50 Hz
+    T_end = 0.002  # single step for static validation
     
     # Material properties
     mu0 = 4e-7 * np.pi
@@ -164,8 +164,8 @@ class MaxwellSolver2D:
             self.tags.AIRGAP_INNER: 1/mu0,
             self.tags.AIRGAP_OUTER: 1/mu0,
             self.tags.ROTOR: 1/(mu0*1000),  # High permeability - INCREASED from 100
-            self.tags.PM_N: 1/(mu0*1.05),
-            self.tags.PM_S: 1/(mu0*1.05),
+            self.tags.PM_N: 1/mu0,
+            self.tags.PM_S: 1/mu0,
             self.tags.STATOR: 1/(mu0*1000),  # High permeability - INCREASED from 100
             self.tags.COIL_AP: 1/(mu0*0.999991),
             self.tags.COIL_AM: 1/(mu0*0.999991),
@@ -379,10 +379,10 @@ class MaxwellSolver2D:
         for coil in Omega_coils:
             L += self.J_z * v * self.dx(coil)
         
-        # PM source term (FIXED: removed incorrect dt factor)
+        # PM source term: -∫ M · curl(v) dΩ over PM regions
         curl_v = ufl.as_vector((v.dx(1), -v.dx(0)))
         M_vec = ufl.as_vector((self.M_x, self.M_y))
-        L += -(mu0/self.nu) * ufl.inner(M_vec, curl_v) * dxc(Omega_pm)
+        L += -ufl.inner(M_vec, curl_v) * dxc(Omega_pm)
         
         # V-equation RHS (motional term)
         vXB_prev = omega * (y*ufl.grad(Az_prev)[0] - x*ufl.grad(Az_prev)[1])
@@ -452,6 +452,12 @@ class MaxwellSolver2D:
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         out = io.XDMFFile(self.mesh.comm, output_file, "w")
         out.write_mesh(self.mesh)
+        # Write cell tags if available (needed for post-processing like torque)
+        if self.ct is not None:
+            try:
+                out.write_meshtags(self.ct)
+            except Exception:
+                pass
         
         # PETSc options for solver
         petsc_options = {
@@ -494,6 +500,36 @@ class MaxwellSolver2D:
             # Progress
             norm_Az = np.linalg.norm(Az_sol.x.array)
             print(f"   Step {step:3d}/{num_steps}  t={t*1e3:5.2f} ms  ||Az||={norm_Az:.2e}")
+            # Report final-step average magnetic flux density magnitude (B_rms)
+            if step == num_steps:
+                Bx = ufl.grad(Az_sol)[1]
+                By = -ufl.grad(Az_sol)[0]
+                b2 = Bx*Bx + By*By
+                # Whole-domain RMS (diagnostic)
+                area_all = fem.assemble_scalar(fem.form(1.0 * ufl.dx(domain=self.mesh)))
+                val_all = fem.assemble_scalar(fem.form(b2 * ufl.dx(domain=self.mesh)))
+                Brms_all = float(np.sqrt(val_all / max(area_all, 1e-18)))
+                # Air-gap-only RMS
+                import math as _math
+                def _cell_r(c: int) -> float:
+                    g = self.mesh.geometry.dofmap[c]
+                    cx = float(np.mean(self.mesh.geometry.x[g, 0]))
+                    cy = float(np.mean(self.mesh.geometry.x[g, 1]))
+                    return _math.hypot(cx, cy)
+                pm_cells = np.concatenate([self.ct.find(self.tags.PM_N), self.ct.find(self.tags.PM_S)])
+                stator_cells = self.ct.find(self.tags.STATOR)
+                if pm_cells.size and stator_cells.size:
+                    rin = max(_cell_r(int(c)) for c in pm_cells)
+                    rout = min(_cell_r(int(c)) for c in stator_cells)
+                else:
+                    rin, rout = 0.0, 1.0
+                xcoord = ufl.SpatialCoordinate(self.mesh)
+                r = ufl.sqrt(xcoord[0]**2 + xcoord[1]**2)
+                mask = ufl.conditional(ufl.lt(r, rout), ufl.conditional(ufl.gt(r, rin), 1.0, 0.0), 0.0)
+                area_gap = fem.assemble_scalar(fem.form(mask * ufl.dx(domain=self.mesh)))
+                val_gap = fem.assemble_scalar(fem.form(b2 * mask * ufl.dx(domain=self.mesh)))
+                Brms_gap = float(np.sqrt(val_gap / max(area_gap, 1e-18)))
+                print(f"   Final B_rms (domain) ≈ {Brms_all:.3e} T, B_rms (air-gap) ≈ {Brms_gap:.3e} T")
         
         out.close()
         
