@@ -11,7 +11,6 @@ Formulation:
 - PM excitation via volume term
 - σ and ω terms only in rotating conductor (rotor)
 
-Author: Based on Abhinav's parameters and TEAM 30 techniques
 """
 
 from dolfinx import fem, io, mesh as dmesh
