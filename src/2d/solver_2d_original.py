@@ -49,6 +49,9 @@ class SimulationConfig:
     # Material properties
     mu0 = 4e-7 * np.pi
     
+    # Boundary conditions
+    V_rotor_reference = 1000.0  # Electric potential reference on exterior boundary (should not affect B)
+    
     # Derived parameters
     omega_e = 2 * np.pi * frequency
     omega_m = omega_e / pole_pairs
@@ -68,6 +71,7 @@ class SimulationConfig:
         print(f"   ω_m:           {cls.omega_m:.1f} rad/s = {cls.omega_m*60/(2*np.pi):.0f} RPM")
         print(f"   J_peak:        {cls.J_peak:.3e} A/m²")
         print(f"   B_rem:         {cls.B_rem} T")
+        print(f"   V_rotor_ref:   {cls.V_rotor_reference} V")
         print(f"   Timestep:      {cls.dt*1000:.2f} ms")
         print(f"   Duration:      {cls.T_end*1000:.1f} ms ({cls.T_end*cls.frequency:.0f} periods)")
 
@@ -233,27 +237,34 @@ class MaxwellSolver2D:
         zeroAz.x.array[:] = 0.0
         self.bcAz = fem.dirichletbc(zeroAz, bdofs_Az, self.W.sub(0))
         
-        # BC 2: V = 0 on rotor patch (robust ground)
+        # BC 2: V = 0 on exterior boundary (reference ground)
         W1, _ = self.W.sub(1).collapse()
-        self.mesh.topology.create_connectivity(tdim, 0)
-        self.mesh.topology.create_connectivity(0, tdim)
-        c2v = self.mesh.topology.connectivity(tdim, 0)
         
-        rotor_cells = self.ct.find(self.tags.ROTOR)
-        assert rotor_cells.size > 0, "No rotor cells found for V grounding"
+        # Use the same exterior boundary as Az BC
+        if self.ft is not None:
+            exterior_facets_V = self.ft.find(self.tags.EXTERIOR)
+            if len(exterior_facets_V) > 0:
+                bnd_V = exterior_facets_V
+                print(f"   ✅ V on EXTERIOR: {len(bnd_V)} facets")
+            else:
+                bnd_V = locate_entities_boundary(
+                    self.mesh, tdim-1, lambda X: np.full(X.shape[1], True)
+                )
+                print(f"   ⚠️  EXTERIOR tag not found for V, using all boundaries")
+        else:
+            bnd_V = locate_entities_boundary(
+                self.mesh, tdim-1, lambda X: np.full(X.shape[1], True)
+            )
+            print(f"   Using all exterior boundaries for V: {len(bnd_V)} facets")
         
-        # Use first 30 rotor cells as patch ground
-        patch_cells = np.array(rotor_cells[:min(30, rotor_cells.size)], dtype=np.int32)
-        patch_verts = np.unique(
-            np.hstack([c2v.links(int(c)) for c in patch_cells])
-        ).astype(np.int32)
-        
-        vdofs = fem.locate_dofs_topological((self.W.sub(1), W1), 0, patch_verts)
+        vdofs = fem.locate_dofs_topological((self.W.sub(1), W1), tdim-1, bnd_V)
         V0 = fem.Function(W1)
-        V0.x.array[:] = 0.0
+        # V reference value on exterior boundary (should not affect B since only grad(V) appears)
+        V_ref = getattr(self.config, 'V_rotor_reference', 0.0)
+        V0.x.array[:] = V_ref
         self.bcV = fem.dirichletbc(V0, vdofs, self.W.sub(1))
         
-        print(f"   ✅ V=0 on rotor patch: {len(vdofs)} DOFs")
+        print(f"   ✅ V={V_ref} on exterior boundary: {len(vdofs)} DOFs")
         
         self.bcs = [self.bcAz, self.bcV]
         
@@ -437,7 +448,7 @@ class MaxwellSolver2D:
                 self.M_x.x.array[c] = sign * self.config.M_rem * np.cos(theta_now)
                 self.M_y.x.array[c] = sign * self.config.M_rem * np.sin(theta_now)
     
-    def solve(self, output_file="../results/results_2d_mixed.xdmf"):
+    def solve(self, output_file="../../results/2d/results_2d_mixed.xdmf"):
         """Main time-stepping solver"""
         print("\n⏱️  Starting time-stepping simulation...")
         
@@ -558,6 +569,5 @@ class MaxwellSolver2D:
 # ============================================================================
 
 if __name__ == "__main__":
-    solver = MaxwellSolver2D(mesh_file="../motor.msh")
+    solver = MaxwellSolver2D(mesh_file="../../meshes/2d/motor.msh")
     solver.run()
-

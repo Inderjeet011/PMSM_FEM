@@ -5,19 +5,36 @@ __pycache__/
 *.pyd
 .Python
 *.so
+*.egg-info/
+dist/
+build/
 
 # FEniCS output files (large data files)
 *.h5
+*.hdf5
 *.xdmf
 
 # Mesh files (can be large)
 *.msh
 
-# Results directory - ignore large data files but keep structure
-results/*.h5
-results/*.xdmf
-results/*.msh
+# Results directory - ignore all output files
+results/**/*.h5
+results/**/*.hdf5
+results/**/*.xdmf
+results/**/*.msh
+results/**/*.png
+results/**/*.jpg
+results/**/*.pdf
+results/**/*.txt
 !results/.gitkeep
+!results/**/README.md
+!results/**/LICENSE
+
+# Meshes directory - ignore mesh files
+meshes/**/*.h5
+meshes/**/*.hdf5
+meshes/**/*.xdmf
+meshes/**/*.msh
 
 # Exclude directories
 latest_fem/
@@ -30,6 +47,7 @@ motor_mesh_quality.png
 venv/
 env/
 ENV/
+.venv/
 
 # IDE settings
 .vscode/
@@ -37,12 +55,37 @@ ENV/
 *.swp
 *.swo
 *~
+*.sublime-*
 
 # OS files
 .DS_Store
 Thumbs.db
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
 
 # Temporary files
 *.tmp
 *.log
+*.bak
+*.backup
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Documentation build
+docs/_build/
+docs/.doctrees/
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
 

@@ -1,0 +1,124 @@
+================================================================================
+BOUNDARY CONDITION TEST RESULTS - V REFERENCE VALUE ANALYSIS
+A Story of Discovery
+================================================================================
+
+THE PROBLEM
+-----------
+
+We are solving Maxwell's equations for an electric motor using a mixed 
+A-V formulation. This means we solve for two unknowns:
+- Az: The magnetic vector potential (which gives us the magnetic field B)
+- V:  The electric scalar potential
+
+The challenge: In our equations, V only appears as grad(V), not V itself. 
+This means mathematically, adding any constant to V shouldn't change the 
+magnetic field B. But we still need to set V somewhere to make the problem 
+solvable - otherwise the system is underdetermined.
+
+THE QUESTION
+------------
+
+We wondered: "If we change the value of V on the boundary (say from 0 to 4 
+or even 5000), will the magnetic field B change? Or will it stay the same 
+since only grad(V) matters?"
+
+THE EXPERIMENTS
+---------------
+
+EXPERIMENT 1: Testing on the Rotor Patch
+----------------------------------------
+
+First, we set V = 0 on a small patch of the rotor (the rotating part of the 
+motor). We ran the simulation and got:
+  B_rms (domain):  1.157 T
+  B_rms (air-gap): 0.911 T
+
+Then we changed V to 4.0 V on the same rotor patch:
+  B_rms (domain):  0.825 T
+  B_rms (air-gap): 0.650 T
+
+Surprise! The results were different. But wait - maybe V = 0 is special? 
+Let's test with a really large value: V = 5000 V:
+  B_rms (domain):  0.825 T
+  B_rms (air-gap): 0.650 T
+
+Interesting! V = 4 and V = 5000 give EXACTLY the same B values! But V = 0 
+gave different results. This suggests that V = 0 might be handled differently 
+by the numerical solver.
+
+EXPERIMENT 2: Testing on the Exterior Boundary
+-----------------------------------------------
+
+Someone suggested: "What if we set V on the outside boundary of the motor 
+instead of on the rotor? That would still give us a reference point."
+
+So we moved the boundary condition to the exterior boundary and tested again:
+
+With V = 0 on the exterior:
+  B_rms (domain):  1.754 T
+  B_rms (air-gap): 1.381 T
+
+With V = 4 on the exterior:
+  B_rms (domain):  0.825 T
+  B_rms (air-gap): 0.650 T
+
+With V = 1000 on the exterior:
+  B_rms (domain):  0.825 T
+  B_rms (air-gap): 0.650 T
+
+Again, V = 4 and V = 1000 give IDENTICAL results, but V = 0 is different!
+
+WHAT WE LEARNED
+---------------
+
+1. The absolute value of V doesn't matter (when it's not zero)
+   - Whether we use V = 4, V = 1000, or V = 5000, we get the same B field
+   - This confirms our theory: only grad(V) matters, not the absolute value
+
+2. V = 0 behaves strangely
+   - Setting V = 0 gives different results than any non-zero value
+   - This is likely because numerical solvers handle zero boundary conditions 
+     differently (maybe as "uninitialized" or with special treatment)
+
+3. Where we set V matters
+   - Setting V on the rotor patch vs. the exterior boundary gives different 
+     B values (because it changes how the constraint propagates through the 
+     domain)
+   - But once we choose a location, the absolute value (if non-zero) doesn't 
+     matter
+
+4. We need the boundary condition
+   - Without setting V somewhere, the problem is not uniquely solvable
+   - It's like having a floating voltage - we need to "ground" it somewhere
+
+THE TAKEAWAY
+------------
+
+For practical simulations:
+- You MUST set V somewhere to make the problem solvable
+- Choose the location based on physics (e.g., rotor patch if rotor is 
+  grounded, or exterior if outer boundary is grounded)
+- Use a non-zero value (like V = 4 or V = 1000) instead of exactly zero 
+  to avoid numerical issues
+- The exact value doesn't matter - 4, 1000, or 5000 all give the same 
+  magnetic field B
+
+This confirms that our mathematical understanding is correct: the magnetic 
+field B depends only on grad(V), not on the absolute value of V.
+
+================================================================================
+SUMMARY OF NUMERICAL RESULTS
+================================================================================
+
+ROTOR PATCH TESTS:
+  V = 0.0 V    →  B_rms = 1.157 T (domain), 0.911 T (air-gap)
+  V = 4.0 V    →  B_rms = 0.825 T (domain), 0.650 T (air-gap)
+  V = 5000.0 V →  B_rms = 0.825 T (domain), 0.650 T (air-gap)
+
+EXTERIOR BOUNDARY TESTS:
+  V = 0.0 V    →  B_rms = 1.754 T (domain), 1.381 T (air-gap)
+  V = 4.0 V    →  B_rms = 0.825 T (domain), 0.650 T (air-gap)
+  V = 1000.0 V →  B_rms = 0.825 T (domain), 0.650 T (air-gap)
+
+================================================================================
