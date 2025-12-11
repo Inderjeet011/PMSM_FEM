@@ -89,3 +89,15 @@ htmlcov/
 .dmypy.json
 dmypy.json
 
+# Helper scripts (debug, check, diagnose, verify, visualize)
+**/debug_*.py
+**/check_*.py
+**/diagnose_*.py
+**/verify_*.py
+**/visualize_*.py
+**/team_30_*.py
+**/*_test_results.txt
+**/debug_*.txt
+**/debug_summary.txt
+**/boundary_condition_test_results.txt
+

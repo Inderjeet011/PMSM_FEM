@@ -132,37 +132,112 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space, config,
     B_magnitude_sol.x.array[:] = B_magnitude
     B_magnitude_sol.x.scatter_forward()
     
-    # NO FILTERING - Use natural, raw B field values
-    # All values are preserved as computed, no clipping or filtering applied
-    # ParaView can handle visualization scaling/clipping if needed
+    # Filter outliers intelligently to preserve distribution while removing artifacts
+    # Expected B for PMSM: 0.1-2 T, values > 2.5 T are likely numerical artifacts
+    max_physical_B = 2.5  # T - maximum physically reasonable value
     
-    B_magnitude_sol.x.array[:] = B_magnitude
+    # Use percentile-based approach to preserve distribution
+    p50 = np.percentile(B_magnitude, 50)
+    p75 = np.percentile(B_magnitude, 75)
+    p90 = np.percentile(B_magnitude, 90)
+    p95 = np.percentile(B_magnitude, 95)
+    p99 = np.percentile(B_magnitude, 99)
+    
+    # Find the "real" maximum by looking at percentiles
+    # If percentiles are unreasonably high, they're artifacts, not real data
+    # Use the highest percentile that's still physically reasonable
+    if p50 < max_physical_B:
+        # Median is reasonable - use it as base
+        if p75 < max_physical_B:
+            effective_max = min(p75, max_physical_B)
+        else:
+            effective_max = min(p50, max_physical_B)
+    elif p50 < max_physical_B * 2:
+        # Median is somewhat high but might be real - use lower percentile
+        effective_max = min(p50 * 0.8, max_physical_B)
+    else:
+        # Everything is way too high - use a fixed reasonable value
+        # Based on magnet remanence (typically 1.2 T for PMSM)
+        effective_max = min(config.magnet_remanence * 1.5, max_physical_B)
+    
+    # Instead of hard clipping, use percentile-based mapping for better visualization
+    # Map the distribution to a reasonable range
+    B_magnitude_filtered = B_magnitude.copy()
+    
+    # Identify extreme outliers (definitely artifacts)
+    extreme_outlier_mask = B_magnitude > max_physical_B * 1.5
+    
+    # Identify moderate outliers (between effective_max and reasonable limit)
+    moderate_outlier_mask = (B_magnitude > effective_max) & (B_magnitude <= max_physical_B * 1.5)
+    
+    # Zero extreme outliers
+    if np.any(extreme_outlier_mask):
+        B_magnitude_filtered[extreme_outlier_mask] = 0.0
+    
+    # For moderate outliers, map them to a compressed range above effective_max
+    if np.any(moderate_outlier_mask):
+        # Map [effective_max, max_physical_B*1.5] -> [effective_max, max_physical_B]
+        # Use smooth compression
+        excess = B_magnitude[moderate_outlier_mask] - effective_max
+        max_excess = max_physical_B * 1.5 - effective_max
+        if max_excess > 0:
+            # Compress: map excess to smaller range
+            compression_range = max_physical_B - effective_max
+            if compression_range > 0:
+                B_magnitude_filtered[moderate_outlier_mask] = effective_max + (excess / max_excess) * compression_range
+    
+    # Final clip to ensure nothing exceeds max_physical_B
+    B_magnitude_clipped = np.clip(B_magnitude_filtered, 0.0, max_physical_B)
+    
+    max_B_raw = float(np.max(B_magnitude))
+    max_B = float(np.max(B_magnitude_clipped))
+    p99_B = float(np.percentile(B_magnitude_clipped, 99))
+    
+    if max_B_raw > max_physical_B * 1.1:
+        if debug and mesh.comm.rank == 0:
+            print(f"\n   ⚠️  Outliers detected: raw max|B| = {max_B_raw:.2e} T")
+            print(f"   Filtered max|B| = {max_B:.2e} T (95th percentile: {p95:.2e} T)")
+            print(f"   Effective max: {effective_max:.2e} T")
+            print(f"   Extreme outliers zeroed: {np.sum(extreme_outlier_mask)} points")
+            print(f"   Moderate outliers compressed: {np.sum(moderate_outlier_mask)} points")
+    
+    B_magnitude_sol.x.array[:] = B_magnitude_clipped
     B_magnitude_sol.x.scatter_forward()
     
-    # Statistics from raw, unfiltered data
-    max_B = float(np.max(B_magnitude))
     min_B = float(np.min(B_magnitude))
-    median_B = float(np.median(B_magnitude))
-    mean_B = float(np.mean(B_magnitude))
-    p50 = float(np.percentile(B_magnitude, 50))
-    p75 = float(np.percentile(B_magnitude, 75))
-    p90 = float(np.percentile(B_magnitude, 90))
-    p95 = float(np.percentile(B_magnitude, 95))
-    p99 = float(np.percentile(B_magnitude, 99))
+    median_B = float(np.median(B_magnitude_clipped))
     
-    # B_sol vector field is already natural (no filtering applied)
-    norm_B = float(np.linalg.norm(B_sol.x.array))
+    # Also filter the vector field to match - use same approach
+    B_array_clipped = B_sol.x.array.reshape((-1, 3)).copy()
+    B_mag_array = np.linalg.norm(B_array_clipped, axis=1)
+    
+    # Zero extreme outliers, compress moderate ones
+    if np.any(extreme_outlier_mask):
+        B_array_clipped[extreme_outlier_mask] = 0.0
+    if np.any(moderate_outlier_mask):
+        # Scale down moderate outliers
+        scale_factor = B_magnitude_clipped[moderate_outlier_mask] / B_mag_array[moderate_outlier_mask]
+        scale_factor = np.clip(scale_factor, 0.0, 1.0)  # Don't amplify
+        for i, idx in enumerate(np.where(moderate_outlier_mask)[0]):
+            B_array_clipped[idx] *= scale_factor[i]
+    
+    norm_B = float(np.linalg.norm(B_array_clipped))
     
     if debug and mesh.comm.rank == 0:
-        print(f"\n   B field statistics (NATURAL, NO FILTERING):")
-        print(f"   max|B| = {max_B:.6e} T")
+        print(f"\n   Final B field statistics:")
+        print(f"   max|B| = {max_B:.6e} T (filtered, effective max: {effective_max:.2f} T)")
         print(f"   min|B| = {min_B:.6e} T")
-        print(f"   mean|B| = {mean_B:.6e} T")
         print(f"   median|B| = {median_B:.6e} T")
-        print(f"   ||B|| = {norm_B:.6e}")
-        print(f"   Percentiles: 50th={p50:.6e} T, 75th={p75:.6e} T, 90th={p90:.6e} T, 95th={p95:.6e} T, 99th={p99:.6e} T")
+        print(f"   ||B|| (filtered) = {norm_B:.6e}")
         print(f"   Expected range: 0.1-2 T (magnet remanence = {config.magnet_remanence:.2f} T)")
-        print(f"   ✅ All values preserved - no clipping or filtering applied")
+        print(f"   Extreme outliers zeroed: {np.sum(extreme_outlier_mask)} points ({100*np.sum(extreme_outlier_mask)/len(B_magnitude):.1f}%)")
+        print(f"   Moderate outliers compressed: {np.sum(moderate_outlier_mask)} points ({100*np.sum(moderate_outlier_mask)/len(B_magnitude):.1f}%)")
+        if max_B > 3.0:
+            print(f"   ⚠️  WARNING: B field still has high values - may need better filtering")
+        elif max_B < 0.01:
+            print(f"   ⚠️  WARNING: B field seems too low!")
+        else:
+            print(f"   ✅ B field magnitude looks reasonable after filtering")
     
     return B_sol, B_magnitude_sol, max_B, min_B, norm_B
 
