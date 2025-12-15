@@ -47,7 +47,7 @@ class SimulationConfig3D:
         self.degree_V = 1
         self.coil_current_peak = model_parameters["J"]
         self.mu0 = model_parameters["mu_0"]
-        self.mesh_path = Path(__file__).parents[2] / "meshes" / "3d" / "pmesh3D_test1.xdmf"
+        self.mesh_path = Path(__file__).parents[2] / "meshes" / "3d" / "pmesh3D_ipm.xdmf"
         self.results_path = Path(__file__).parents[2] / "results" / "3d" / "av_solver.xdmf"
         self.diagnostics_path = Path(__file__).parents[2] / "results" / "3d" / "av_solver_diagnostics.csv"
         self.write_results = True
@@ -84,9 +84,25 @@ def load_mesh(mesh_path):
     
     with io.XDMFFile(MPI.COMM_WORLD, str(mesh_path), "r") as xdmf:
         mesh = xdmf.read_mesh()
-        cell_tags = xdmf.read_meshtags(mesh, name="Cell_markers")
+        # Try different possible names for cell tags
+        cell_tags = None
+        for name in ["Cell_markers", "mesh_tags"]:
+            try:
+                cell_tags = xdmf.read_meshtags(mesh, name=name)
+                break
+            except:
+                continue
+        
         mesh.topology.create_connectivity(mesh.topology.dim - 1, 0)
-        facet_tags = xdmf.read_meshtags(mesh, name="Facet_markers")
+        
+        # Try different possible names for facet tags
+        facet_tags = None
+        for name in ["Facet_markers", "facet_tags"]:
+            try:
+                facet_tags = xdmf.read_meshtags(mesh, name=name)
+                break
+            except:
+                continue
     
     if mesh.comm.rank == 0:
         print(f"Mesh loaded: {mesh.topology.index_map(mesh.topology.dim).size_global} cells")
@@ -208,7 +224,11 @@ def setup_materials(mesh, cell_tags, config):
 
 
 def setup_boundary_conditions(mesh, facet_tags, A_space, V_space):
-    """Setup boundary conditions."""
+    """Setup boundary conditions.
+    
+    For AMS compatibility, we use weak boundary conditions on A (penalty term)
+    and keep strong Dirichlet BC on V (scalar potential).
+    """
     tdim = mesh.topology.dim
     mesh.topology.create_connectivity(tdim - 1, tdim)
     
@@ -219,18 +239,18 @@ def setup_boundary_conditions(mesh, facet_tags, A_space, V_space):
             mesh, tdim - 1, lambda _x: np.full(_x.shape[1], True)
         )
     
-    zero_vector = fem.Function(A_space)
-    zero_vector.x.array[:] = 0.0
-    bdofs_A = fem.locate_dofs_topological(A_space, entity_dim=tdim - 1, entities=exterior_facets)
-    bc_A = fem.dirichletbc(zero_vector, bdofs_A)
+    # No strong Dirichlet BC on A_space (weak penalty term will be used instead)
+    bc_A = None
     
+    # Keep strong Dirichlet BC on V_space (scalar potential)
     zero_scalar = fem.Function(V_space)
     zero_scalar.x.array[:] = 0.0
     bdofs_V = fem.locate_dofs_topological(V_space, entity_dim=tdim - 1, entities=exterior_facets)
     bc_V = fem.dirichletbc(zero_scalar, bdofs_V)
     
     if mesh.comm.rank == 0:
-        print(f"Boundary DOFs: A={bdofs_A.size}, V={bdofs_V.size}")
+        print(f"Boundary DOFs: A=0 (weak BC), V={bdofs_V.size} (strong BC)")
     
-    block_bcs = [[bc_A], [bc_V]]
+    # A block has no BCs, V block has bc_V
+    block_bcs = [[], [bc_V]]
     return bc_A, bc_V, block_bcs

@@ -1,504 +1,720 @@
-# Generate the three phase PMSM model, with a given minimal resolution, encapsilated in a LxL box.
+# Generate the three phase PMSM model, with a given minimal resolution, encapsulated in a LxL box.
 
 import argparse
 from pathlib import Path
 from typing import Dict, Union
-from datetime import datetime
-import dolfinx
-import gmsh
 import numpy as np
 from mpi4py import MPI
+import gmsh
+import dolfinx
 
 __all__ = ["model_parameters", "mesh_parameters", "surface_map"]
 
-# Model parameters for the PMSM 2D Model
+# ---------------------------------------------------------------------------
+# Model and mesh parameters
+# ---------------------------------------------------------------------------
+
 model_parameters = {
-    "mu_0": 1.25663753e-6,  # Relative permability of air [H/m]=[kg m/(s^2 A^2)]
-    "freq": 60,  # Frequency of excitation,
-    "J": 3.1e6 * np.sqrt(2),  # [A/m^2] Current density of copper winding
-    "mu_r": {"Cu": 1, "Stator": 30, "Rotor": 30, "Al": 1, "Air": 1, "AirGap": 1, "PM": 1.04457},  # Relative permability
-    "sigma": {"Rotor": 1.6e6, "Al": 3.72e7, "Stator": 0, "Cu": 0, "Air": 0, "AirGap": 0, "PM": 6.25e5},  # Conductivity 6.
-    "densities": {"Rotor": 7850, "Al": 2700, "Stator": 0, "Air": 0, "Cu": 0, "AirGap": 0, "PM": 7500}  # [kg/m^3]
+    "mu_0": 1.25663753e-6,  # [H/m]
+    "freq": 60,  # Hz
+    "J": 3.1e6 * np.sqrt(2),  # [A/m^2]
+    "mu_r": {
+        "Cu": 1,
+        "Stator": 30,
+        "Rotor": 30,
+        "Al": 1,
+        "Air": 1,
+        "AirGap": 1,
+        "PM": 1.04457,
+    },
+    "sigma": {
+        "Rotor": 1.6e6,
+        "Al": 3.72e7,
+        "Stator": 0,
+        "Cu": 0,
+        "Air": 0,
+        "AirGap": 0,
+        "PM": 6.25e5,
+    },
+    "densities": {
+        "Rotor": 7850,
+        "Al": 2700,
+        "Stator": 0,
+        "Air": 0,
+        "Cu": 0,
+        "AirGap": 0,
+        "PM": 7500,
+    },
 }
-# Marker for facets, and restriction to use in surface integral of airgap
+
+# Facet markers
 surface_map: Dict[str, Union[int, str]] = {"Exterior": 1, "MidAir": 2, "restriction": "+"}
 
-# Copper wires is ordered in counter clock-wise order from angle = 0, 2*np.pi/num_segments...
-_domain_map_three: Dict[str, tuple[int, ...]] = {"Air": (1,), "AirGap": (2, 3), "Al": (4,), "Rotor": (5, ), 
-                                                 "Stator": (6, ), "Cu": (7, 8, 9, 10, 11, 12),
-                                                 "PM": (13, 14, 15, 16, 17, 18, 19, 20, 21, 22)}
+# Volume markers (3D physical groups)
+_domain_map_three: Dict[str, tuple[int, ...]] = {
+    "Air": (1,),
+    "AirGap": (2, 3),
+    "Al": (4,),
+    "Rotor": (5,),
+    "Stator": (6,),
+    "Cu": (7, 8, 9, 10, 11, 12),
+    "PM": (13, 14, 15, 16, 17, 18, 19, 20, 21, 22),
+}
 
-# Currents mapping to the domain marker sof the copper
-_currents_three: Dict[int, Dict[str, float]] = {7: {"alpha": 1, "beta": 0}, 8: {"alpha": -1, "beta": 2 * np.pi / 3},
-                                                9: {"alpha": 1, "beta": 4 * np.pi / 3}, 10: {"alpha": -1, "beta": 0},
-                                                11: {"alpha": 1, "beta": 2 * np.pi / 3},
-                                                12: {"alpha": -1, "beta": 4 * np.pi / 3}}
+# Currents mapping to Cu markers (you already had this)
+_currents_three: Dict[int, Dict[str, float]] = {
+    7: {"alpha": 1, "beta": 0},
+    8: {"alpha": -1, "beta": 2 * np.pi / 3},
+    9: {"alpha": 1, "beta": 4 * np.pi / 3},
+    10: {"alpha": -1, "beta": 0},
+    11: {"alpha": 1, "beta": 2 * np.pi / 3},
+    12: {"alpha": -1, "beta": 4 * np.pi / 3},
+}
+
+# Radii (kept from your script)
+mesh_parameters: Dict[str, float] = {
+    "r1": 0.017,  # shaft
+    "r2": 0.04,
+    "r3": 0.042,  # rotor outer
+    "r4": 0.062,  # stator inner
+    "r5": 0.075,  # stator outer
+    "r6": 0.036,  # PM inner radius
+    "r7": 0.038,  # PM outer radius
+}
 
 
-# The different radiuses used in domain specifications
-mesh_parameters: Dict[str, float] = {"r1": 0.017, "r2": 0.04, "r3": 0.042, "r4": 0.062, "r5": 0.075, "r6": 0.036, "r7": 0.038}
-# mesh_parameters: Dict[str, float] = {"r1": 0.02, "r2": 0.03, "r3": 0.032, "r4": 0.052, "r5": 0.057, "r6": 0.026}
+# ---------------------------------------------------------------------------
+# Helper functions for 2D geometry
+# ---------------------------------------------------------------------------
 
-
-
-def _add_copper_segment(start_angle=0):
+def _add_copper_segment(angle: float, center: int) -> int:
     """
-    Helper function
-    Add a 45 degree copper segement, r in (r3, r4) with midline at "start_angle".
+    Add a copper segment at a given angle (2D surface at z=0).
+    Uses the annular sector between r3 and r4.
     """
-    copper_arch_inner = gmsh.model.occ.addCircle(
-        0, 0, 0, mesh_parameters["r3"], angle1=start_angle - np.pi / 8, angle2=start_angle + np.pi / 8)
-    copper_arch_outer = gmsh.model.occ.addCircle(
-        0, 0, 0, mesh_parameters["r4"], angle1=start_angle - np.pi / 8, angle2=start_angle + np.pi / 8)
-    gmsh.model.occ.synchronize()
-    nodes_inner = gmsh.model.getBoundary([(1, copper_arch_inner)])
-    nodes_outer = gmsh.model.getBoundary([(1, copper_arch_outer)])
-    l0 = gmsh.model.occ.addLine(nodes_inner[0][1], nodes_outer[0][1])
-    l1 = gmsh.model.occ.addLine(nodes_inner[1][1], nodes_outer[1][1])
-    c_l = gmsh.model.occ.addCurveLoop([copper_arch_inner, l1, copper_arch_outer, l0])
+    r3 = mesh_parameters["r3"]
+    r4 = mesh_parameters["r4"]
 
-    copper_segment = gmsh.model.occ.addPlaneSurface([c_l])
+    # Angular half-width of the slot = 22.5 deg (π/8) – same as original
+    dphi = np.pi / 8
+
+    # Create explicit points for inner and outer arcs
+    p_i0 = gmsh.model.occ.addPoint(r3 * np.cos(angle - dphi), r3 * np.sin(angle - dphi), 0.0)
+    p_i1 = gmsh.model.occ.addPoint(r3 * np.cos(angle + dphi), r3 * np.sin(angle + dphi), 0.0)
+    p_o0 = gmsh.model.occ.addPoint(r4 * np.cos(angle - dphi), r4 * np.sin(angle - dphi), 0.0)
+    p_o1 = gmsh.model.occ.addPoint(r4 * np.cos(angle + dphi), r4 * np.sin(angle + dphi), 0.0)
+
+    # Create arcs using addCircleArc with shared center point
+    arc_inner = gmsh.model.occ.addCircleArc(p_i0, center, p_i1)
+    arc_outer = gmsh.model.occ.addCircleArc(p_o0, center, p_o1)
+
+    # Create side lines
+    side1 = gmsh.model.occ.addLine(p_i0, p_o0)
+    side2 = gmsh.model.occ.addLine(p_i1, p_o1)
+
+    # Create curve loop and surface
+    loop = gmsh.model.occ.addCurveLoop([arc_inner, side2, arc_outer, side1])
+    copper_segment = gmsh.model.occ.addPlaneSurface([loop])
     gmsh.model.occ.synchronize()
     return copper_segment
 
-def _add_permanent_magnets(start_angle=0):
+
+def _add_permanent_magnets(angle: float, center: int) -> int:
     """
-    Helper function
-    Add a 45 degree copper segement, r in (r3, r4) with midline at "start_angle".
+    Add a permanent magnet at a given angle (2D surface at z=0).
+    Magnets lie in annular region [r6, r7].
     """
-    copper_arch_inner = gmsh.model.occ.addCircle(
-        0, 0, 0, mesh_parameters["r6"], angle1=start_angle - np.pi / 12, angle2=start_angle + np.pi / 12) # 30 deg + 6 deg arc length
-    copper_arch_outer = gmsh.model.occ.addCircle(
-        0, 0, 0, mesh_parameters["r7"], angle1=start_angle - np.pi / 12, angle2=start_angle + np.pi / 12)
+    r6 = mesh_parameters["r6"]
+    r7 = mesh_parameters["r7"]
+
+    dphi = np.pi / 12  # 15 deg half-width => 30 deg magnet
+
+    # Create explicit points for inner and outer arcs
+    p_i0 = gmsh.model.occ.addPoint(r6 * np.cos(angle - dphi), r6 * np.sin(angle - dphi), 0.0)
+    p_i1 = gmsh.model.occ.addPoint(r6 * np.cos(angle + dphi), r6 * np.sin(angle + dphi), 0.0)
+    p_o0 = gmsh.model.occ.addPoint(r7 * np.cos(angle - dphi), r7 * np.sin(angle - dphi), 0.0)
+    p_o1 = gmsh.model.occ.addPoint(r7 * np.cos(angle + dphi), r7 * np.sin(angle + dphi), 0.0)
+
+    # Create arcs using addCircleArc with shared center point
+    arc_inner = gmsh.model.occ.addCircleArc(p_i0, center, p_i1)
+    arc_outer = gmsh.model.occ.addCircleArc(p_o0, center, p_o1)
+
+    # Create side lines
+    side1 = gmsh.model.occ.addLine(p_i0, p_o0)
+    side2 = gmsh.model.occ.addLine(p_i1, p_o1)
+
+    # Create curve loop and surface
+    loop = gmsh.model.occ.addCurveLoop([arc_inner, side2, arc_outer, side1])
+    pm_segment = gmsh.model.occ.addPlaneSurface([loop])
     gmsh.model.occ.synchronize()
-    nodes_inner = gmsh.model.getBoundary([(1, copper_arch_inner)])
-    nodes_outer = gmsh.model.getBoundary([(1, copper_arch_outer)])
-    l0 = gmsh.model.occ.addLine(nodes_inner[0][1], nodes_outer[0][1])
-    l1 = gmsh.model.occ.addLine(nodes_inner[1][1], nodes_outer[1][1])
-    c_l = gmsh.model.occ.addCurveLoop([copper_arch_inner, l1, copper_arch_outer, l0])
+    return pm_segment
 
-    copper_segment = gmsh.model.occ.addPlaneSurface([c_l])
-    gmsh.model.occ.synchronize()
-    return copper_segment
 
-def generate_PMSM_mesh(filename: Path, single: bool, res: np.float64, L: np.float64, depth: np.float64):
+def _angle_diff(a: float, b: float) -> float:
+    """Smallest absolute difference between two angles in [0, 2π)."""
+    d = (a - b + np.pi) % (2 * np.pi) - np.pi
+    return abs(d)
+
+
+# ---------------------------------------------------------------------------
+# Main mesh generator
+# ---------------------------------------------------------------------------
+
+def generate_PMSM_mesh(
+    filename: Path, single: bool, res: np.float64, L: np.float64, depth: np.float64
+):
     """
-    Generate the three phase PMSM model, with a given minimal resolution, encapsilated in
-    a LxL box.
-    All domains are marked, while only the exterior facets and the mid air gap facets are marked
-      """
-    spacing = (np.pi / 4) + (np.pi / 4) / 3
-    angles = np.asarray([i * spacing for i in range(6)], dtype=np.float64)
-    domain_map = _domain_map_three
-    assert len(domain_map["Cu"]) == len(angles)  
+    Generate PMSM 3D mesh with motor centered in an air box.
+    Air box covers motor from all directions (x, y, z).
+    Returns: (mesh, cell_tags, facet_tags)
+    """
 
-    gmsh.initialize()
-    # Generate three phase induction motor
-    rank = MPI.COMM_WORLD.rank
+    comm = MPI.COMM_WORLD
+    rank = comm.rank
     root = 0
-    gdim = 3  # Geometric dimension of the mesh
-    if rank == root:
+    gdim = 3
 
-        # Center line for mesh resolution
-        cf = gmsh.model.occ.addPoint(0, 0, 0)
-        cb = gmsh.model.occ.addPoint(0, 0, depth)
+    domain_map = _domain_map_three
+
+    # Geometry is built only on rank 0 using Gmsh
+    if rank == root:
+        gmsh.initialize()
+        gmsh.model.add("PMSM_3D_IPM")
+
+        # ------------------------------------------------------------
+        # Step 1: Air box dimensions
+        # ------------------------------------------------------------
+        r5 = mesh_parameters["r5"]  # stator outer radius
+
+        xy_buffer_factor = 6.0  # ~6x stator radius
+        z_buffer_factor = 3.0   # ~3x motor depth above and below
+
+        air_box_size_xy = 2.0 * xy_buffer_factor * r5
+        air_box_size_z = depth * (1.0 + 2.0 * z_buffer_factor)
+
+        air_box_x_min = -air_box_size_xy / 2.0
+        air_box_y_min = -air_box_size_xy / 2.0
+        air_box_z_min = 0.0
+
+        air_box_x_max = air_box_x_min + air_box_size_xy
+        air_box_y_max = air_box_y_min + air_box_size_xy
+        air_box_z_max = air_box_z_min + air_box_size_z
+
+        # Motor center in z: we extrude [0, depth], so center at depth/2.
+        # We want that center to coincide with air box center: air_box_size_z/2
+        box_center_z = air_box_z_min + air_box_size_z / 2.0
+        motor_center_z = box_center_z
+        shift_z = motor_center_z - depth / 2.0  # translation of motor volumes
+
+        motor_z_start = shift_z
+        motor_z_end = shift_z + depth
+
+        print("\n=== MESH CONFIGURATION ===")
+        print(f"Air box: x=[{air_box_x_min:.4f}, {air_box_x_max:.4f}], "
+              f"y=[{air_box_y_min:.4f}, {air_box_y_max:.4f}], "
+              f"z=[{air_box_z_min:.4f}, {air_box_z_max:.4f}]")
+        print(f"Motor z-range after translation: [{motor_z_start:.4f}, {motor_z_end:.4f}]")
+        print(f"Motor center z: {motor_center_z:.4f}")
+
+        # ------------------------------------------------------------
+        # Step 2: 2D motor geometry at z=0
+        # ------------------------------------------------------------
+        r1 = mesh_parameters["r1"]
+        r2 = mesh_parameters["r2"]
+        r3 = mesh_parameters["r3"]
+        r4 = mesh_parameters["r4"]
+        r5 = mesh_parameters["r5"]
+        r6 = mesh_parameters["r6"]
+        r7 = mesh_parameters["r7"]
+
+        # Center point (reused for all arcs)
+        center_point = gmsh.model.occ.addPoint(0.0, 0.0, 0.0)
+
+        # Center line for mesh refinement (later translated)
+        cf = center_point  # Reuse center point
+        cb = gmsh.model.occ.addPoint(0.0, 0.0, depth)
         cline = gmsh.model.occ.addLine(cf, cb)
 
-        # Calculate air box size based on motor radius (not fixed L parameter)
-        r5 = mesh_parameters["r5"]
-        outer_air_factor = 4.0  # 3.0–5.0 is reasonable; start with 4.0
-        L_actual = 2.0 * outer_air_factor * r5
-        
-        # Define the different circular layers
-        strator_steel = gmsh.model.occ.addCircle(0, 0, 0, mesh_parameters["r5"])
-        air_2 = gmsh.model.occ.addCircle(0, 0, 0, mesh_parameters["r4"])        # stator bdry
-        air = gmsh.model.occ.addCircle(0, 0, 0, mesh_parameters["r3"])          # air bdry
-        air_mid = gmsh.model.occ.addCircle(0, 0, 0, 0.5 * (mesh_parameters["r2"] + mesh_parameters["r3"]))  # mid_air
-        aluminium = gmsh.model.occ.addCircle(0, 0, 0, mesh_parameters["r2"])    # al boundary 40 mm
-        rotor_steel = gmsh.model.occ.addCircle(0, 0, 0, mesh_parameters["r1"])  # 17 mm
-        pmsm1 = gmsh.model.occ.addCircle(0, 0, 0, mesh_parameters["r6"])        # pm bdry 37 mm
-        pmsm2 = gmsh.model.occ.addCircle(0, 0, 0, mesh_parameters["r7"])        # pm bdry 39 mm
-
-        # Create out strator steel
-        steel_loop = gmsh.model.occ.addCurveLoop([strator_steel])
-        air_2_loop = gmsh.model.occ.addCurveLoop([air_2])
-        strator_steel = gmsh.model.occ.addPlaneSurface([steel_loop, air_2_loop])
-
-        # Create air layer
-        air_loop = gmsh.model.occ.addCurveLoop([air])
-        air = gmsh.model.occ.addPlaneSurface([air_2_loop, air_loop])
-
-        domains = [(2, _add_copper_segment(angle)) for angle in angles]
-
-        # air_3_loop = gmsh.model.occ.addCurveLoop([aluminium])        
-
-        # Add second air segment (in two pieces)
-        air_mid_loop = gmsh.model.occ.addCurveLoop([air_mid])
-        al_loop = gmsh.model.occ.addCurveLoop([aluminium])  # outer
-        al_2_loop = gmsh.model.occ.addCurveLoop([pmsm1])
-        al_3_loop = gmsh.model.occ.addCurveLoop([pmsm2])
-
-        air_surf1 = gmsh.model.occ.addPlaneSurface([air_loop, air_mid_loop])
-        air_surf2 = gmsh.model.occ.addPlaneSurface([air_mid_loop, al_loop])
-
-        # Add aluminium segement
-        rotor_loop = gmsh.model.occ.addCurveLoop([rotor_steel])
-        aluminium_surf1 = gmsh.model.occ.addPlaneSurface([al_2_loop, rotor_loop])    # rotor - Al gap   20 mm
-        aluminium_surf2 = gmsh.model.occ.addPlaneSurface([al_3_loop, al_2_loop])    # PM gap    2 mm
-        aluminium_surf3 = gmsh.model.occ.addPlaneSurface([al_loop, al_3_loop])      # Pm-bdry gap 1 mm
-
-        # Creating PMs
-        pm_spacing = (np.pi / 6) + (np.pi / 30)
-        pm_angles = np.asarray([i * pm_spacing for i in range(10)], dtype=np.float64)
-        magnets = [(2, _add_permanent_magnets(angle)) for angle in pm_angles]
-        domains.extend(magnets)
-
-        # Add steel rotor
-        rotor_disk = gmsh.model.occ.addPlaneSurface([rotor_loop])
-        gmsh.model.occ.synchronize()
-        domains.extend([(2, strator_steel), (2, rotor_disk), (2, air),
-                        (2, air_surf1), (2, air_surf2), (2, aluminium_surf1), (2, aluminium_surf2), (2, aluminium_surf3)])
+        # Base circles
+        c_r1 = gmsh.model.occ.addCircle(0, 0, 0, r1)
+        c_r2 = gmsh.model.occ.addCircle(0, 0, 0, r2)
+        c_r3 = gmsh.model.occ.addCircle(0, 0, 0, r3)
+        c_r4 = gmsh.model.occ.addCircle(0, 0, 0, r4)
+        c_r5 = gmsh.model.occ.addCircle(0, 0, 0, r5)
 
         gmsh.model.occ.synchronize()
-        
-        domains = gmsh.model.occ.extrude(domains, 0, 0, depth)
-        domains_3D = []
-        for domain in domains:
-            if domain[0] == 3:
-                domains_3D.append(domain)
-        # air_box = gmsh.model.occ.addBox(
-        #     -L / 2, -L / 2, -5 * depth, L, L, 10 * depth
-        # )
-        # Calculate air box size based on motor radius (not fixed L)
-        r5 = mesh_parameters["r5"]
-        outer_air_factor = 4.0  # 3.0–5.0 is reasonable; start with 4.0
-        L_actual = 2.0 * outer_air_factor * r5
-        
-        # Air box enclosing whole machine
+
+        # Curve loops and base surfaces:
+        # Shaft (Al)
+        loop_r1 = gmsh.model.occ.addCurveLoop([c_r1])
+        shaft_surf = gmsh.model.occ.addPlaneSurface([loop_r1])  # r in [0, r1]
+
+        # Rotor annulus (Rotor) between r1 and r3
+        loop_r3 = gmsh.model.occ.addCurveLoop([c_r3])
+        rotor_surf = gmsh.model.occ.addPlaneSurface([loop_r3, loop_r1])  # [r1, r3]
+
+        # Stator (Stator) between r4 and r5
+        loop_r4 = gmsh.model.occ.addCurveLoop([c_r4])
+        loop_r5 = gmsh.model.occ.addCurveLoop([c_r5])
+        stator_surf = gmsh.model.occ.addPlaneSurface([loop_r5, loop_r4])  # [r4, r5]
+
+        # Air annulus between rotor and stator [r3, r4] = Air / AirGap + Cu slots
+        airgap_surf = gmsh.model.occ.addPlaneSurface([loop_r4, loop_r3])
+
+        gmsh.model.occ.synchronize()
+
+        # ------------------------------------------------------------
+        # Copper slots: 6 slots, three-phase winding
+        # ------------------------------------------------------------
+        spacing = (np.pi / 4.0) + (np.pi / 4.0) / 3.0  # = π/3 => 60 deg
+        slot_angles = np.asarray([i * spacing for i in range(6)], dtype=np.float64)
+
+        copper_surfaces = []
+        for ang in slot_angles:
+            copper_surfaces.append(_add_copper_segment(ang, center_point))
+
+        # ------------------------------------------------------------
+        # Permanent magnets: interior PM (IPM) in [r6, r7]
+        # ------------------------------------------------------------
+        # Keep 10 magnets as in your original intention, but regular spacing
+        pm_count = 10
+        pm_spacing = 2.0 * np.pi / pm_count
+        pm_angles = np.asarray([i * pm_spacing for i in range(pm_count)], dtype=np.float64)
+
+        pm_surfaces = []
+        for ang in pm_angles:
+            pm_surfaces.append(_add_permanent_magnets(ang, center_point))
+
+        gmsh.model.occ.synchronize()
+
+        # Collect all 2D surfaces to extrude
+        domains_2d = []
+        # Shaft (Al)
+        domains_2d.append((2, shaft_surf))
+        # Rotor iron
+        domains_2d.append((2, rotor_surf))
+        # Airgap ring
+        domains_2d.append((2, airgap_surf))
+        # Stator ring
+        domains_2d.append((2, stator_surf))
+        # Copper
+        for s in copper_surfaces:
+            domains_2d.append((2, s))
+        # PM
+        for s in pm_surfaces:
+            domains_2d.append((2, s))
+
+        gmsh.model.occ.synchronize()
+
+        # ------------------------------------------------------------
+        # Step 3: Extrude 2D motor surfaces to 3D
+        # ------------------------------------------------------------
+        if not domains_2d:
+            raise RuntimeError("No valid 2D domains to extrude.")
+
+        extruded = gmsh.model.occ.extrude(domains_2d, 0.0, 0.0, depth)
+        gmsh.model.occ.synchronize()
+
+        # Extract 3D motor volumes
+        motor_volumes = [e for e in extruded if e[0] == 3]
+        if not motor_volumes:
+            raise RuntimeError("No 3D volumes created during extrusion.")
+
+        # Translate motor volumes and refinement line to center z
+        gmsh.model.occ.translate(motor_volumes, 0.0, 0.0, shift_z)
+        gmsh.model.occ.translate([(1, cline)], 0.0, 0.0, shift_z)
+        gmsh.model.occ.synchronize()
+
+        # ------------------------------------------------------------
+        # Step 4: Create outer air box and fragment
+        # ------------------------------------------------------------
         air_box = gmsh.model.occ.addBox(
-            -L_actual / 2, -L_actual / 2, 0.0,
-            L_actual, L_actual, depth
+            air_box_x_min,
+            air_box_y_min,
+            air_box_z_min,
+            air_box_size_xy,
+            air_box_size_xy,
+            air_box_size_z,
         )
-        # Cutting box (removes one half)
-        # cutting_box = gmsh.model.occ.addBox(0, -L/2, -5 * depth, L/2, L, 10 * depth)
 
-        # # Perform Boolean cut to remove one half
-        # half_box = gmsh.model.occ.cut([(3, air_box)], [(3, cutting_box)])
-        volumes, _ = gmsh.model.occ.fragment([(3, air_box)], domains_3D)
-
+        volumes, _ = gmsh.model.occ.fragment([(3, air_box)], motor_volumes)
         gmsh.model.occ.synchronize()
-
-        # Helpers for assigning domain markers based on area of domain
-        rs = [mesh_parameters[f"r{i}"] for i in range(1, 8)]
-        r_mid = 0.5 * (rs[1] + rs[2])  # Radius for middle of air gap
-        area_helper = (rs[3]**2 - rs[2]**2) * np.pi  # Helper function to determine area of copper and air
-        area_helper1 = (rs[6]**2 - rs[5]**2) * np.pi  # Helper function to determine area of PM and Al
-        frac_cu = 45 / 360
-        frac_air = (360 - len(angles) * 45) / (360 * len(angles))
-        frac_pm = 30 / 360
-        frac_al = 60  / 3600
-        _area_to_domain_map: Dict[float, str] = {depth * rs[0]**2 * np.pi: "Rotor",
-                                                 depth * (rs[5]**2 - rs[0]**2) * np.pi: "Al",                           # change
-                                                 depth * (r_mid**2 - rs[1]**2) * np.pi: "AirGap1",
-                                                 depth * (rs[2]**2 - r_mid**2) * np.pi: "AirGap0",
-                                                 depth * area_helper * frac_cu: "Cu",
-                                                 depth * area_helper * frac_air: "Air",
-                                                 depth * (rs[4]**2 - rs[3]**2) * np.pi: "Stator",
-                                                 float(L_actual**2 * depth - depth * np.pi * rs[4]**2): "Air",
-                                                 depth * area_helper1 * frac_pm: "PM",
-                                                 depth * area_helper1 * frac_al: "Al",
-                                                 depth * (rs[1]**2 - rs[6]**2) * np.pi: "Al"}
-
-        # Helper for assigning current wire tag to copper windings
-        cu_points = np.asarray([[np.cos(angle), np.sin(angle)] for angle in angles])
-        pm_points = np.asarray([[np.cos(angle), np.sin(angle)] for angle in pm_angles])
-
-        # Assign physical surfaces based on the mass of the segment
-        # For copper wires order them counter clockwise
-        other_air_markers = []
-        other_al_markers = []
-        assigned_volumes = set()  # Track which volumes have been assigned
-
-        for volume in volumes:
-            
-            mass = gmsh.model.occ.get_mass(volume[0], volume[1])
-            found_domain = False
-            # Use relative tolerance for mass matching (1% tolerance)
-            for _mass in _area_to_domain_map.keys():
-                if np.isclose(mass, _mass, rtol=0.01):
-                    domain_type = _area_to_domain_map[_mass]
-                    print(domain_type)
-                    if domain_type == "Cu":
-                        com = gmsh.model.occ.get_center_of_mass(volume[0], volume[1])
-                        point = np.array([com[0], com[1]]) / np.sqrt(com[0]**2 + com[1]**2)
-                        index = np.flatnonzero(np.isclose(cu_points, point).all(axis=1))[0]
-                        marker = domain_map[domain_type][index]
-                        gmsh.model.addPhysicalGroup(volume[0], [volume[1]], marker)
-                        assigned_volumes.add(volume[1])
-                        found_domain = True
-                        break
-                    elif domain_type == "PM":
-                        com = gmsh.model.occ.get_center_of_mass(volume[0], volume[1])
-                        point = np.array([com[0], com[1]]) / np.sqrt(com[0]**2 + com[1]**2)
-                        index = np.flatnonzero(np.isclose(pm_points, point).all(axis=1))[0]
-                        marker = domain_map[domain_type][index]
-                        gmsh.model.addPhysicalGroup(volume[0], [volume[1]], marker)
-                        assigned_volumes.add(volume[1])
-                        found_domain = True
-                        break
-                    elif domain_type == "AirGap0":
-                        gmsh.model.addPhysicalGroup(volume[0], [volume[1]], domain_map["AirGap"][0])
-                        assigned_volumes.add(volume[1])
-                        found_domain = True
-                        break
-                    elif domain_type == "AirGap1":
-                        gmsh.model.addPhysicalGroup(volume[0], [volume[1]], domain_map["AirGap"][1])
-                        assigned_volumes.add(volume[1])
-                        found_domain = True
-                        break
-
-                    elif domain_type == "Air":
-                        other_air_markers.append(volume[1])
-                        found_domain = True
-                        break
-                    elif domain_type == "Al":
-                        other_al_markers.append(volume[1])
-                        found_domain = True
-                        break
-                    else:
-                        marker = domain_map[domain_type][0]
-                        gmsh.model.addPhysicalGroup(volume[0], [volume[1]], marker)
-                        assigned_volumes.add(volume[1])
-                        found_domain = True
-                        break
-            if not found_domain:
-                # Try to find closest match
-                closest_mass = min(_area_to_domain_map.keys(), key=lambda x: abs(x - mass))
-                relative_error = abs(mass - closest_mass) / max(abs(closest_mass), 1e-10)
-                if relative_error < 0.15:  # 15% tolerance as fallback
-                    print(f"⚠️  Warning: Domain {volume[1]} mass {mass:.6e} close to {closest_mass:.6e} (error: {relative_error*100:.2f}%), using closest match")
-                    domain_type = _area_to_domain_map[closest_mass]
-                    if domain_type == "Air":
-                        other_air_markers.append(volume[1])
-                    elif domain_type == "Al":
-                        other_al_markers.append(volume[1])
-                    else:
-                        marker = domain_map[domain_type][0] if domain_type in domain_map else domain_map["Air"][0]
-                        if marker == domain_map["Air"][0]:
-                            other_air_markers.append(volume[1])
-                        else:
-                            gmsh.model.addPhysicalGroup(volume[0], [volume[1]], marker)
-                            assigned_volumes.add(volume[1])
-                else:
-                    # Default to Air for unmatched volumes (likely outer air box fragments)
-                    print(f"⚠️  Warning: Domain {volume[1]} mass {mass:.6e} doesn't match any expected domain (closest: {closest_mass:.6e}, error: {relative_error*100:.2f}%). Assigning to Air.")
-                    other_air_markers.append(volume[1])
-
-        # Assign air domains (only if there are any)
-        if other_air_markers:
-            gmsh.model.addPhysicalGroup(volume[0], other_air_markers, domain_map["Air"][0])
-
-        # Assign Al domains (only if there are any)
-        if other_al_markers:
-            gmsh.model.addPhysicalGroup(volume[0], other_al_markers, domain_map["Al"][0])
-
-        # Mark air gap boundary and exterior box
-        surfaces = gmsh.model.getBoundary(volumes, combined=False, oriented=False)
-        surfaces_filtered = set([surface[1] for surface in surfaces])
-        air_gap_circumference = 2 * r_mid * np.pi * depth
-
-        for surface in surfaces_filtered:
-            length = gmsh.model.occ.get_mass(gdim - 1, surface)
-            if np.isclose(length - air_gap_circumference, 0):
-                gmsh.model.addPhysicalGroup(gdim - 1, [surface], surface_map["MidAir"])
-        lines = gmsh.model.getBoundary(surfaces, combined=True, oriented=False)
-        gmsh.model.addPhysicalGroup(gdim - 1, [surface[1] for surface in surfaces], surface_map["Exterior"])
-
-        # Generate mesh with improved resolution settings
-        res_base = res  # base resolution near machine
         
-        # Field 1: Distance field (computes distances from center line)
+        # Debug: print total volumes
+        num_volumes = sum(1 for dim, tag in volumes if dim == 3)
+        print(f"\nTotal 3D volumes after fragment: {num_volumes}")
+
+        # ------------------------------------------------------------
+        # Step 5: Tag volumes by center-of-mass (robust classification)
+        # ------------------------------------------------------------
+        tol = 1e-3 * r5
+        r_mid_gap = 0.5 * (r3 + r4)  # for splitting AirGap into two markers
+
+        def classify_volume(tag3: int):
+            x, y, z = gmsh.model.occ.getCenterOfMass(3, tag3)
+            r = np.hypot(x, y)
+            theta = np.arctan2(y, x)
+            if theta < 0:
+                theta += 2.0 * np.pi
+
+            # Outer air box - check this FIRST before other conditions
+            if z < motor_z_start - tol or z > motor_z_end + tol:
+                return "Air", domain_map["Air"][0]
+            if r > r5 + tol:
+                return "Air", domain_map["Air"][0]
+
+            # Check Cu slots first (overrides other bands)
+            slot_half = np.pi / 8.0
+            if r3 - tol <= r <= r4 + tol:
+                for i, ang in enumerate(slot_angles):
+                    if _angle_diff(theta, ang) <= slot_half:
+                        # assign phase-wise Cu marker
+                        cu_marker = domain_map["Cu"][i % len(domain_map["Cu"])]
+                        return "Cu", cu_marker
+
+            # Check PM pockets (must be before rotor check)
+            pm_half = np.pi / 12.0
+            if r6 - tol <= r <= r7 + tol:
+                for i, ang in enumerate(pm_angles):
+                    if _angle_diff(theta, ang) <= pm_half:
+                        pm_marker = domain_map["PM"][i % len(domain_map["PM"])]
+                        return "PM", pm_marker
+
+            # Radial bands for other regions
+            if r <= r1 + tol:
+                return "Al", domain_map["Al"][0]
+            # Rotor: from r1 to r3, excluding PM region (r6-r7 already handled above)
+            if r1 < r <= r3 + tol:
+                return "Rotor", domain_map["Rotor"][0]
+            # Air gap: from r3 to r4, excluding Cu slots (already handled above)
+            if r3 - tol <= r <= r4 + tol:
+                # air gap annulus - split into two regions
+                if r <= r_mid_gap:
+                    return "AirGap", domain_map["AirGap"][0]
+                else:
+                    return "AirGap", domain_map["AirGap"][1]
+            # Stator: from r4 to r5
+            if r4 - tol <= r <= r5 + tol:
+                return "Stator", domain_map["Stator"][0]
+
+            # Anything else inside box but not covered => treat as Air
+            return "Air", domain_map["Air"][0]
+
+        # Add physical groups - collect volumes by marker first
+        volumes_by_marker = {}
+        classification_counts = {}
+        sample_centers = {}  # For debugging
+        all_centers = []  # For debugging - store all volume centers
+        for dim, tag in volumes:
+            if dim != 3:
+                continue
+            x, y, z = gmsh.model.occ.getCenterOfMass(3, tag)
+            r = np.hypot(x, y)
+            all_centers.append((r, z, tag))
+            name, marker = classify_volume(tag)
+            if marker not in volumes_by_marker:
+                volumes_by_marker[marker] = []
+            volumes_by_marker[marker].append(tag)
+            # Count classifications for debugging
+            if name not in classification_counts:
+                classification_counts[name] = {"count": 0, "marker": marker}
+            classification_counts[name]["count"] += 1
+            # Store sample center for each material type
+            if name not in sample_centers:
+                sample_centers[name] = (r, x, y, z)
+        
+        # Debug: print volume distribution by radial position
+        print("\n=== VOLUME DISTRIBUTION BY RADIUS ===")
+        all_centers.sort(key=lambda x: x[0])  # Sort by radius
+        for r, z, tag in all_centers:
+            if r1 - 0.001 <= r <= r1 + 0.001:
+                region = "r1 (shaft)"
+            elif r1 < r <= r6:
+                region = "r1-r6 (rotor inner)"
+            elif r6 <= r <= r7:
+                region = "r6-r7 (PM region)"
+            elif r7 < r <= r3:
+                region = "r7-r3 (rotor outer)"
+            elif r3 <= r <= r4:
+                region = "r3-r4 (airgap)"
+            elif r4 <= r <= r5:
+                region = "r4-r5 (stator)"
+            elif r > r5:
+                region = ">r5 (air)"
+            else:
+                region = "other"
+            print(f"  Vol {tag:3d}: r={r:.4f}, z={z:.4f}, region={region}")
+        
+        # Print classification summary
+        print("\n=== VOLUME CLASSIFICATION SUMMARY ===")
+        for name in sorted(classification_counts.keys()):
+            count = classification_counts[name]["count"]
+            marker = classification_counts[name]["marker"]
+            r, x, y, z = sample_centers[name]
+            print(f"  {name:10s} (tag {marker:2d}): {count:4d} volumes, sample r={r:.4f}, z={z:.4f}")
+        
+        # Check for missing expected tags
+        expected_tags = set()
+        for tags in domain_map.values():
+            expected_tags.update(tags)
+        found_tags = set(volumes_by_marker.keys())
+        missing_tags = expected_tags - found_tags
+        if missing_tags:
+            print(f"\n⚠️  WARNING: Missing expected tags: {sorted(missing_tags)}")
+            print(f"   Found tags: {sorted(found_tags)}")
+            print(f"   Expected tags: {sorted(expected_tags)}")
+            print(f"\n   Radial boundaries: r1={r1:.4f}, r2={r2:.4f}, r3={r3:.4f}, r4={r4:.4f}, r5={r5:.4f}")
+            print(f"   PM region: r6={r6:.4f}, r7={r7:.4f}")
+            print(f"   Motor z-range: [{motor_z_start:.4f}, {motor_z_end:.4f}]")
+        
+        # Add physical groups with all volumes sharing the same marker
+        for marker, volume_tags in volumes_by_marker.items():
+            gmsh.model.addPhysicalGroup(3, volume_tags, marker)
+
+        # ------------------------------------------------------------
+        # Step 6: Tag boundaries (MidAir & Exterior)
+        # ------------------------------------------------------------
+        # Get all faces bounding all volumes
+        surf_entities = gmsh.model.getBoundary(
+            volumes, combined=False, oriented=False
+        )
+        surf_tags = sorted(set(s[1] for s in surf_entities))
+
+        # MidAir: cylindrical surface around mid of air gap
+        r_mid = r_mid_gap
+        tol_mid = 0.02 * r_mid
+
+        midair_faces = []
+        exterior_faces = []
+
+        for s_tag in surf_tags:
+            # Center of mass of surface
+            x, y, z = gmsh.model.occ.getCenterOfMass(2, s_tag)
+            r_surf = np.hypot(x, y)
+
+            # Bounding box for detecting outer air-box faces
+            xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(2, s_tag)
+
+            # MidAir: cylindrical band approximately at r_mid and in motor z-range
+            if abs(r_surf - r_mid) < tol_mid and (motor_z_start - tol) <= z <= (motor_z_end + tol):
+                midair_faces.append(s_tag)
+
+            # Exterior: faces lying on the outer box boundary
+            eps_box = 1e-6 * max(
+                abs(air_box_x_min),
+                abs(air_box_x_max),
+                abs(air_box_y_min),
+                abs(air_box_y_max),
+                abs(air_box_z_min),
+                abs(air_box_z_max),
+                1.0,
+            )
+            on_x_min = abs(xmin - air_box_x_min) < eps_box
+            on_x_max = abs(xmax - air_box_x_max) < eps_box
+            on_y_min = abs(ymin - air_box_y_min) < eps_box
+            on_y_max = abs(ymax - air_box_y_max) < eps_box
+            on_z_min = abs(zmin - air_box_z_min) < eps_box
+            on_z_max = abs(zmax - air_box_z_max) < eps_box
+
+            if on_x_min or on_x_max or on_y_min or on_y_max or on_z_min or on_z_max:
+                exterior_faces.append(s_tag)
+
+        if midair_faces:
+            gmsh.model.addPhysicalGroup(2, midair_faces, surface_map["MidAir"])
+        if exterior_faces:
+            gmsh.model.addPhysicalGroup(2, exterior_faces, surface_map["Exterior"])
+
+        # ------------------------------------------------------------
+        # Step 7: Mesh generation
+        # ------------------------------------------------------------
+        res_base = float(res)
+
         gmsh.model.mesh.field.add("Distance", 1)
         gmsh.model.mesh.field.setNumbers(1, "EdgesList", [cline])
-        
-        # Field 2: Threshold field (distance-based transition)
+
         gmsh.model.mesh.field.add("Threshold", 2)
         gmsh.model.mesh.field.setNumber(2, "IField", 1)
-        gmsh.model.mesh.field.setNumber(2, "LcMin", res_base)  # fine near machine
-        gmsh.model.mesh.field.setNumber(2, "LcMax", 10 * res_base)  # coarse outer air, but not insane
-        gmsh.model.mesh.field.setNumber(2, "DistMin", r5)  # start coarsening after stator
-        gmsh.model.mesh.field.setNumber(2, "DistMax", outer_air_factor * r5)  # coarsen up to outer box
-        
-        # Field 3: Min field (combines all fields)
+        gmsh.model.mesh.field.setNumber(2, "LcMin", res_base)
+        gmsh.model.mesh.field.setNumber(2, "LcMax", 10.0 * res_base)
+        gmsh.model.mesh.field.setNumber(2, "DistMin", r5)
+        gmsh.model.mesh.field.setNumber(2, "DistMax", 6.0 * r5)
+
         gmsh.model.mesh.field.add("Min", 3)
         gmsh.model.mesh.field.setNumbers(3, "FieldsList", [2])
         gmsh.model.mesh.field.setAsBackgroundMesh(3)
 
-        # gmsh.option.setNumber("Mesh.Algorithm", 7)
-        gmsh.option.setNumber("General.Terminal", 1)            # Generates triangular elements
-        # gmsh.option.setNumber("Mesh.RecombineAll", 1)         # Generates quadrilateral elements
+        gmsh.option.setNumber("General.Terminal", 1)
         gmsh.model.mesh.generate(gdim)
         gmsh.model.mesh.optimize("Netgen")
-        gmsh.write(str(filename.with_suffix(".msh")))
 
-    gmsh.finalize()
+        msh_file = str(filename.with_suffix(".msh"))
+        gmsh.write(msh_file)
+        gmsh.finalize()
 
+    # Synchronize all ranks before reading mesh
+    comm.barrier()
+
+    # ------------------------------------------------------------
+    # Step 8: Read MSH into DOLFINx and retag cells if needed
+    # ------------------------------------------------------------
+    from dolfinx.io import gmshio
+    from dolfinx.io import XDMFFile
+    import dolfinx.mesh as dmesh
+
+    result = gmshio.read_from_msh(
+        str(filename.with_suffix(".msh")), comm, 0, gdim=3
+    )
+    mesh = result[0]
+    ct = result[1] if len(result) > 1 else None
+    ft = result[2] if len(result) > 2 else None
+
+    # Retag cells based on center coordinates (more robust than volume classification)
+    if ct is not None:
+        # Check if we have all required tags
+        found_tags = set(np.unique(ct.values)) if len(ct.values) > 0 else set()
+        required_tags = {domain_map["Air"][0], domain_map["Rotor"][0], 
+                        domain_map["Stator"][0], domain_map["Al"][0]}
+        required_tags.update(domain_map["AirGap"])
+        required_tags.update(domain_map["Cu"])
+        required_tags.update(domain_map["PM"])
+        
+        if not required_tags.issubset(found_tags):
+            if rank == root:
+                print("\n⚠️  Missing tags detected. Retagging cells by center coordinates...")
+            
+            # Get cell centers (same approach as load_mesh.py)
+            coords = mesh.geometry.x
+            dofmap = mesh.geometry.dofmap
+            # dofmap is a 2D array: shape (num_cells, num_vertices_per_cell)
+            centers = coords[dofmap].mean(axis=1)
+            radii = np.linalg.norm(centers[:, :2], axis=1)
+            angles = np.mod(np.arctan2(centers[:, 1], centers[:, 0]), 2 * np.pi)
+            z_coords = centers[:, 2]
+            
+            # Classification function for cells
+            def classify_cell(r, theta, z):
+                # Outer air box
+                if z < motor_z_start - tol or z > motor_z_end + tol:
+                    return domain_map["Air"][0]
+                if r > r5 + tol:
+                    return domain_map["Air"][0]
+                
+                # Check Cu slots first
+                slot_half = np.pi / 8.0
+                if r3 - tol <= r <= r4 + tol:
+                    for i, ang in enumerate(slot_angles):
+                        if _angle_diff(theta, ang) <= slot_half:
+                            return domain_map["Cu"][i % len(domain_map["Cu"])]
+                
+                # Check PM pockets
+                pm_half = np.pi / 12.0
+                if r6 - tol <= r <= r7 + tol:
+                    for i, ang in enumerate(pm_angles):
+                        if _angle_diff(theta, ang) <= pm_half:
+                            return domain_map["PM"][i % len(domain_map["PM"])]
+                
+                # Radial bands
+                if r <= r1 + tol:
+                    return domain_map["Al"][0]
+                if r1 < r <= r3 + tol:
+                    return domain_map["Rotor"][0]
+                if r3 - tol <= r <= r4 + tol:
+                    if r <= r_mid_gap:
+                        return domain_map["AirGap"][0]
+                    else:
+                        return domain_map["AirGap"][1]
+                if r4 - tol <= r <= r5 + tol:
+                    return domain_map["Stator"][0]
+                
+                return domain_map["Air"][0]
+            
+            # Retag all cells
+            n_cells = mesh.topology.index_map(3).size_local
+            new_tags = np.empty(n_cells, dtype=np.int32)
+            for i in range(n_cells):
+                new_tags[i] = classify_cell(radii[i], angles[i], z_coords[i])
+            
+            # Create new cell tags
+            cell_indices = np.arange(n_cells, dtype=np.int32)
+            ct = dmesh.meshtags(mesh, mesh.topology.dim, cell_indices, new_tags)
+            
+            if rank == root:
+                unique_tags = np.unique(new_tags)
+                print(f"✅ Retagged {n_cells} cells. Unique tags: {sorted(unique_tags)}")
+
+    # Write XDMF with function field for ParaView visualization
+    from dolfinx import fem
+
+    with XDMFFile(comm, filename.with_suffix(".xdmf"), "w") as xdmf:
+        xdmf.write_mesh(mesh)
+        
+        if ct is not None:
+            # Write meshtags (default name will be used)
+            xdmf.write_meshtags(ct, mesh.geometry)
+            
+            # Create a function field for easier ParaView visualization
+            DG0 = fem.functionspace(mesh, ("DG", 0))
+            cell_tag_function = fem.Function(DG0)
+            cell_tag_function.name = "CellTags"
+            
+            # Map cell tags to function - initialize all to 0 first
+            cell_tag_function.x.array[:] = 0.0
+            
+            # Map tagged cells
+            cell_to_tag = {int(i): int(v) for i, v in zip(ct.indices, ct.values)}
+            for cell_idx, tag in cell_to_tag.items():
+                if cell_idx < cell_tag_function.x.array.size:
+                    cell_tag_function.x.array[cell_idx] = float(tag)
+            
+            # Write function field for ParaView
+            xdmf.write_function(cell_tag_function, 0.0)
+        
+        if ft is not None:
+            xdmf.write_meshtags(ft, mesh.geometry)
+
+    if rank == root:
+        print(f"\n✅ Mesh generated: {filename.with_suffix('.xdmf')}")
+
+    return mesh, ct, ft
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="GMSH scripts to generate PMSM engines for",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--res", default=0.01, type=np.float64, dest="res",
-                        help="Mesh resolution")
-    parser.add_argument("--L", default=1, type=np.float64, dest="L",
-                        help="Size of surround box with air")
-    parser.add_argument("--depth", default=0.057, type=np.float64, dest="depth",
-                        help="Height of surround box with air")
+        description="Gmsh script to generate 3D IPM PMSM mesh",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--res",
+        default=0.01,
+        type=np.float64,
+        dest="res",
+        help="Base mesh resolution near motor",
+    )
+    parser.add_argument(
+        "--L",
+        default=1.0,
+        type=np.float64,
+        dest="L",
+        help="(Unused) legacy parameter for box size",
+    )
+    parser.add_argument(
+        "--depth",
+        default=0.057,
+        type=np.float64,
+        dest="depth",
+        help="Axial depth of the motor (extrusion length)",
+    )
 
     args = parser.parse_args()
-    L = args.L
     res = args.res
     depth = args.depth
 
     folder = Path("../../meshes/3d")
     folder.mkdir(parents=True, exist_ok=True)
-    current_datetime = datetime.now()
-    formatted_datetime = current_datetime.strftime("%b_%d_%H_%M_%S")
-    fname = folder / f"pmesh3D_test1"    #
-    generate_PMSM_mesh(fname, False, res, L, depth)
+    fname = folder / "pmesh3D_ipm"
 
-    result = dolfinx.io.gmshio.read_from_msh(
-        str(fname.with_suffix(".msh")), MPI.COMM_WORLD, 0, gdim=3)
-    mesh = result[0]
-    cell_markers = result[1] if len(result) > 1 else None
-    facet_markers = result[2] if len(result) > 2 else None
-
-    # Retag cells based on geometry if tags are incomplete
-    if cell_markers is not None:
-        current_tags = set(np.unique(cell_markers.values))
-        required_tags = {1, 2, 3, 4, 5, 6}  # Basic domains
-        required_tags.update(range(7, 13))  # Coils (7-12)
-        required_tags.update(range(13, 23))  # Magnets (13-22)
-        
-        if not required_tags.issubset(current_tags):
-            print("\n🔄 Retagging cells based on geometry (GMSH tags incomplete)...")
-            
-            # Get cell centers
-            coords = mesh.geometry.x
-            dofmap = mesh.geometry.dofmap
-            centers = coords[dofmap].mean(axis=1)
-            radii = np.linalg.norm(centers[:, :2], axis=1)
-            angles = np.mod(np.arctan2(centers[:, 1], centers[:, 0]), 2 * np.pi)
-            
-            # Domain radii
-            r1 = mesh_parameters["r1"]
-            r2 = mesh_parameters["r2"]
-            r3 = mesh_parameters["r3"]
-            r4 = mesh_parameters["r4"]
-            r5 = mesh_parameters["r5"]
-            r6 = mesh_parameters["r6"]
-            r7 = mesh_parameters["r7"]
-            r_mid = 0.5 * (r2 + r3)
-            
-            # Coil and PM angles
-            coil_spacing = (np.pi / 4) + (np.pi / 4) / 3
-            coil_centers = np.asarray([i * coil_spacing for i in range(6)])
-            pm_spacing = (np.pi / 6) + (np.pi / 30)
-            pm_centers = np.asarray([i * pm_spacing for i in range(10)])
-            
-            coil_half = np.pi / 8 + np.deg2rad(2.0)
-            pm_half = np.pi / 12 + np.deg2rad(2.0)
-            radial_tol = 5e-4
-            
-            def _nearest(theta, centers_array):
-                diffs = np.arctan2(np.sin(theta - centers_array), np.cos(theta - centers_array))
-                idx = int(np.argmin(np.abs(diffs)))
-                return idx, float(abs(diffs[idx]))
-            
-            # Retag all cells
-            new_tags = np.empty_like(cell_markers.values)
-            for cell in range(len(new_tags)):
-                r = radii[cell]
-                theta = angles[cell]
-                tag = 1  # Default to Air
-                
-                if r <= r1 + radial_tol:
-                    tag = 5  # Rotor
-                elif r <= r6 - radial_tol:
-                    tag = 4  # Al
-                elif r <= r7 + radial_tol:
-                    idx, delta = _nearest(theta, pm_centers)
-                    if delta <= pm_half:
-                        tag = 13 + idx  # PM (13-22)
-                    else:
-                        tag = 4  # Al
-                elif r <= r2 - radial_tol:
-                    tag = 4  # Al
-                elif r <= r_mid + radial_tol:
-                    tag = 2  # AirGap0
-                elif r <= r3 + radial_tol:
-                    tag = 3  # AirGap1
-                elif r <= r4 + radial_tol:
-                    idx, delta = _nearest(theta, coil_centers)
-                    if delta <= coil_half:
-                        tag = 7 + idx  # Coil (7-12)
-                    else:
-                        tag = 1  # Air
-                elif r <= r5 + radial_tol:
-                    tag = 6  # Stator
-                else:
-                    tag = 1  # Air
-                
-                new_tags[cell] = tag
-            
-            # Create new meshtags
-            cell_indices = np.arange(len(new_tags), dtype=np.int32)
-            cell_markers = dolfinx.mesh.meshtags(mesh, mesh.topology.dim, cell_indices, new_tags)
-            unique_tags = sorted(set(new_tags.tolist()))
-            print(f"   ✅ Retagged mesh. Unique cell tags: {unique_tags}")
-            print(f"   Total cells: {len(new_tags)}")
-            for tag in unique_tags:
-                count = np.sum(new_tags == tag)
-                print(f"      Tag {tag}: {count} cells ({100*count/len(new_tags):.1f}%)")
-
-    cell_markers.name = "Cell_markers"
-    if facet_markers is not None:
-        facet_markers.name = "Facet_markers"
-    
-    # Create cell tag function for ParaView visualization
-    print("\n🎨 Creating cell tag function for ParaView...")
-    DG0 = dolfinx.fem.functionspace(mesh, ("DG", 0))
-    cell_tag_function = dolfinx.fem.Function(DG0, name="CellTags")
-    
-    if cell_markers is not None:
-        # Map cell markers to function values
-        cell_to_tag = {int(i): int(v) for i, v in zip(cell_markers.indices, cell_markers.values)}
-        print(f"   Found {len(cell_to_tag)} tagged cells")
-        
-        for cell_idx, tag in cell_to_tag.items():
-            if cell_idx < cell_tag_function.x.array.size:
-                cell_tag_function.x.array[cell_idx] = float(tag)
-        
-        # Get unique tags for reporting
-        unique_tags = sorted(set(cell_to_tag.values()))
-        print(f"   Unique domain tags: {unique_tags}")
-    
-    # Write XDMF with mesh, meshtags, and cell tag function
-    print(f"\n💾 Writing XDMF file: {fname.with_suffix('.xdmf')}")
-    with dolfinx.io.XDMFFile(MPI.COMM_WORLD, fname.with_suffix(".xdmf"), "w") as xdmf:
-        xdmf.write_mesh(mesh)
-        
-        if cell_markers is not None:
-            xdmf.write_meshtags(cell_markers, mesh.geometry)
-            xdmf.write_function(cell_tag_function, 0.0)
-        
-        if facet_markers is not None:
-            xdmf.write_meshtags(facet_markers, mesh.geometry)
-    
-    print("✅ XDMF file written with cell tag function")
-    print("\n📋 ParaView Instructions:")
-    print("   1. Open the XDMF file in ParaView")
-    print("   2. Click 'Apply'")
-    print("   3. In the 'Coloring' dropdown, select 'CellTags'")
-    print("   4. Use 'Discrete' color map for distinct domain colors")
-    print("   5. Adjust opacity if needed")
+    generate_PMSM_mesh(fname, False, res, args.L, depth)
