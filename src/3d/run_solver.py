@@ -126,7 +126,7 @@ def solve_one_step(mesh, A_space, V_space, ct, config, ksp, mat_nest, a_blocks,
         ksp.solve(rhs, sol)
         t_solve_end = time.time()
         if mesh.comm.rank == 0:
-            print(f"  [DIAG] ksp.solve() completed in {t_solve_end-t_solve_start:.3f} seconds")
+            print(f"[TIME] outer_solve_wall_s = {t_solve_start-t_solve_start + (t_solve_end-t_solve_start):.3f}", flush=True)
         
         # Diagnostic: Check convergence and solution
         if mesh.comm.rank == 0:
@@ -144,8 +144,7 @@ def solve_one_step(mesh, A_space, V_space, ct, config, ksp, mat_nest, a_blocks,
                 3: "CONVERGED_ITS",
             }
             reason_str = reason_map.get(reason, f"UNKNOWN({reason})")
-            import sys
-            print(f"  [DIAG] Convergence: {reason_str}, iterations={iterations}, residual={residual:.6e}", flush=True)
+            print(f"[OUTER-FINAL] reason={reason_str}, its={iterations}, true_resid={residual:.6e}", flush=True)
         
         A_sol = fem.Function(A_space, name="A")
         V_sol = fem.Function(V_space, name="V")
@@ -223,6 +222,19 @@ def run_solver(config=None):
         # Setup boundary conditions
         print("Setting up boundary conditions...")
         bc_A, bc_V, block_bcs = setup_boundary_conditions(mesh, ft, A_space, V_space)
+
+        # Ground V inside conductor network to remove constant null mode
+        from solve_equations import make_ground_bc_V
+        bc_ground = make_ground_bc_V(mesh, V_space, ct, DomainTags3D.conducting())
+        block_bcs[1].append(bc_ground)
+        # Grounding diagnostics
+        if mesh.comm.rank == 0:
+            print("[DIAG] Ground BC for V created (one DOF globally should be constrained).")
+        try:
+            print(f"[DIAG] rank={mesh.comm.rank} ground dofs={bc_ground.dof_indices().size}")
+        except AttributeError:
+            # Older dolfinx: no dof_indices; best-effort diagnostic
+            print(f"[DIAG] rank={mesh.comm.rank} ground BC applied (no dof_indices API).")
         
         # Setup sources
         print("Setting up sources...")
@@ -283,7 +295,7 @@ def run_solver(config=None):
                 debug_B = (step == 1)  # Debug first step only
                 # For visualization: compute B on the full domain.
                 # You can threshold/clip the outer air box in ParaView without changing physics.
-                B_sol, B_magnitude_sol, max_B, min_B, norm_B = compute_B_field(
+                B_sol, B_magnitude_sol, max_B, min_B, norm_B, B_dg = compute_B_field(
                     mesh, A_sol, B_space, B_magnitude_space, config, 
                     cell_tags=ct, debug=debug_B, restrict_to_airgap=False
                 )
@@ -297,11 +309,15 @@ def run_solver(config=None):
                         A_lag.x.array[:] = 0.0
                     
                     V_sol.name = "V"
+                    B_dg.name = "B_dg"
                     B_sol.name = "B"
                     B_magnitude_sol.name = "B_Magnitude"
                     
                     writer.write_function(A_lag, current_time)
                     writer.write_function(V_sol, current_time)
+                    # DG0 B written as cell data
+                    writer.write_function(B_dg, current_time)
+                    # Smoothed / projected B and its magnitude for visualization
                     writer.write_function(B_sol, current_time)
                     writer.write_function(B_magnitude_sol, current_time)
                 

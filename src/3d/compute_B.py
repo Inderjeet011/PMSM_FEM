@@ -5,6 +5,7 @@ from dolfinx import fem
 from dolfinx.fem import petsc
 from petsc4py import PETSc
 import ufl
+from load_mesh import DomainTags3D
 
 # Air gap tags
 AIR_GAP = (2, 3)
@@ -42,8 +43,8 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space, config, cell_tags=N
         print(f"   If curl(A) ≈ A/L, then B ≈ {max_A:.3e}/{typical_L:.4f} = {rough_B_estimate:.3e} T")
         print(f"   Expected B range: 0.1-2 T (magnet remanence = {config.magnet_remanence:.2f} T)")
     
-    # Use DG space for B computation - handles discontinuities better
-    # Create DG space for B (discontinuous, can represent curl(A) properly)
+    # Use DG space for B computation - handles discontinuities better.
+    # Natural choice: DG0 vector field (piecewise constant per cell).
     DG_vec = fem.functionspace(mesh, ("DG", 0, (3,)))
     B_dg = fem.Function(DG_vec, name="B_dg")
     curlA = ufl.curl(A_sol)
@@ -133,12 +134,65 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space, config, cell_tags=N
                     print(f"   mean|B| in air gap = {np.mean(airgap_B):.6e} T")
                     print(f"   median|B| in air gap = {np.median(airgap_B):.6e} T")
     
-    # Now interpolate from DG to Lagrange for visualization
+    # ------------------------------------------------------------------
+    # Region-wise diagnostics in the natural DG0 space (cell-wise B)
+    # ------------------------------------------------------------------
+    if cell_tags is not None:
+        # B_dg has one vector value per cell in DG0.
+        B_dg_array = B_dg.x.array.reshape((-1, 3))
+        B_dg_mag = np.linalg.norm(B_dg_array, axis=1)
+
+        # Define material/region groups
+        region_defs = {
+            "AirGap": DomainTags3D.AIR_GAP,
+            "PM": DomainTags3D.MAGNETS,
+            "Iron": DomainTags3D.ROTOR + DomainTags3D.STATOR,
+            "Conductors": DomainTags3D.conducting(),
+        }
+
+        if mesh.comm.rank == 0:
+            print("\n[B-REGION] Cell-wise DG0 B statistics by region:")
+
+        for region_name, markers in region_defs.items():
+            cell_ids = []
+            for m in markers:
+                cells_m = cell_tags.find(m)
+                if cells_m.size > 0:
+                    cell_ids.append(cells_m)
+            if not cell_ids:
+                continue
+            cells = np.concatenate(cell_ids).astype(np.int64)
+            vals = B_dg_mag[cells]
+            if vals.size == 0:
+                continue
+
+            max_B_r = float(np.max(vals))
+            mean_B_r = float(np.mean(vals))
+            med_B_r = float(np.median(vals))
+            p90 = float(np.percentile(vals, 90))
+            p99 = float(np.percentile(vals, 99))
+            frac_gt_10 = 100.0 * float(np.mean(vals > 10.0))
+            frac_gt_100 = 100.0 * float(np.mean(vals > 100.0))
+
+            if mesh.comm.rank == 0:
+                print(
+                    f"  - {region_name:10s}: "
+                    f"Ncells={vals.size:6d}, "
+                    f"max|B|={max_B_r:8.3e} T, "
+                    f"mean|B|={mean_B_r:8.3e} T, "
+                    f"median|B|={med_B_r:8.3e} T, "
+                    f"P90={p90:8.3e} T, P99={p99:8.3e} T, "
+                    f">%10T={frac_gt_10:6.2f}%, >100T={frac_gt_100:6.2f}%"
+                )
+
+    # ------------------------------------------------------------------
+    # Optional smoothing / projection for visualization
+    # ------------------------------------------------------------------
     if debug and mesh.comm.rank == 0:
         print(f"\n[Step 6] Interpolating from DG to Lagrange for visualization...")
     
-    # Use DG solution directly - it's more stable than Lagrange
-    # For visualization, we'll use B_dg directly
+    # For visualization in a user-provided space B_space, we still form a
+    # projected field B_sol. The primary diagnostic field remains B_dg.
     B_sol = fem.Function(B_space, name="B")
     
     # Project from DG to Lagrange for visualization
@@ -198,12 +252,6 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space, config, cell_tags=N
         # For now, let's keep the projection but it should be mostly in air gap already
     
     # Clean up
-    A_B.destroy()
-    b_B.destroy()
-    x_B.destroy()
-    ksp_B.destroy()
-    
-    # Clean up
     A_B_dg.destroy()
     b_B_dg.destroy()
     x_B_dg.destroy()
@@ -261,4 +309,4 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space, config, cell_tags=N
     if debug and mesh.comm.rank == 0:
         print(f"Final B field: max={max_B:.3e} T, min={min_B:.3e} T, ||B||={norm_B:.3e}")
     
-    return B_sol, B_magnitude_sol, max_B, min_B, norm_B
+    return B_sol, B_magnitude_sol, max_B, min_B, norm_B, B_dg
