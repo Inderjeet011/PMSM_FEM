@@ -10,8 +10,28 @@ from load_mesh import DomainTags3D
 # Air gap tags
 AIR_GAP = (2, 3)
 
+# Motor-region tags: everything except the outer air box
+MOTOR_TAGS = (
+    DomainTags3D.ROTOR
+    + DomainTags3D.STATOR
+    + DomainTags3D.COILS
+    + DomainTags3D.MAGNETS
+    + DomainTags3D.ALUMINIUM
+    + DomainTags3D.AIR_GAP
+)
 
-def compute_B_field(mesh, A_sol, B_space, B_magnitude_space, config, cell_tags=None, debug=False, restrict_to_airgap=False):
+
+def compute_B_field(
+    mesh,
+    A_sol,
+    B_space,
+    B_magnitude_space,
+    config,
+    cell_tags=None,
+    debug=False,
+    restrict_to_airgap=False,
+    restrict_to_motor=False,
+):
     """Compute B = curl(A)."""
     if debug and mesh.comm.rank == 0:
         print("\n" + "="*70)
@@ -70,7 +90,7 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space, config, cell_tags=N
     B_test_dg = ufl.TestFunction(DG_vec)
     B_trial_dg = ufl.TrialFunction(DG_vec)
     
-    # If restrict_to_airgap, only compute in air gap region (avoids boundary artifacts)
+    # If restrict_to_airgap or restrict_to_motor, only compute in that region
     if restrict_to_airgap and cell_tags is not None:
         if debug and mesh.comm.rank == 0:
             print(f"   Restricting computation to air gap region (tags: {AIR_GAP})...")
@@ -79,6 +99,16 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space, config, cell_tags=N
         dx_airgap_combined = dx_airgap(AIR_GAP[0]) + dx_airgap(AIR_GAP[1])
         a_B_dg = fem.form(ufl.inner(B_trial_dg, B_test_dg) * dx_airgap_combined)
         L_B_dg = fem.form(ufl.inner(curlA, B_test_dg) * dx_airgap_combined)
+    elif restrict_to_motor and cell_tags is not None:
+        if debug and mesh.comm.rank == 0:
+            print(f"   Restricting computation to motor region (tags: {MOTOR_TAGS})...")
+        dx_motor = ufl.Measure("dx", domain=mesh, subdomain_data=cell_tags)
+        dx_motor_combined = None
+        for tag in MOTOR_TAGS:
+            term = dx_motor(tag)
+            dx_motor_combined = term if dx_motor_combined is None else dx_motor_combined + term
+        a_B_dg = fem.form(ufl.inner(B_trial_dg, B_test_dg) * dx_motor_combined)
+        L_B_dg = fem.form(ufl.inner(curlA, B_test_dg) * dx_motor_combined)
     else:
         a_B_dg = fem.form(ufl.inner(B_trial_dg, B_test_dg) * ufl.dx)
         L_B_dg = fem.form(ufl.inner(curlA, B_test_dg) * ufl.dx)
@@ -199,13 +229,23 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space, config, cell_tags=N
     B_test = ufl.TestFunction(B_space)
     B_trial = ufl.TrialFunction(B_space)
     
-    # If restricted to air gap, also restrict the projection
+    # If restricted to air gap or motor, also restrict the projection
     if restrict_to_airgap and cell_tags is not None:
         dx_airgap = ufl.Measure("dx", domain=mesh, subdomain_data=cell_tags)
         dx_airgap_combined = dx_airgap(AIR_GAP[0]) + dx_airgap(AIR_GAP[1])
         a_B = fem.form(ufl.inner(B_trial, B_test) * dx_airgap_combined)
         L_B = fem.form(ufl.inner(B_dg, B_test) * dx_airgap_combined)
         # Initialize B_sol to zero (only air gap will be filled)
+        B_sol.x.array[:] = 0.0
+    elif restrict_to_motor and cell_tags is not None:
+        dx_motor = ufl.Measure("dx", domain=mesh, subdomain_data=cell_tags)
+        dx_motor_combined = None
+        for tag in MOTOR_TAGS:
+            term = dx_motor(tag)
+            dx_motor_combined = term if dx_motor_combined is None else dx_motor_combined + term
+        a_B = fem.form(ufl.inner(B_trial, B_test) * dx_motor_combined)
+        L_B = fem.form(ufl.inner(B_dg, B_test) * dx_motor_combined)
+        # Initialize B_sol to zero (only motor region will be filled)
         B_sol.x.array[:] = 0.0
     else:
         a_B = fem.form(ufl.inner(B_trial, B_test) * ufl.dx)

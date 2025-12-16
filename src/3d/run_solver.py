@@ -293,11 +293,17 @@ def run_solver(config=None):
                     print("Computing B = curl(A)...")
                 
                 debug_B = (step == 1)  # Debug first step only
-                # For visualization: compute B on the full domain.
-                # You can threshold/clip the outer air box in ParaView without changing physics.
+                # For visualization: compute B only on the motor region (exclude outer air box).
                 B_sol, B_magnitude_sol, max_B, min_B, norm_B, B_dg = compute_B_field(
-                    mesh, A_sol, B_space, B_magnitude_space, config, 
-                    cell_tags=ct, debug=debug_B, restrict_to_airgap=False
+                    mesh,
+                    A_sol,
+                    B_space,
+                    B_magnitude_space,
+                    config,
+                    cell_tags=ct,
+                    debug=debug_B,
+                    restrict_to_airgap=False,
+                    restrict_to_motor=True,
                 )
                 
                 if writer is not None:
@@ -305,7 +311,7 @@ def run_solver(config=None):
                     A_lag = fem.Function(A_lag_space, name="A")
                     try:
                         A_lag.interpolate(A_sol)
-                    except:
+                    except:  # pragma: no cover - safeguard for interpolation issues
                         A_lag.x.array[:] = 0.0
                     
                     V_sol.name = "V"
@@ -315,7 +321,7 @@ def run_solver(config=None):
                     
                     writer.write_function(A_lag, current_time)
                     writer.write_function(V_sol, current_time)
-                    # DG0 B written as cell data
+                    # DG0 B written as cell data (non-zero only in motor region)
                     writer.write_function(B_dg, current_time)
                     # Smoothed / projected B and its magnitude for visualization
                     writer.write_function(B_sol, current_time)
@@ -327,12 +333,7 @@ def run_solver(config=None):
                 
                 if mesh.comm.rank == 0:
                     print(f"Step {step}/{num_steps}: t={current_time*1e3:.3f} ms, "
-                        f"||A||={norm_A:.3e}, ||B||={norm_B:.3e}, max|B|={max_B:.3e} T\n")
-
-                # For now, stop after first step to ensure clean output files for visualization.
-                # This does not change physics; it only shortens the simulated time window.
-                if step == 1:
-                    break
+                        f"||A||={norm_B:.3e}, ||B||={norm_B:.3e}, max|B|={max_B:.3e} T\n")
         
         if writer is not None:
             writer.close()

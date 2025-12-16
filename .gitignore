@@ -26,6 +26,7 @@ results/**/*.png
 results/**/*.jpg
 results/**/*.pdf
 results/**/*.txt
+results/**/*.csv
 !results/.gitkeep
 !results/**/README.md
 !results/**/LICENSE
