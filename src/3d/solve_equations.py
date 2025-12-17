@@ -233,12 +233,26 @@ def build_forms(mesh, A_space, V_space, sigma, nu, J_z, M_vec, A_prev,
     a00_motional_expr = ufl.inner(ufl.cross(u_rot, curlA), v)
     a00 += (mu0 * sigma * inv_dt) * a00_motional_expr * dx_conductors
     a00 += alpha * ufl.inner(A, v) * ds_exterior
+
+    # Optional (tiny) operator regularization:
+    # Adding eps * (A, v) helps remove the curl-curl near-nullspace in insulating regions.
+    # Keep eps very small and always verify DG0 B statistics are unchanged.
+    epsA_full_value = float(getattr(config, "epsilon_A_full", 0.0))
+    if epsA_full_value > 0.0:
+        epsA_full = fem.Constant(mesh, PETSc.ScalarType(epsA_full_value))
+        a00 += epsA_full * ufl.inner(A, v) * dx
+        if mesh.comm.rank == 0:
+            print(f"[DIAG] A00_full mass shift: epsilon_A_full={epsA_full_value:.3e}")
     
     # A00_spd: SPD version for preconditioner (different scaling for AMS)
-    epsilon = fem.Constant(mesh, PETSc.ScalarType(1e-6))  # Small mass shift for zero-sigma regions
+    # This is the right place to add a small mass shift to remove near-nullspace modes.
+    epsilon_A_spd = float(getattr(config, "epsilon_A_spd", 1e-6))
+    epsilon = fem.Constant(mesh, PETSc.ScalarType(epsilon_A_spd))
     a00_spd = dt * nu * ufl.inner(curlA, curlv) * dx  # dt factor for robustness
     a00_spd += sigma * mu0 * ufl.inner(A, v) * dx
     a00_spd += epsilon * ufl.inner(A, v) * dx
+    if mesh.comm.rank == 0:
+        print(f"[DIAG] A00_spd mass shift: epsilon_A_spd={epsilon_A_spd:.3e}")
     # Scaled-down boundary penalty for AMS
     try:
         alpha_value = float(alpha.value)
@@ -262,6 +276,13 @@ def build_forms(mesh, A_space, V_space, sigma, nu, J_z, M_vec, A_prev,
     # Small stabilization for zero-sigma regions
     epsV = fem.Constant(mesh, PETSc.ScalarType(1e-8 * mu0))
     a11 = a11_core + epsV * ufl.inner(S, q) * dx
+
+    # Numerical row scaling for the V-equation: multiply the entire V-row by dt.
+    # This does NOT change the exact solution (the V-equation RHS is zero), but it
+    # balances the A01/A10 coupling and can greatly improve Krylov convergence.
+    if bool(getattr(config, "scale_V_row_by_dt", True)):
+        a10 = dt * a10
+        a11 = dt * a11
 
     # Right-hand side: coil current + previous step + permanent magnets
     J_term = J_z * v[2] * dx
@@ -374,7 +395,7 @@ def assemble_system_matrix(mesh, a_blocks, block_bcs, a00_spd_form=None, a00_mot
 
 
 
-def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd=None, A00_pc=None, degree_A=None):
+def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd=None, A00_pc=None, degree_A=None, config=None):
     """Configure linear solver for the 3D A–V system.
 
     Global structure:
@@ -431,7 +452,9 @@ def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd=None,
     # Use a more achievable tolerance for this difficult coupled problem
     # rtol=1e-4 requires ~1 order of magnitude reduction from initial residual
     # Keep max_it small for quick iteration during setup.
-    ksp.setTolerances(rtol=1e-4, atol=0.0, max_it=50)
+    outer_rtol = float(getattr(config, "outer_rtol", 1e-4)) if config is not None else 1e-4
+    outer_max_it = int(getattr(config, "outer_max_it", 50)) if config is not None else 50
+    ksp.setTolerances(rtol=outer_rtol, atol=0.0, max_it=outer_max_it)
     ksp.setGMRESRestart(120)  # Increased restart for better convergence
     # Python monitor (outer) – rank 0 only, print all iterations for steps 1-3
     def _outer_mon(ksp_obj, its, rnorm):
@@ -444,15 +467,45 @@ def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd=None,
     opts_outer.setValue("-ksp_monitor_true_residual", "")
     opts_outer.setValue("-ksp_converged_reason", "")
     
-    # Schur complement fieldsplit: solve A-V coupling by eliminating one block
     pc = ksp.getPC()
     pc.setType("fieldsplit")
-    pc.setFieldSplitType(PETSc.PC.CompositeType.SCHUR)
-    pc.setFieldSplitSchurFactType(PETSc.PC.SchurFactType.LOWER)
-    pc.setFieldSplitSchurPreType(PETSc.PC.SchurPreType.A11)  # Use A11 as Schur preconditioner
-    schur_pre_type = "A11"
-    if mesh.comm.rank == 0:
-        print(f"Schur factorization: LOWER, Schur preconditioner: {schur_pre_type}")
+
+    fieldsplit_type = getattr(config, "fieldsplit_type", "schur") if config is not None else "schur"
+    fieldsplit_type = str(fieldsplit_type).lower()
+
+    schur_pre_type = None
+    if fieldsplit_type == "additive":
+        pc.setFieldSplitType(PETSc.PC.CompositeType.ADDITIVE)
+        if mesh.comm.rank == 0:
+            print("FieldSplit type: ADDITIVE (block diagonal)")
+    elif fieldsplit_type in ("multiplicative", "gs"):
+        pc.setFieldSplitType(PETSc.PC.CompositeType.MULTIPLICATIVE)
+        if mesh.comm.rank == 0:
+            print("FieldSplit type: MULTIPLICATIVE (block Gauss-Seidel)")
+    elif fieldsplit_type in ("symmetric_multiplicative", "symm_multiplicative", "symgs"):
+        pc.setFieldSplitType(PETSc.PC.CompositeType.SYMMETRIC_MULTIPLICATIVE)
+        if mesh.comm.rank == 0:
+            print("FieldSplit type: SYMMETRIC_MULTIPLICATIVE")
+    else:
+        # Default: Schur complement fieldsplit
+        pc.setFieldSplitType(PETSc.PC.CompositeType.SCHUR)
+        pc.setFieldSplitSchurFactType(PETSc.PC.SchurFactType.LOWER)
+
+        # Schur preconditioner choice: try SELFP (often stronger) or fall back to A11.
+        schur_pre = getattr(config, "schur_pre", "A11") if config is not None else "A11"
+        schur_pre = str(schur_pre).upper()
+        if schur_pre == "SELFP":
+            try:
+                pc.setFieldSplitSchurPreType(PETSc.PC.SchurPreType.SELFP)
+                schur_pre_type = "SELFP"
+            except Exception:
+                pc.setFieldSplitSchurPreType(PETSc.PC.SchurPreType.A11)
+                schur_pre_type = "A11"
+        else:
+            pc.setFieldSplitSchurPreType(PETSc.PC.SchurPreType.A11)
+            schur_pre_type = "A11"
+        if mesh.comm.rank == 0:
+            print(f"Schur factorization: LOWER, Schur preconditioner: {schur_pre_type}")
     
     # Define field splits using nested IS extracted from the operator
     nested_IS = A.getNestISs()
@@ -510,9 +563,18 @@ def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd=None,
     # A-block: use true operator (A00_full) but SPD preconditioner (A00_spd) for AMS
     if mesh.comm.rank == 0:
         print("[DIAG] Configuring AMS preconditioner on A-block sub-KSP...")
-    ksp_A.setType("fgmres")
-    ksp_A.setTolerances(rtol=0.0, atol=0.0, max_it=2)
-    ksp_A.setGMRESRestart(10)
+    # A-block: either a tiny Krylov solve (default) or a single AMS apply (preonly).
+    ksp_A_type = str(getattr(config, "ksp_A_type", "fgmres")).lower() if config is not None else "fgmres"
+    if ksp_A_type == "preonly":
+        ksp_A.setType("preonly")
+        ksp_A_max_it = 1
+    else:
+        ksp_A.setType("fgmres")
+        # Keep the A-block apply cheap by default; tune via config.ksp_A_max_it if needed.
+        ksp_A_max_it = int(getattr(config, "ksp_A_max_it", 2)) if config is not None else 2
+        ksp_A.setTolerances(rtol=0.0, atol=0.0, max_it=ksp_A_max_it)
+        ksp_A_restart = int(getattr(config, "ksp_A_restart", 30)) if config is not None else 30
+        ksp_A.setGMRESRestart(ksp_A_restart)
     if A00_spd is not None:
         ksp_A.setOperators(A00_full, A00_spd)
         if mesh.comm.rank == 0:
@@ -577,10 +639,18 @@ def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd=None,
     pc_A.setFromOptions()
     
     if mesh.comm.rank == 0:
-        print("A-block: FGMRES(2) + Hypre AMS with discrete gradient G")
+        if ksp_A_type == "preonly":
+            print("A-block: Preonly + Hypre AMS with discrete gradient G")
+        else:
+            print(f"A-block: FGMRES({ksp_A_max_it}) + Hypre AMS with discrete gradient G")
 
-    # V-block: just apply preconditioner (no Krylov iterations)
-    ksp_V.setType("preonly")
+    # V-block: for ADDITIVE, a few iterations can help; for SCHUR keep it cheap by default.
+    ksp_V_max_it = int(getattr(config, "ksp_V_max_it", 0)) if config is not None else 0
+    if fieldsplit_type == "additive" and ksp_V_max_it > 0:
+        ksp_V.setType("cg")
+        ksp_V.setTolerances(rtol=0.0, atol=0.0, max_it=ksp_V_max_it)
+    else:
+        ksp_V.setType("preonly")
     pc_V = ksp_V.getPC()
     
     # Use robust preconditioner for V-block (BoomerAMG or GAMG for SPD, ILU/Jacobi fallback)
@@ -618,10 +688,14 @@ def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd=None,
     opts.setValue("-fieldsplit_A_pc_hypre_ams_relax_type", "2")
 
     if mesh.comm.rank == 0:
-        print("Solver configured: Schur fieldsplit")
-        print("  - A-block: FGMRES(2) + Hypre AMS (with discrete gradient)")
-        print("  - V-block: Preonly + BoomerAMG/GAMG")
-        print(f"  - Schur factorization: LOWER, Schur pre: {schur_pre_type}")
+        print("Solver configured: fieldsplit")
+        print(f"  - A-block: FGMRES({ksp_A_max_it}) + Hypre AMS (with discrete gradient)")
+        if fieldsplit_type == "additive" and ksp_V_max_it > 0:
+            print(f"  - V-block: CG({ksp_V_max_it}) + BoomerAMG/GAMG")
+        else:
+            print("  - V-block: Preonly + BoomerAMG/GAMG")
+        if schur_pre_type is not None:
+            print(f"  - Schur factorization: LOWER, Schur pre: {schur_pre_type}")
 
     # Keep AMS-related objects alive to avoid GC issues
     _ams_object_refs[id(ksp)] = {

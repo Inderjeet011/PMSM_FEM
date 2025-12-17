@@ -181,7 +181,7 @@ def run_tuning_sweep(beta_pc_values=[0.3, 0.5, 0.7, 1.0], alpha_spd_factor=1.0):
         )
         
         # Configure solver
-        ksp = configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, A00_pc, config.degree_A)
+        ksp = configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, A00_pc, config.degree_A, config=config)
         
         # Solve one step
         residual_history, reason, iterations, final_residual = solve_one_step_tuning(

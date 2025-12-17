@@ -51,9 +51,50 @@ class SimulationConfig3D:
         self.mu0 = model_parameters["mu_0"]
         self.mesh_path = Path(__file__).parents[2] / "meshes" / "3d" / "pmesh3D_ipm.xdmf"
         self.results_path = Path(__file__).parents[2] / "results" / "3d" / "av_solver.xdmf"
+        # Visualization-only export: a second XDMF/H5 with the airbox removed entirely.
+        self.export_motor_only = True
+        self.motor_only_results_path = Path(__file__).parents[2] / "results" / "3d" / "av_solver_motor_only.xdmf"
         self.diagnostics_path = Path(__file__).parents[2] / "results" / "3d" / "av_solver_diagnostics.csv"
         self.write_results = True
         self.magnet_remanence = 1.2
+        # -----------------------------
+        # Linear solver tuning knobs
+        # -----------------------------
+        # FieldSplit preconditioner choice for the coupled A–V system.
+        # "additive" has been the most robust for the PMSM case so far.
+        self.fieldsplit_type = "additive"  # "schur" | "additive" | "multiplicative"
+        self.schur_pre = "A11"  # if fieldsplit_type == "schur": "A11" | "SELFP"
+        
+        # Balance the V-row scaling (improves conditioning; does not change the exact solution).
+        self.scale_V_row_by_dt = True
+        
+        # A-block apply inside the preconditioner.
+        # "fgmres" with a few iterations gives much stronger convergence than a single AMS apply.
+        self.ksp_A_type = "fgmres"  # "preonly" | "fgmres"
+        self.ksp_A_max_it = 8
+        self.ksp_A_restart = 50
+        
+        # V-block solve for additive fieldsplit (0 keeps it as preonly).
+        self.ksp_V_max_it = 0
+        
+        # Outer KSP limits (keep small for quick runs; increase when diagnosing).
+        # With the current additive preconditioner, rtol ~2e-2 is realistic for <=50 its.
+        self.outer_rtol = 2e-2
+        self.outer_max_it = 50
+        
+        # Timestep acceptance threshold (ratio = ||b-Ax|| / ||b-Ax0||).
+        # With the current preconditioner we typically get ~0.31 at 50 its; 0.35 keeps marching stable.
+        self.accept_ratio = 0.35
+        
+        # A00_spd boundary penalty scaling (AMS-only matrix; does not change physics).
+        self.alpha_spd_factor = 1e-3
+
+        # Small operator regularization for robustness (verify DG0 B stats when changing):
+        # This removes a curl-curl near-nullspace mode that otherwise causes Krylov plateaus.
+        self.epsilon_A_full = 1e-4
+
+        # Keep the SPD preconditioner mass shift tiny; the main effect comes from epsilon_A_full.
+        self.epsilon_A_spd = 1e-6
     
     @property
     def omega_e(self):

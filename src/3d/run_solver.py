@@ -235,9 +235,14 @@ def solve_one_step(mesh, A_space, V_space, ct, config, ksp, mat_nest, a_blocks,
         # Otherwise A_prev becomes huge and later timesteps can blow up (residuals 1e20+).
         r_final = float(ksp.getResidualNorm())
         ratio = (r_final / r0) if r0 > 0 else np.inf
-        accept = (ksp.getConvergedReason() > 0) or (np.isfinite(ratio) and ratio < 0.2)
+        accept_ratio = float(getattr(config, "accept_ratio", 0.2))
+        accept = (ksp.getConvergedReason() > 0) or (np.isfinite(ratio) and ratio < accept_ratio)
         if mesh.comm.rank == 0:
-            print(f"  [SANITY] ||b-Ax0||={r0:.3e}, ||b-Ax||={r_final:.3e}, ratio={ratio:.3e}, accept={accept}", flush=True)
+            print(
+                f"  [SANITY] ||b-Ax0||={r0:.3e}, ||b-Ax||={r_final:.3e}, "
+                f"ratio={ratio:.3e}, accept={accept} (threshold={accept_ratio:.3e})",
+                flush=True,
+            )
 
         if accept:
             A_prev.x.array[:] = A_sol.x.array[:]
@@ -373,7 +378,7 @@ def run_solver(config=None):
         
         # Configure solver
         print("Configuring solver...")
-        ksp = configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, A00_pc, config.degree_A)
+        ksp = configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, A00_pc, config.degree_A, config=config)
         
         print("Setup complete!\n")
         
@@ -461,6 +466,22 @@ def run_solver(config=None):
             writer.close()
             if mesh.comm.rank == 0:
                 print(f"Results written to: {config.results_path}")
+
+        # Visualization-only: write a second XDMF/H5 with the airbox removed entirely.
+        # This does not affect physics/solver; it only filters the written results.
+        if bool(getattr(config, "export_motor_only", False)) and bool(getattr(config, "write_results", True)):
+            try:
+                from extract_motor_only import extract_motor_mesh
+                motor_only_path = getattr(config, "motor_only_results_path", None)
+                if motor_only_path is None:
+                    motor_only_path = config.results_path.parent / "av_solver_motor_only.xdmf"
+                # Call on all ranks; the helper writes HDF5 on rank 0 and uses an MPI barrier.
+                extract_motor_mesh(config.results_path, motor_only_path)
+                if mesh.comm.rank == 0:
+                    print(f"[VIS] Motor-only XDMF written to: {motor_only_path}", flush=True)
+            except Exception as exc:
+                if mesh.comm.rank == 0:
+                    print(f"[WARN] Motor-only export failed: {exc}", flush=True)
         
         print("=== DONE ===")
 
