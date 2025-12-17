@@ -50,12 +50,16 @@ class SimulationConfig3D:
         self.coil_current_peak = model_parameters["J"]
         self.mu0 = model_parameters["mu_0"]
         self.mesh_path = Path(__file__).parents[2] / "meshes" / "3d" / "pmesh3D_ipm.xdmf"
+        # Output: write only these two files (XDMF + HDF5)
         self.results_path = Path(__file__).parents[2] / "results" / "3d" / "av_solver.xdmf"
-        # Visualization-only export: a second XDMF/H5 with the airbox removed entirely.
-        self.export_motor_only = True
-        self.motor_only_results_path = Path(__file__).parents[2] / "results" / "3d" / "av_solver_motor_only.xdmf"
-        self.diagnostics_path = Path(__file__).parents[2] / "results" / "3d" / "av_solver_diagnostics.csv"
         self.write_results = True
+        # Optional: write a diagnostics CSV (disabled by default to keep outputs minimal)
+        self.write_diagnostics = False
+        self.diagnostics_path = Path(__file__).parents[2] / "results" / "3d" / "av_solver_diagnostics.csv"
+
+        # Motor-only output into the SAME av_solver.xdmf/.h5 (no extra outputs):
+        # Implementation writes a temporary full-mesh file, then replaces av_solver.* with motor-only.
+        self.output_motor_only = True
         self.magnet_remanence = 1.2
         # -----------------------------
         # Linear solver tuning knobs

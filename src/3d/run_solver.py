@@ -170,7 +170,10 @@ def solve_one_step(mesh, A_space, V_space, ct, config, ksp, mat_nest, a_blocks,
                 3: "CONVERGED_ITS",
             }
             reason_str = reason_map.get(reason, f"UNKNOWN({reason})")
-            print(f"[OUTER-FINAL] reason={reason_str}, its={iterations}, true_resid={residual:.6e}", flush=True)
+            print(
+                f"[OUTER-FINAL] reason={reason_str}, code={reason}, its={iterations}, true_resid={residual:.6e}",
+                flush=True,
+            )
         
         A_sol = fem.Function(A_space, name="A")
         V_sol = fem.Function(V_space, name="V")
@@ -392,23 +395,35 @@ def run_solver(config=None):
             print(f"Steps: {num_steps}, dt: {dt*1e3:.3f} ms\n")
         
         writer = None
+        output_motor_only = bool(getattr(config, "output_motor_only", False))
+        tmp_full_path = None
+        out_path = config.results_path
+        if output_motor_only:
+            # Write full-mesh results to a temporary file, then replace av_solver.* with motor-only.
+            tmp_full_path = out_path.with_name(out_path.stem + "__fulltmp.xdmf")
+            out_path = tmp_full_path
+
         if config.write_results:
-            config.results_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
             if mesh.comm.rank == 0:
-                print(f"Writing results to: {config.results_path}")
-            writer = io.XDMFFile(MPI.COMM_WORLD, str(config.results_path), "w")
+                print(f"Writing results to: {out_path}")
+            writer = io.XDMFFile(MPI.COMM_WORLD, str(out_path), "w")
             writer.write_mesh(mesh)
             if ct is not None:
                 writer.write_meshtags(ct, mesh.geometry)
             if ft is not None:
                 writer.write_meshtags(ft, mesh.geometry)
         
-        config.diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(config.diagnostics_path, "w", newline="") as diag_file:
+        diag_writer = None
+        diag_file = None
+        if bool(getattr(config, "write_diagnostics", False)):
+            config.diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+            diag_file = open(config.diagnostics_path, "w", newline="")
             diag_writer = csv.writer(diag_file)
-            diag_writer.writerow(["step", "time_ms", "norm_A", "iterations", "residual", 
-                                "max_J", "max_B", "min_B", "norm_B"])
-            
+            diag_writer.writerow(["step", "time_ms", "norm_A", "iterations", "residual",
+                                  "max_J", "max_B", "min_B", "norm_B"])
+
+        try:
             for step in range(1, num_steps + 1):
                 current_time += dt
                 A_sol, V_sol, its, max_J, residual, L_blocks = solve_one_step(
@@ -445,6 +460,14 @@ def run_solver(config=None):
                     B_dg.name = "B_dg"
                     B_sol.name = "B"
                     B_magnitude_sol.name = "B_Magnitude"
+
+                    # Visualization-only smoother fields (keep B_dg unchanged for diagnostics)
+                    B_vis = fem.Function(B_space, name="B_vis")
+                    B_vis.x.array[:] = B_sol.x.array[:]
+                    B_vis.x.scatter_forward()
+                    B_vis_mag = fem.Function(B_magnitude_space, name="B_vis_mag")
+                    B_vis_mag.x.array[:] = B_magnitude_sol.x.array[:]
+                    B_vis_mag.x.scatter_forward()
                     
                     writer.write_function(A_lag, current_time)
                     writer.write_function(V_sol, current_time)
@@ -453,35 +476,45 @@ def run_solver(config=None):
                     # Smoothed / projected B and its magnitude for visualization
                     writer.write_function(B_sol, current_time)
                     writer.write_function(B_magnitude_sol, current_time)
+                    writer.write_function(B_vis, current_time)
+                    writer.write_function(B_vis_mag, current_time)
                 
-                norm_A = np.linalg.norm(A_sol.x.array)
-                diag_writer.writerow([step, current_time * 1e3, norm_A, its, residual,
-                                    max_J, max_B, min_B, norm_B])
+                if diag_writer is not None:
+                    norm_A = np.linalg.norm(A_sol.x.array)
+                    diag_writer.writerow([step, current_time * 1e3, norm_A, its, residual,
+                                          max_J, max_B, min_B, norm_B])
                 
                 if mesh.comm.rank == 0:
                     print(f"Step {step}/{num_steps}: t={current_time*1e3:.3f} ms, "
                         f"||A||={norm_B:.3e}, ||B||={norm_B:.3e}, max|B|={max_B:.3e} T\n")
         
+        finally:
+            if diag_file is not None:
+                diag_file.close()
+
         if writer is not None:
             writer.close()
             if mesh.comm.rank == 0:
-                print(f"Results written to: {config.results_path}")
+                print(f"Results written to: {out_path}")
 
-        # Visualization-only: write a second XDMF/H5 with the airbox removed entirely.
-        # This does not affect physics/solver; it only filters the written results.
-        if bool(getattr(config, "export_motor_only", False)) and bool(getattr(config, "write_results", True)):
+        # Replace outputs with motor-only but keep the same final filenames (av_solver.xdmf/.h5)
+        if output_motor_only and tmp_full_path is not None and bool(getattr(config, "write_results", True)):
             try:
                 from extract_motor_only import extract_motor_mesh
-                motor_only_path = getattr(config, "motor_only_results_path", None)
-                if motor_only_path is None:
-                    motor_only_path = config.results_path.parent / "av_solver_motor_only.xdmf"
-                # Call on all ranks; the helper writes HDF5 on rank 0 and uses an MPI barrier.
-                extract_motor_mesh(config.results_path, motor_only_path)
+                final_path = config.results_path
+                # Extract motor-only into the final path (av_solver.xdmf)
+                extract_motor_mesh(tmp_full_path, final_path)
                 if mesh.comm.rank == 0:
-                    print(f"[VIS] Motor-only XDMF written to: {motor_only_path}", flush=True)
+                    # Delete temporary full-mesh files
+                    tmp_h5 = tmp_full_path.with_suffix(".h5")
+                    if tmp_full_path.exists():
+                        tmp_full_path.unlink()
+                    if tmp_h5.exists():
+                        tmp_h5.unlink()
+                    print(f"[VIS] Motor-only results written to: {final_path} (no extra files)", flush=True)
             except Exception as exc:
                 if mesh.comm.rank == 0:
-                    print(f"[WARN] Motor-only export failed: {exc}", flush=True)
+                    print(f"[WARN] Motor-only replace failed (keeping full-mesh output): {exc}", flush=True)
         
         print("=== DONE ===")
 
