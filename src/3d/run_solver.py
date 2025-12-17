@@ -115,8 +115,34 @@ def solve_one_step(mesh, A_space, V_space, ct, config, ksp, mat_nest, a_blocks,
         ]
         sol = PETSc.Vec().createNest(sol_blocks, comm=mesh.comm)
         
-        # Set initial guess to zero explicitly
-        sol.set(0.0)
+        # Initial guess:
+        # - If the previous step produced a "good enough" solution, reuse A_prev.
+        # - Otherwise start from zero, to avoid feeding a bad A_prev into the (mu0*sigma/dt)*A_prev term next step.
+        prev_ok = bool(getattr(A_prev, "_accepted", False))
+        if prev_ok:
+            A_prev.x.scatter_forward()
+            A_prev_norm = float(np.linalg.norm(A_prev.x.array))
+            with sol.getNestSubVecs()[0].localForm() as local:
+                local.array[:] = A_prev.x.array[: local.array.size]
+            with sol.getNestSubVecs()[1].localForm() as local:
+                local.array[:] = 0.0
+            sol.assemble()
+            if mesh.comm.rank == 0:
+                print(f"  [DIAG] Initial guess: using A_prev (||A_prev||={A_prev_norm:.3e})")
+        else:
+            sol.set(0.0)
+            if mesh.comm.rank == 0:
+                print("  [DIAG] Initial guess: zero (previous step not accepted yet)")
+
+        # Compute the true residual norm for the chosen initial guess: r0 = ||b - A*x0||
+        # This is the baseline we want to reduce each timestep.
+        r0_vec = rhs.duplicate()
+        r0_vec.set(0.0)
+        mat_nest.mult(sol, r0_vec)
+        r0_vec.scale(-1.0)
+        r0_vec.axpy(1.0, rhs)
+        r0 = float(r0_vec.norm())
+        r0_vec.destroy()
         
         # Check convergence reason
         if mesh.comm.rank == 0:
@@ -152,22 +178,75 @@ def solve_one_step(mesh, A_space, V_space, ct, config, ksp, mat_nest, a_blocks,
         copy_block_to_function(sol.getNestSubVecs()[1], V_sol)
         
         # Diagnostic: Check solution norms
+        # NOTE: A_sol is in an H(curl) (Nédélec) space, so its DOFs are NOT 3-component
+        # vector values at points. For a beginner-friendly sanity check, we interpolate
+        # to a Lagrange vector field and measure norms there (good for diagnostics/plots).
         if mesh.comm.rank == 0:
-            # Use .x.array directly (dolfinx Vector), no localForm
-            A_array = A_sol.x.array.reshape((-1, 3))
-            norm_A = np.linalg.norm(A_array)
-            max_A = np.max(np.linalg.norm(A_array, axis=1))
-            mean_A = np.mean(np.linalg.norm(A_array, axis=1))
+            A_lag_space = fem.functionspace(mesh, ("Lagrange", 1, (3,)))
+            A_lag = fem.Function(A_lag_space, name="A_interp")
+            try:
+                A_lag.interpolate(A_sol)
+                A_lag.x.scatter_forward()
+                A_vals = A_lag.x.array.reshape((-1, 3))
+                norm_A = float(np.linalg.norm(A_vals))
+                max_A = float(np.max(np.linalg.norm(A_vals, axis=1)))
+                mean_A = float(np.mean(np.linalg.norm(A_vals, axis=1)))
+            except Exception as exc:
+                # If interpolation fails, fall back to coefficient norm (not physical).
+                norm_A = float(np.linalg.norm(A_sol.x.array))
+                max_A = float(np.max(np.abs(A_sol.x.array)))
+                mean_A = float(np.mean(np.abs(A_sol.x.array)))
+                print(f"  [WARN] A interpolation failed for diagnostics: {exc}", flush=True)
 
             V_array = V_sol.x.array
             norm_V = np.linalg.norm(V_array)
             max_V = np.max(np.abs(V_array))
             mean_V = np.mean(np.abs(V_array))
 
-            print(f"  [DIAG] Solution: ||A||={norm_A:.6e} Wb/m, max|A|={max_A:.6e} Wb/m, mean|A|={mean_A:.6e} Wb/m", flush=True)
+            print(f"  [DIAG] Solution: ||A_interp||={norm_A:.6e} (Lagrange interp), max|A_interp|={max_A:.6e}, mean|A_interp|={mean_A:.6e}", flush=True)
             print(f"  [DIAG] Solution: ||V||={norm_V:.6e} V, max|V|={max_V:.6e} V, mean|V|={mean_V:.6e} V", flush=True)
-        
-        A_prev.x.array[:] = A_sol.x.array[:]
+
+            # Simple sanity check: look at |V| only in conductors (where sigma > 0).
+            # V itself is gauge-like (constant shift doesn't matter), but huge values
+            # in conductors usually indicate the solve is not under control.
+            try:
+                conductor_cells = []
+                for tag in DomainTags3D.conducting():
+                    cc = ct.find(tag)
+                    if cc.size > 0:
+                        conductor_cells.append(cc.astype(np.int32))
+                if conductor_cells:
+                    cells = np.unique(np.concatenate(conductor_cells))
+                    dofs = np.unique(
+                        np.concatenate([V_space.dofmap.cell_dofs(int(c)) for c in cells])
+                    )
+                    if dofs.size > 0:
+                        Vc = np.abs(V_sol.x.array[dofs])
+                        print(
+                            f"  [SANITY] |V| in conductors: max={float(Vc.max()):.3e} V, "
+                            f"mean={float(Vc.mean()):.3e} V",
+                            flush=True,
+                        )
+            except Exception as exc:
+                print(f"  [WARN] Could not compute conductor-only V stats: {exc}", flush=True)
+
+        # Accept/reject the step for time marching:
+        # If the linear solve did not reduce the residual enough, do NOT update A_prev.
+        # Otherwise A_prev becomes huge and later timesteps can blow up (residuals 1e20+).
+        r_final = float(ksp.getResidualNorm())
+        ratio = (r_final / r0) if r0 > 0 else np.inf
+        accept = (ksp.getConvergedReason() > 0) or (np.isfinite(ratio) and ratio < 0.2)
+        if mesh.comm.rank == 0:
+            print(f"  [SANITY] ||b-Ax0||={r0:.3e}, ||b-Ax||={r_final:.3e}, ratio={ratio:.3e}, accept={accept}", flush=True)
+
+        if accept:
+            A_prev.x.array[:] = A_sol.x.array[:]
+            setattr(A_prev, "_accepted", True)
+        else:
+            setattr(A_prev, "_accepted", False)
+            if mesh.comm.rank == 0:
+                print("  [WARN] Step not accepted: keeping previous A_prev to avoid blow-up.", flush=True)
+
         iterations = ksp.getIterationNumber()
         residual = ksp.getResidualNorm()
         max_J = current_stats(J_z)
@@ -227,14 +306,25 @@ def run_solver(config=None):
         from solve_equations import make_ground_bc_V
         bc_ground = make_ground_bc_V(mesh, V_space, ct, DomainTags3D.conducting())
         block_bcs[1].append(bc_ground)
-        # Grounding diagnostics
-        if mesh.comm.rank == 0:
-            print("[DIAG] Ground BC for V created (one DOF globally should be constrained).")
+        # Grounding diagnostics: should be ~1 global DOF in the conductor network
+        local_ndofs = 0
         try:
-            print(f"[DIAG] rank={mesh.comm.rank} ground dofs={bc_ground.dof_indices().size}")
-        except AttributeError:
-            # Older dolfinx: no dof_indices; best-effort diagnostic
-            print(f"[DIAG] rank={mesh.comm.rank} ground BC applied (no dof_indices API).")
+            di = bc_ground.dof_indices
+            di = di() if callable(di) else di
+            # dolfinx may return (dofs, block_size)
+            if isinstance(di, tuple):
+                local_ndofs = int(di[0].size)
+            else:
+                local_ndofs = int(np.asarray(di).size)
+        except Exception:
+            try:
+                # Some dolfinx versions expose dofs as an array-like attribute
+                local_ndofs = int(len(bc_ground.dofs))
+            except Exception:
+                local_ndofs = 0
+        global_ndofs = mesh.comm.allreduce(local_ndofs, op=MPI.SUM)
+        if mesh.comm.rank == 0:
+            print(f"[DIAG] V grounding: global constrained dofs = {global_ndofs}", flush=True)
         
         # Setup sources
         print("Setting up sources...")
@@ -244,14 +334,46 @@ def run_solver(config=None):
         # Build forms and assemble matrix
         print("Building forms and assembling matrix...")
         from load_mesh import EXTERIOR_FACET_TAG
-        a_blocks, L_blocks, a00_spd_form = build_forms(mesh, A_space, V_space, sigma, nu, J_z, M_vec,
-                                                        A_prev, dx, dx_conductors, dx_magnets, ds, config,
-                                                        exterior_facet_tag=EXTERIOR_FACET_TAG)
-        mat_blocks, mat_nest, _, A00_spd = assemble_system_matrix(mesh, a_blocks, block_bcs, a00_spd_form)
+        a_blocks, L_blocks, a00_spd_form, a00_motional_form = build_forms(
+            mesh,
+            A_space,
+            V_space,
+            sigma,
+            nu,
+            J_z,
+            M_vec,
+            A_prev,
+            dx,
+            dx_conductors,
+            dx_magnets,
+            ds,
+            config,
+            exterior_facet_tag=EXTERIOR_FACET_TAG,
+        )
+        beta_pc = getattr(config, "beta_pc", 0.3)  # Default 0.3, can be set for tuning
+        mat_blocks, mat_nest, _, A00_spd, A00_pc = assemble_system_matrix(
+            mesh, a_blocks, block_bcs, a00_spd_form, a00_motional_form, beta_pc=beta_pc
+        )
+
+        # Quick coupling sanity: these should be non-zero (otherwise V is effectively decoupled).
+        if mesh.comm.rank == 0:
+            try:
+                A01 = mat_blocks[0][1]
+                A10 = mat_blocks[1][0]
+                A11 = mat_blocks[1][1]
+                print(
+                    "[DIAG] Block norms: "
+                    f"||A01||_F={A01.norm(PETSc.NormType.NORM_FROBENIUS):.3e}, "
+                    f"||A10||_F={A10.norm(PETSc.NormType.NORM_FROBENIUS):.3e}, "
+                    f"||A11||_F={A11.norm(PETSc.NormType.NORM_FROBENIUS):.3e}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[WARN] Could not compute block norms: {exc}", flush=True)
         
         # Configure solver
         print("Configuring solver...")
-        ksp = configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, config.degree_A)
+        ksp = configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, A00_pc, config.degree_A)
         
         print("Setup complete!\n")
         

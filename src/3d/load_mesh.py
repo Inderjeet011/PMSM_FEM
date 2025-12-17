@@ -42,7 +42,9 @@ class SimulationConfig3D:
         self.steps_per_period = 20
         period = 1.0 / self.drive_frequency
         self.dt = period / self.steps_per_period
-        self.num_steps = self.steps_per_period
+        # Run enough steps to cover at least 16ms (for visualization at 4ms, 8ms, 12ms, 16ms)
+        # With dt ≈ 0.833ms, we need at least 20 steps to reach 16ms
+        self.num_steps = 20  # This gives ~16.67ms total time, covering all requested timesteps
         self.degree_A = 1
         self.degree_V = 1
         self.coil_current_peak = model_parameters["J"]
