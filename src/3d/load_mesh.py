@@ -190,7 +190,7 @@ def maybe_retag_cells(mesh, cell_tags):
     angles = np.mod(np.arctan2(centers[:, 1], centers[:, 0]), 2 * np.pi)
     
     r1, r2, r3, r4, r5, r6, r7 = [mesh_parameters[f"r{i}"] for i in range(1, 8)]
-    r_mid = 0.5 * (r2 + r3)
+    r_mid_gap = 0.5 * (r3 + r4)  # CORRECT: airgap is between r3 and r4, split at midpoint
     
     coil_spacing = (np.pi / 4) + (np.pi / 4) / 3
     coil_centers = np.asarray([i * coil_spacing for i in range(len(COILS))])
@@ -221,14 +221,18 @@ def maybe_retag_cells(mesh, cell_tags):
             tag = MAGNETS[idx] if delta <= pm_half else ALUMINIUM[0]
         elif r <= r2 - radial_tol:
             tag = ALUMINIUM[0]
-        elif r <= r_mid + radial_tol:
-            tag = AIR_GAP[0]
-        elif r <= r3 + radial_tol:
-            tag = AIR_GAP[1]
-        elif r <= r4 + radial_tol:
+        elif r <= r3 - radial_tol:
+            tag = ALUMINIUM[0]  # Rotor iron continues to r3
+        elif r3 - radial_tol < r <= r_mid_gap + radial_tol:
+            tag = AIR_GAP[0]  # Inner half of airgap
+        elif r_mid_gap - radial_tol < r <= r4 + radial_tol:
+            # Check if this is a coil slot or airgap
             idx, delta = nearest(theta, coil_centers)
-            tag = COILS[idx] if delta <= coil_half else AIR[0]
-        elif r <= r5 + radial_tol:
+            if delta <= coil_half:
+                tag = COILS[idx]  # Coil slot
+            else:
+                tag = AIR_GAP[1]  # Outer half of airgap
+        elif r4 - radial_tol < r <= r5 + radial_tol:
             tag = STATOR[0]
         else:
             tag = AIR[0]

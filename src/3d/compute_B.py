@@ -4,6 +4,7 @@ import numpy as np
 from dolfinx import fem
 from dolfinx.fem import petsc
 from petsc4py import PETSc
+from mpi4py import MPI
 import ufl
 from load_mesh import DomainTags3D
 
@@ -122,28 +123,31 @@ def compute_B_field(
     if (restrict_to_airgap or restrict_to_motor) and cell_tags is not None:
         B_dg_array = B_dg.x.array.reshape((-1, 3))
         tdim = mesh.topology.dim
-        num_cells = mesh.topology.index_map(tdim).size_local
+        num_cells_local = mesh.topology.index_map(tdim).size_local
         
         if restrict_to_airgap:
-            # Get airgap cells
-            target_cells = set()
+            # Get airgap cells (these are LOCAL cell indices)
+            target_cells_local = set()
             for tag in AIR_GAP:
                 cells = cell_tags.find(tag)
-                target_cells.update(cells.tolist())
+                # cell_tags.find() returns local cell indices on this rank
+                target_cells_local.update(cells.tolist())
             if mesh.comm.rank == 0:
-                print(f"[MASK] Masking B_dg to airgap: {len(target_cells)} cells")
+                total_airgap = mesh.comm.allreduce(len(target_cells_local), op=MPI.SUM)
+                print(f"[MASK] Masking B_dg to airgap: {len(target_cells_local)} local cells ({total_airgap} total)")
         elif restrict_to_motor:
             # Get motor cells
-            target_cells = set()
+            target_cells_local = set()
             for tag in MOTOR_TAGS:
                 cells = cell_tags.find(tag)
-                target_cells.update(cells.tolist())
+                target_cells_local.update(cells.tolist())
             if mesh.comm.rank == 0:
-                print(f"[MASK] Masking B_dg to motor: {len(target_cells)} cells")
+                total_motor = mesh.comm.allreduce(len(target_cells_local), op=MPI.SUM)
+                print(f"[MASK] Masking B_dg to motor: {len(target_cells_local)} local cells ({total_motor} total)")
         
-        # Zero B_dg for cells NOT in target region
-        for cell_idx in range(num_cells):
-            if cell_idx not in target_cells:
+        # Zero B_dg for cells NOT in target region (using LOCAL indices)
+        for cell_idx in range(num_cells_local):
+            if cell_idx not in target_cells_local:
                 B_dg_array[cell_idx, :] = 0.0
         
         B_dg.x.array[:] = B_dg_array.flatten()
@@ -240,15 +244,15 @@ def compute_B_field(
     if (restrict_to_airgap or restrict_to_motor) and cell_tags is not None:
         # Get target cells
         if restrict_to_airgap:
-            target_cells = set()
+            target_cells_local = set()
             for tag in AIR_GAP:
                 cells = cell_tags.find(tag)
-                target_cells.update(cells.tolist())
+                target_cells_local.update(cells.tolist())
         elif restrict_to_motor:
-            target_cells = set()
+            target_cells_local = set()
             for tag in MOTOR_TAGS:
                 cells = cell_tags.find(tag)
-                target_cells.update(cells.tolist())
+                target_cells_local.update(cells.tolist())
         
         # Zero B_sol first
         B_sol.x.array[:] = 0.0
@@ -267,9 +271,9 @@ def compute_B_field(
         B_sol_array = B_sol.x.array.reshape((-1, 3))
         
         kept_dofs = set()
-        for cell_idx in target_cells:
+        for cell_idx in target_cells_local:
             if cell_idx < num_cells_local:
-                # Get B_dg value for this cell
+                # Get B_dg value for this cell (already masked, so zero if not in target)
                 B_cell = B_dg_array[cell_idx, :]
                 # Set all DOFs of this cell to B_cell
                 cell_dofs = dofmap.cell_dofs(cell_idx)
