@@ -471,12 +471,11 @@ def run_solver(config=None):
                 
                 t_post_start = time.perf_counter()
                 debug_B = (step == 1)  # Debug first step only
-                # For visualization: compute B and (optionally) mask it to a region to reduce clutter.
-                region = str(getattr(config, "B_output_region", "motor")).strip().lower()
-                restrict_to_airgap = (region == "airgap")
-                restrict_to_motor = (region == "motor")
-                # region == "full" -> no restriction
-
+                # Use config to determine B output region
+                B_output_region = getattr(config, "B_output_region", "motor")
+                restrict_to_airgap = (B_output_region == "airgap")
+                restrict_to_motor = (B_output_region == "motor")
+                # For visualization: compute B on full mesh, then mask to requested region
                 B_sol, B_magnitude_sol, max_B, min_B, norm_B, B_dg = compute_B_field(
                     mesh,
                     A_sol,

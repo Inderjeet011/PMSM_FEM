@@ -86,14 +86,11 @@ def compute_B_field(
                 print(f"   Could not evaluate curl(A) directly: {e}")
     
     # Project curl(A) to DG space using L2 projection
-    # DG space is cell-wise constant, so this is more stable
+    # ALWAYS compute on full mesh for correct physics, then mask if needed
     B_test_dg = ufl.TestFunction(DG_vec)
     B_trial_dg = ufl.TrialFunction(DG_vec)
     
-    # NOTE:
-    # We intentionally compute B_dg on the full mesh (full dx), then *mask* it
-    # to the desired region (airgap or motor). This avoids singular "restricted
-    # mass matrix" projections (DG0 mass has zero rows for excluded cells).
+    # Compute B on full mesh (correct physics)
     a_B_dg = fem.form(ufl.inner(B_trial_dg, B_test_dg) * ufl.dx)
     L_B_dg = fem.form(ufl.inner(curlA, B_test_dg) * ufl.dx)
     
@@ -120,42 +117,36 @@ def compute_B_field(
     
     B_dg.x.array[:] = x_B_dg.array_r[:B_dg.x.array.size]
     B_dg.x.scatter_forward()
-
-    # ------------------------------------------------------------------
-    # Mask B_dg to requested region (airgap or motor)
-    # ------------------------------------------------------------------
-    if cell_tags is not None and (restrict_to_airgap or restrict_to_motor):
-        selected = set()
+    
+    # Mask B_dg to zero outside requested region (after computing on full mesh)
+    if (restrict_to_airgap or restrict_to_motor) and cell_tags is not None:
+        B_dg_array = B_dg.x.array.reshape((-1, 3))
+        tdim = mesh.topology.dim
+        num_cells = mesh.topology.index_map(tdim).size_local
+        
         if restrict_to_airgap:
+            # Get airgap cells
+            target_cells = set()
             for tag in AIR_GAP:
                 cells = cell_tags.find(tag)
-                if cells.size > 0:
-                    selected.update(cells.tolist())
+                target_cells.update(cells.tolist())
+            if mesh.comm.rank == 0:
+                print(f"[MASK] Masking B_dg to airgap: {len(target_cells)} cells")
         elif restrict_to_motor:
+            # Get motor cells
+            target_cells = set()
             for tag in MOTOR_TAGS:
-                # MOTOR_TAGS is a tuple of tuples of ints; flatten it here.
-                if isinstance(tag, (tuple, list)):
-                    for t in tag:
-                        cells = cell_tags.find(int(t))
-                        if cells.size > 0:
-                            selected.update(cells.tolist())
-                else:
-                    cells = cell_tags.find(int(tag))
-                    if cells.size > 0:
-                        selected.update(cells.tolist())
-
-        # DG0 vector: 1 vector value per cell -> can reshape to (ncells, 3)
-        vec = B_dg.x.array.reshape((-1, 3))
-        all_cells = np.arange(vec.shape[0], dtype=np.int64)
-        if selected:
-            keep = np.fromiter(selected, dtype=np.int64)
-            keep = keep[(keep >= 0) & (keep < vec.shape[0])]
-            mask = np.ones(vec.shape[0], dtype=bool)
-            mask[keep] = False  # False = keep
-            vec[mask, :] = 0.0
-        else:
-            # If selection is empty, zero everything to be safe.
-            vec[:, :] = 0.0
+                cells = cell_tags.find(tag)
+                target_cells.update(cells.tolist())
+            if mesh.comm.rank == 0:
+                print(f"[MASK] Masking B_dg to motor: {len(target_cells)} cells")
+        
+        # Zero B_dg for cells NOT in target region
+        for cell_idx in range(num_cells):
+            if cell_idx not in target_cells:
+                B_dg_array[cell_idx, :] = 0.0
+        
+        B_dg.x.array[:] = B_dg_array.flatten()
         B_dg.x.scatter_forward()
     
     if debug and mesh.comm.rank == 0:
@@ -193,17 +184,13 @@ def compute_B_field(
         B_dg_array = B_dg.x.array.reshape((-1, 3))
         B_dg_mag = np.linalg.norm(B_dg_array, axis=1)
 
-        # Define material/region groups (for DG0 diagnostics).
-        # If we masked to a specific region, only report the relevant subset to avoid confusion.
-        if restrict_to_airgap:
-            region_defs = {"AirGap": DomainTags3D.AIR_GAP}
-        else:
-            region_defs = {
-                "AirGap": DomainTags3D.AIR_GAP,
-                "PM": DomainTags3D.MAGNETS,
-                "Iron": DomainTags3D.ROTOR + DomainTags3D.STATOR,
-                "Conductors": DomainTags3D.conducting(),
-            }
+        # Define material/region groups
+        region_defs = {
+            "AirGap": DomainTags3D.AIR_GAP,
+            "PM": DomainTags3D.MAGNETS,
+            "Iron": DomainTags3D.ROTOR + DomainTags3D.STATOR,
+            "Conductors": DomainTags3D.conducting(),
+        }
 
         if mesh.comm.rank == 0:
             print("\n[B-REGION] Cell-wise DG0 B statistics by region:")
@@ -246,15 +233,14 @@ def compute_B_field(
     if debug and mesh.comm.rank == 0:
         print(f"\n[Step 6] Interpolating from DG to Lagrange for visualization...")
     
-    # For visualization in a user-provided space B_space, we still form a
-    # projected field B_sol. The primary diagnostic field remains B_dg.
+    # For visualization in a user-provided space B_space, project from masked B_dg
+    # Project on full mesh, then mask nodal DOFs
     B_sol = fem.Function(B_space, name="B")
     
-    # Project from DG to Lagrange for visualization
+    # Project from DG to Lagrange for visualization (full mesh projection)
     B_test = ufl.TestFunction(B_space)
     B_trial = ufl.TrialFunction(B_space)
     
-    # Visualization projection is done on full mesh using the (possibly masked) B_dg.
     a_B = fem.form(ufl.inner(B_trial, B_test) * ufl.dx)
     L_B = fem.form(ufl.inner(B_dg, B_test) * ufl.dx)
     
@@ -280,8 +266,66 @@ def compute_B_field(
     B_sol.x.array[:] = x_B.array_r[:B_sol.x.array.size]
     B_sol.x.scatter_forward()
     
-    # Note: if you want a strictly "airgap only" visualization, prefer using B_dg
-    # (cell data). Continuous nodal fields can smear across region boundaries.
+    # Strict DOF masking: zero B at nodes that don't belong to target region cells
+    if (restrict_to_airgap or restrict_to_motor) and cell_tags is not None:
+        B_array = B_sol.x.array.reshape((-1, 3))
+        
+        # Get target cells
+        if restrict_to_airgap:
+            target_cells = set()
+            for tag in AIR_GAP:
+                cells = cell_tags.find(tag)
+                target_cells.update(cells.tolist())
+        elif restrict_to_motor:
+            target_cells = set()
+            for tag in MOTOR_TAGS:
+                cells = cell_tags.find(tag)
+                target_cells.update(cells.tolist())
+        
+        # Get DOF-to-cell connectivity for B_space
+        tdim = mesh.topology.dim
+        mesh.topology.create_connectivity(tdim, 0)  # cells -> vertices
+        c2v = mesh.topology.connectivity(tdim, 0)
+        
+        # Get DOF map for B_space (Lagrange vector space)
+        dofmap = B_space.dofmap
+        imap = dofmap.index_map
+        size_local = imap.size_local
+        
+        # For each node DOF, check if it belongs to a target cell
+        nodes_in_target = set()
+        for cell_idx in target_cells:
+            if cell_idx < mesh.topology.index_map(tdim).size_local:
+                vertices = c2v.links(cell_idx)
+                for v in vertices:
+                    # Get DOFs at this vertex (3 DOFs for vector field)
+                    dofs = dofmap.cell_dofs(cell_idx)
+                    # Find vertex-based DOFs (first 3 DOFs per vertex typically)
+                    # Actually, simpler: get all DOFs for this cell and mark them
+                    for dof in dofs:
+                        if dof < size_local:  # Only owned DOFs
+                            nodes_in_target.add(int(dof))
+        
+        # Zero DOFs NOT in target region
+        kept = 0
+        zeroed = 0
+        max_outside = 0.0
+        for dof_idx in range(B_array.shape[0]):
+            if dof_idx < size_local:
+                if dof_idx not in nodes_in_target:
+                    mag_before = np.linalg.norm(B_array[dof_idx, :])
+                    max_outside = max(max_outside, mag_before)
+                    B_array[dof_idx, :] = 0.0
+                    zeroed += 1
+                else:
+                    kept += 1
+        
+        B_sol.x.array[:] = B_array.flatten()
+        B_sol.x.scatter_forward()
+        
+        if mesh.comm.rank == 0:
+            region_name = "airgap" if restrict_to_airgap else "motor"
+            print(f"[MASK] B_sol DOF mask applied ({region_name}): kept={kept}, zeroed={zeroed}, max|B|_outside={max_outside:.3e}")
     
     # Clean up
     A_B_dg.destroy()
