@@ -233,43 +233,11 @@ def compute_B_field(
     if debug and mesh.comm.rank == 0:
         print(f"\n[Step 6] Interpolating from DG to Lagrange for visualization...")
     
-    # For visualization in a user-provided space B_space, project from masked B_dg
-    # Project on full mesh, then mask nodal DOFs
+    # For visualization: interpolate from masked B_dg to nodal space
+    # This ensures nodal fields match the cell data exactly (no interpolation artifacts)
     B_sol = fem.Function(B_space, name="B")
     
-    # Project from DG to Lagrange for visualization (full mesh projection)
-    B_test = ufl.TestFunction(B_space)
-    B_trial = ufl.TrialFunction(B_space)
-    
-    a_B = fem.form(ufl.inner(B_trial, B_test) * ufl.dx)
-    L_B = fem.form(ufl.inner(B_dg, B_test) * ufl.dx)
-    
-    A_B = petsc.assemble_matrix(a_B)
-    A_B.assemble()
-    b_B = petsc.create_vector(L_B)
-    petsc.assemble_vector(b_B, L_B)
-    b_B.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-    
-    ksp_B = PETSc.KSP().create(comm=mesh.comm)
-    ksp_B.setOperators(A_B)
-    ksp_B.setType("cg")
-    pc_B = ksp_B.getPC()
-    pc_B.setType("hypre")
-    try:
-        pc_B.setHYPREType("boomeramg")
-    except:
-        pc_B.setType("jacobi")
-    
-    ksp_B.setTolerances(rtol=1e-6, atol=1e-8, max_it=100)
-    x_B = b_B.duplicate()
-    ksp_B.solve(b_B, x_B)
-    B_sol.x.array[:] = x_B.array_r[:B_sol.x.array.size]
-    B_sol.x.scatter_forward()
-    
-    # Strict DOF masking: zero B at nodes that don't belong to target region cells
     if (restrict_to_airgap or restrict_to_motor) and cell_tags is not None:
-        B_array = B_sol.x.array.reshape((-1, 3))
-        
         # Get target cells
         if restrict_to_airgap:
             target_cells = set()
@@ -282,50 +250,75 @@ def compute_B_field(
                 cells = cell_tags.find(tag)
                 target_cells.update(cells.tolist())
         
-        # Get DOF-to-cell connectivity for B_space
-        tdim = mesh.topology.dim
-        mesh.topology.create_connectivity(tdim, 0)  # cells -> vertices
-        c2v = mesh.topology.connectivity(tdim, 0)
+        # Zero B_sol first
+        B_sol.x.array[:] = 0.0
         
-        # Get DOF map for B_space (Lagrange vector space)
+        # Interpolate B_dg (cell-wise) to nodal space, but only in target cells
+        # For each target cell, set nodal DOFs to the cell's B_dg value
+        tdim = mesh.topology.dim
+        mesh.topology.create_connectivity(tdim, 0)
+        c2v = mesh.topology.connectivity(tdim, 0)
         dofmap = B_space.dofmap
         imap = dofmap.index_map
         size_local = imap.size_local
+        num_cells_local = mesh.topology.index_map(tdim).size_local
         
-        # For each node DOF, check if it belongs to a target cell
-        nodes_in_target = set()
+        B_dg_array = B_dg.x.array.reshape((-1, 3))
+        B_sol_array = B_sol.x.array.reshape((-1, 3))
+        
+        kept_dofs = set()
         for cell_idx in target_cells:
-            if cell_idx < mesh.topology.index_map(tdim).size_local:
-                vertices = c2v.links(cell_idx)
-                for v in vertices:
-                    # Get DOFs at this vertex (3 DOFs for vector field)
-                    dofs = dofmap.cell_dofs(cell_idx)
-                    # Find vertex-based DOFs (first 3 DOFs per vertex typically)
-                    # Actually, simpler: get all DOFs for this cell and mark them
-                    for dof in dofs:
-                        if dof < size_local:  # Only owned DOFs
-                            nodes_in_target.add(int(dof))
+            if cell_idx < num_cells_local:
+                # Get B_dg value for this cell
+                B_cell = B_dg_array[cell_idx, :]
+                # Set all DOFs of this cell to B_cell
+                cell_dofs = dofmap.cell_dofs(cell_idx)
+                for dof in cell_dofs:
+                    if dof < size_local:
+                        B_sol_array[dof, :] = B_cell  # Use cell value directly
+                        kept_dofs.add(int(dof))
         
-        # Zero DOFs NOT in target region
-        kept = 0
-        zeroed = 0
-        max_outside = 0.0
-        for dof_idx in range(B_array.shape[0]):
-            if dof_idx < size_local:
-                if dof_idx not in nodes_in_target:
-                    mag_before = np.linalg.norm(B_array[dof_idx, :])
-                    max_outside = max(max_outside, mag_before)
-                    B_array[dof_idx, :] = 0.0
-                    zeroed += 1
-                else:
-                    kept += 1
-        
-        B_sol.x.array[:] = B_array.flatten()
+        B_sol.x.array[:] = B_sol_array.flatten()
         B_sol.x.scatter_forward()
         
         if mesh.comm.rank == 0:
             region_name = "airgap" if restrict_to_airgap else "motor"
-            print(f"[MASK] B_sol DOF mask applied ({region_name}): kept={kept}, zeroed={zeroed}, max|B|_outside={max_outside:.3e}")
+            zeroed = size_local - len(kept_dofs)
+            print(f"[MASK] B_sol interpolated from masked B_dg ({region_name}): kept={len(kept_dofs)}, zeroed={zeroed}")
+    else:
+        # Full mesh: standard projection
+        B_test = ufl.TestFunction(B_space)
+        B_trial = ufl.TrialFunction(B_space)
+        a_B = fem.form(ufl.inner(B_trial, B_test) * ufl.dx)
+        L_B = fem.form(ufl.inner(B_dg, B_test) * ufl.dx)
+        
+        A_B = petsc.assemble_matrix(a_B)
+        A_B.assemble()
+        b_B = petsc.create_vector(L_B)
+        petsc.assemble_vector(b_B, L_B)
+        b_B.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+        
+        ksp_B = PETSc.KSP().create(comm=mesh.comm)
+        ksp_B.setOperators(A_B)
+        ksp_B.setType("cg")
+        pc_B = ksp_B.getPC()
+        pc_B.setType("hypre")
+        try:
+            pc_B.setHYPREType("boomeramg")
+        except:
+            pc_B.setType("jacobi")
+        
+        ksp_B.setTolerances(rtol=1e-6, atol=1e-8, max_it=100)
+        x_B = b_B.duplicate()
+        ksp_B.solve(b_B, x_B)
+        B_sol.x.array[:] = x_B.array_r[:B_sol.x.array.size]
+        B_sol.x.scatter_forward()
+        
+        # Clean up
+        A_B.destroy()
+        b_B.destroy()
+        x_B.destroy()
+        ksp_B.destroy()
     
     # Clean up
     A_B_dg.destroy()
@@ -333,10 +326,12 @@ def compute_B_field(
     x_B_dg.destroy()
     ksp_B_dg.destroy()
     
-    A_B.destroy()
-    b_B.destroy()
-    x_B.destroy()
-    ksp_B.destroy()
+    # Only clean up if we used projection (not interpolation)
+    if not ((restrict_to_airgap or restrict_to_motor) and cell_tags is not None):
+        A_B.destroy()
+        b_B.destroy()
+        x_B.destroy()
+        ksp_B.destroy()
     
     B_sol.name = "B"
     

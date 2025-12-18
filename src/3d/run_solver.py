@@ -501,12 +501,12 @@ def run_solver(config=None):
                     B_sol.name = "B"
                     B_magnitude_sol.name = "B_Magnitude"
 
-                    # Visualization-only smoother fields (keep B_dg unchanged for diagnostics)
+                    # Visualization-only smoother fields (copy already-masked B_sol)
                     B_vis = fem.Function(B_space, name="B_vis")
-                    B_vis.x.array[:] = B_sol.x.array[:]
+                    B_vis.x.array[:] = B_sol.x.array[:]  # Already masked to airgap
                     B_vis.x.scatter_forward()
                     B_vis_mag = fem.Function(B_magnitude_space, name="B_vis_mag")
-                    B_vis_mag.x.array[:] = B_magnitude_sol.x.array[:]
+                    B_vis_mag.x.array[:] = B_magnitude_sol.x.array[:]  # Already masked to airgap
                     B_vis_mag.x.scatter_forward()
                     
                     writer.write_function(A_lag, current_time)
