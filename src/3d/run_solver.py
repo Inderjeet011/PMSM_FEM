@@ -281,7 +281,8 @@ def run_solver(config=None):
         # Load mesh
         print("Loading mesh...")
         mesh, ct, ft = load_mesh(config.mesh_path)
-        ct = maybe_retag_cells(mesh, ct)
+        # Always validate and retag if needed (force_retag will be set by validation if issues found)
+        ct = maybe_retag_cells(mesh, ct, force_retag=False)
         
         # Setup measures
         dx = ufl.Measure("dx", domain=mesh, subdomain_data=ct)
@@ -405,13 +406,7 @@ def run_solver(config=None):
             print(f"Steps: {num_steps}, dt: {dt*1e3:.3f} ms\n")
         
         writer = None
-        output_motor_only = bool(getattr(config, "output_motor_only", False))
-        tmp_full_path = None
         out_path = config.results_path
-        if output_motor_only:
-            # Write full-mesh results to a temporary file, then replace av_solver.* with motor-only.
-            tmp_full_path = out_path.with_name(out_path.stem + "__fulltmp.xdmf")
-            out_path = tmp_full_path
 
         if config.write_results:
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -557,31 +552,6 @@ def run_solver(config=None):
             writer.close()
             if mesh.comm.rank == 0:
                 print(f"Results written to: {out_path}")
-
-        # Replace outputs with motor-only but keep the same final filenames (av_solver.xdmf/.h5)
-        if output_motor_only and tmp_full_path is not None and bool(getattr(config, "write_results", True)):
-            try:
-                t_extract_start = time.perf_counter()
-                from extract_motor_only import extract_motor_mesh
-                final_path = config.results_path
-                # Extract motor-only into the final path (av_solver.xdmf)
-                extract_motor_mesh(tmp_full_path, final_path)
-                if mesh.comm.rank == 0:
-                    # Delete temporary full-mesh files
-                    tmp_h5 = tmp_full_path.with_suffix(".h5")
-                    if tmp_full_path.exists():
-                        tmp_full_path.unlink()
-                    if tmp_h5.exists():
-                        tmp_h5.unlink()
-                    print(f"[VIS] Motor-only results written to: {final_path} (no extra files)", flush=True)
-                t_extract_end = time.perf_counter()
-                extract_wall_local = float(t_extract_end - t_extract_start)
-                extract_wall_max = float(mesh.comm.allreduce(extract_wall_local, op=MPI.MAX))
-                if mesh.comm.rank == 0:
-                    print(f"[TIME] motor_only_extract_wall_s_max = {extract_wall_max:.3f}", flush=True)
-            except Exception as exc:
-                if mesh.comm.rank == 0:
-                    print(f"[WARN] Motor-only replace failed (keeping full-mesh output): {exc}", flush=True)
 
         t_total_end = time.perf_counter()
         loop_wall_local = float(t_total_end - t_loop_start)
