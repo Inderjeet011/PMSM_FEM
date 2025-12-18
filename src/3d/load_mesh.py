@@ -57,6 +57,11 @@ class SimulationConfig3D:
         self.write_diagnostics = False
         self.diagnostics_path = Path(__file__).parents[2] / "results" / "3d" / "av_solver_diagnostics.csv"
 
+        # Optional: write wall-clock timing CSV (disabled by default)
+        # This is useful for comparing "before vs after" performance runs.
+        self.write_timings = False
+        self.timings_path = Path(__file__).parents[2] / "results" / "3d" / "av_solver_timings.csv"
+
         # Motor-only output into the SAME av_solver.xdmf/.h5 (no extra outputs):
         # Implementation writes a temporary full-mesh file, then replaces av_solver.* with motor-only.
         self.output_motor_only = True

@@ -2,6 +2,8 @@
 """Simple 3D A-V solver for PMSM."""
 
 import csv
+import os
+import time
 import basix.ufl
 import numpy as np
 from dolfinx import fem, io
@@ -147,12 +149,13 @@ def solve_one_step(mesh, A_space, V_space, ct, config, ksp, mat_nest, a_blocks,
         # Check convergence reason
         if mesh.comm.rank == 0:
             print(f"  [DIAG] About to call ksp.solve()...")
-        import time
-        t_solve_start = time.time()
+        t_solve_start = time.perf_counter()
         ksp.solve(rhs, sol)
-        t_solve_end = time.time()
+        t_solve_end = time.perf_counter()
+        solve_wall_local = float(t_solve_end - t_solve_start)
+        solve_wall_max = float(mesh.comm.allreduce(solve_wall_local, op=MPI.MAX))
         if mesh.comm.rank == 0:
-            print(f"[TIME] outer_solve_wall_s = {t_solve_start-t_solve_start + (t_solve_end-t_solve_start):.3f}", flush=True)
+            print(f"[TIME] outer_solve_wall_s_max = {solve_wall_max:.3f}", flush=True)
         
         # Diagnostic: Check convergence and solution
         if mesh.comm.rank == 0:
@@ -263,13 +266,15 @@ def solve_one_step(mesh, A_space, V_space, ct, config, ksp, mat_nest, a_blocks,
             print(f"  Done: {iterations} iterations, residual = {residual:.2e}")
             print("")  # Blank line for readability
         
-        return A_sol, V_sol, iterations, max_J, residual, L_blocks
+        return A_sol, V_sol, iterations, max_J, residual, L_blocks, solve_wall_max
 
 
 def run_solver(config=None):
         """Main solver function."""
         if config is None:
             config = SimulationConfig3D()
+
+        t_total_start = time.perf_counter()
         
         print("\n=== SOLVER SETUP ===")
         
@@ -383,7 +388,12 @@ def run_solver(config=None):
         print("Configuring solver...")
         ksp = configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, A00_pc, config.degree_A, config=config)
         
-        print("Setup complete!\n")
+        t_setup_end = time.perf_counter()
+        setup_wall_local = float(t_setup_end - t_total_start)
+        setup_wall_max = float(mesh.comm.allreduce(setup_wall_local, op=MPI.MAX))
+        if mesh.comm.rank == 0:
+            print(f"[TIME] setup_wall_s_max = {setup_wall_max:.3f}", flush=True)
+            print("Setup complete!\n")
         
         # Time loop
         print("=== TIME LOOP ===")
@@ -423,17 +433,43 @@ def run_solver(config=None):
             diag_writer.writerow(["step", "time_ms", "norm_A", "iterations", "residual",
                                   "max_J", "max_B", "min_B", "norm_B"])
 
+        # Optional wall-clock timing CSV (enable via config.write_timings=True
+        # or env var FENICS_WRITE_TIMINGS=1)
+        timings_writer = None
+        timings_file = None
+        env_write_timings = os.getenv("FENICS_WRITE_TIMINGS", "").strip().lower() in {"1", "true", "yes", "y"}
+        write_timings = bool(getattr(config, "write_timings", False)) or env_write_timings
+        if write_timings:
+            config.timings_path.parent.mkdir(parents=True, exist_ok=True)
+            timings_file = open(config.timings_path, "w", newline="")
+            timings_writer = csv.writer(timings_file)
+            timings_writer.writerow([
+                "step",
+                "time_ms",
+                "outer_its",
+                "residual",
+                "step_wall_s_max",
+                "solve_wall_s_max",
+                "post_wall_s_max",
+            ])
+
+        t_loop_start = time.perf_counter()
+        total_outer_its_local = 0
+
         try:
             for step in range(1, num_steps + 1):
+                t_step_start = time.perf_counter()
                 current_time += dt
-                A_sol, V_sol, its, max_J, residual, L_blocks = solve_one_step(
+                A_sol, V_sol, its, max_J, residual, L_blocks, solve_wall_s_max = solve_one_step(
                     mesh, A_space, V_space, ct, config, ksp, mat_nest, a_blocks, L_blocks,
                     block_bcs, sigma, J_z, M_vec, A_prev, dx, dx_magnets, current_time
                 )
+                total_outer_its_local += int(its)
                 
                 if mesh.comm.rank == 0:
                     print("Computing B = curl(A)...")
                 
+                t_post_start = time.perf_counter()
                 debug_B = (step == 1)  # Debug first step only
                 # For visualization: compute B only on the motor region (exclude outer air box).
                 B_sol, B_magnitude_sol, max_B, min_B, norm_B, B_dg = compute_B_field(
@@ -478,11 +514,30 @@ def run_solver(config=None):
                     writer.write_function(B_magnitude_sol, current_time)
                     writer.write_function(B_vis, current_time)
                     writer.write_function(B_vis_mag, current_time)
+
+                t_post_end = time.perf_counter()
+                post_wall_local = float(t_post_end - t_post_start)
+                post_wall_s_max = float(mesh.comm.allreduce(post_wall_local, op=MPI.MAX))
                 
                 if diag_writer is not None:
                     norm_A = np.linalg.norm(A_sol.x.array)
                     diag_writer.writerow([step, current_time * 1e3, norm_A, its, residual,
                                           max_J, max_B, min_B, norm_B])
+
+                t_step_end = time.perf_counter()
+                step_wall_local = float(t_step_end - t_step_start)
+                step_wall_s_max = float(mesh.comm.allreduce(step_wall_local, op=MPI.MAX))
+
+                if timings_writer is not None:
+                    timings_writer.writerow([
+                        step,
+                        current_time * 1e3,
+                        int(its),
+                        float(residual),
+                        step_wall_s_max,
+                        solve_wall_s_max,
+                        post_wall_s_max,
+                    ])
                 
                 if mesh.comm.rank == 0:
                     print(f"Step {step}/{num_steps}: t={current_time*1e3:.3f} ms, "
@@ -491,6 +546,8 @@ def run_solver(config=None):
         finally:
             if diag_file is not None:
                 diag_file.close()
+            if timings_file is not None:
+                timings_file.close()
 
         if writer is not None:
             writer.close()
@@ -500,6 +557,7 @@ def run_solver(config=None):
         # Replace outputs with motor-only but keep the same final filenames (av_solver.xdmf/.h5)
         if output_motor_only and tmp_full_path is not None and bool(getattr(config, "write_results", True)):
             try:
+                t_extract_start = time.perf_counter()
                 from extract_motor_only import extract_motor_mesh
                 final_path = config.results_path
                 # Extract motor-only into the final path (av_solver.xdmf)
@@ -512,9 +570,29 @@ def run_solver(config=None):
                     if tmp_h5.exists():
                         tmp_h5.unlink()
                     print(f"[VIS] Motor-only results written to: {final_path} (no extra files)", flush=True)
+                t_extract_end = time.perf_counter()
+                extract_wall_local = float(t_extract_end - t_extract_start)
+                extract_wall_max = float(mesh.comm.allreduce(extract_wall_local, op=MPI.MAX))
+                if mesh.comm.rank == 0:
+                    print(f"[TIME] motor_only_extract_wall_s_max = {extract_wall_max:.3f}", flush=True)
             except Exception as exc:
                 if mesh.comm.rank == 0:
                     print(f"[WARN] Motor-only replace failed (keeping full-mesh output): {exc}", flush=True)
+
+        t_total_end = time.perf_counter()
+        loop_wall_local = float(t_total_end - t_loop_start)
+        loop_wall_max = float(mesh.comm.allreduce(loop_wall_local, op=MPI.MAX))
+        total_wall_local = float(t_total_end - t_total_start)
+        total_wall_max = float(mesh.comm.allreduce(total_wall_local, op=MPI.MAX))
+        total_outer_its_global = int(mesh.comm.allreduce(int(total_outer_its_local), op=MPI.SUM))
+        if mesh.comm.rank == 0:
+            print(f"[TIME] time_loop_wall_s_max = {loop_wall_max:.3f}", flush=True)
+            print(f"[TIME] total_wall_s_max = {total_wall_max:.3f}", flush=True)
+            # total_outer_its_global is summed across ranks; iterations are identical per rank,
+            # so report per-rank total by dividing by comm size.
+            per_rank_total_its = int(total_outer_its_global // max(mesh.comm.size, 1))
+            avg_its = per_rank_total_its / max(num_steps, 1)
+            print(f"[ITS] total_outer_its = {per_rank_total_its}, avg_outer_its_per_step = {avg_its:.2f}", flush=True)
         
         print("=== DONE ===")
 
