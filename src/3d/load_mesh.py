@@ -65,6 +65,14 @@ class SimulationConfig3D:
         # Motor-only output into the SAME av_solver.xdmf/.h5 (no extra outputs):
         # Implementation writes a temporary full-mesh file, then replaces av_solver.* with motor-only.
         self.output_motor_only = True
+
+        # Visualization control: restrict B-field outputs to a region to reduce clutter in ParaView.
+        # Options: "airgap" | "motor" | "full"
+        # - "airgap": B outputs are non-zero only in AirGap cells (tags 2,3)
+        # - "motor":  B outputs are non-zero only in motor cells (excludes outer airbox tag 1)
+        # - "full":   B outputs everywhere
+        self.B_output_region = "airgap"
+
         self.magnet_remanence = 1.2
         # -----------------------------
         # Linear solver tuning knobs
