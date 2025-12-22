@@ -466,11 +466,8 @@ def run_solver(config=None):
                 
                 t_post_start = time.perf_counter()
                 debug_B = (step == 1)  # Debug first step only
-                # Use config to determine B output region
-                B_output_region = getattr(config, "B_output_region", "motor")
-                restrict_to_airgap = (B_output_region == "airgap")
-                restrict_to_motor = (B_output_region == "motor")
-                # For visualization: compute B on full mesh, then mask to requested region
+                # Compute B on the full mesh (no masking/clipping). Visualization filtering
+                # (slices, clips, transparency) will be done later in ParaView.
                 B_sol, B_magnitude_sol, max_B, min_B, norm_B, B_dg = compute_B_field(
                     mesh,
                     A_sol,
@@ -479,8 +476,8 @@ def run_solver(config=None):
                     config,
                     cell_tags=ct,
                     debug=debug_B,
-                    restrict_to_airgap=restrict_to_airgap,
-                    restrict_to_motor=restrict_to_motor,
+                    restrict_to_airgap=False,
+                    restrict_to_motor=False,
                 )
                 
                 if writer is not None:
@@ -495,24 +492,14 @@ def run_solver(config=None):
                     B_dg.name = "B_dg"
                     B_sol.name = "B"
                     B_magnitude_sol.name = "B_Magnitude"
-
-                    # Visualization-only smoother fields (copy already-masked B_sol)
-                    B_vis = fem.Function(B_space, name="B_vis")
-                    B_vis.x.array[:] = B_sol.x.array[:]  # Already masked to airgap
-                    B_vis.x.scatter_forward()
-                    B_vis_mag = fem.Function(B_magnitude_space, name="B_vis_mag")
-                    B_vis_mag.x.array[:] = B_magnitude_sol.x.array[:]  # Already masked to airgap
-                    B_vis_mag.x.scatter_forward()
                     
                     writer.write_function(A_lag, current_time)
                     writer.write_function(V_sol, current_time)
-                    # DG0 B written as cell data (non-zero only in motor region)
+                    # DG0 B written as cell data on the full domain
                     writer.write_function(B_dg, current_time)
-                    # Smoothed / projected B and its magnitude for visualization
+                    # Smoothed / projected B and its magnitude on the full domain
                     writer.write_function(B_sol, current_time)
                     writer.write_function(B_magnitude_sol, current_time)
-                    writer.write_function(B_vis, current_time)
-                    writer.write_function(B_vis_mag, current_time)
 
                 t_post_end = time.perf_counter()
                 post_wall_local = float(t_post_end - t_post_start)

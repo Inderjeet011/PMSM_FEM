@@ -39,12 +39,12 @@ class SimulationConfig3D:
     def __init__(self):
         self.pole_pairs = 2
         self.drive_frequency = model_parameters["freq"]
-        self.steps_per_period = 20
+        self.steps_per_period = 10
         period = 1.0 / self.drive_frequency
         self.dt = period / self.steps_per_period
-        # Run enough steps to cover at least 16ms (for visualization at 4ms, 8ms, 12ms, 16ms)
-        # With dt ≈ 0.833ms, we need at least 20 steps to reach 16ms
-        self.num_steps = 20  # This gives ~16.67ms total time, covering all requested timesteps
+        # Run exactly one period (f=60 Hz => period ≈ 16.67 ms) with fewer timestamps.
+        # With steps_per_period=10, dt ≈ 1.667 ms and 10 steps cover one full period.
+        self.num_steps = 10
         self.degree_A = 1
         self.degree_V = 1
         self.coil_current_peak = model_parameters["J"]
@@ -65,11 +65,10 @@ class SimulationConfig3D:
         # Motor-only output disabled (write full mesh directly)
         self.output_motor_only = False
         self.magnet_remanence = 1.2
-        # B field output region: "airgap" | "motor" | "full"
-        # "airgap": B field is computed on full mesh, then masked to zero outside airgap cells
-        # "motor": B field is computed on full mesh, then masked to zero outside motor cells
-        # "full": B field everywhere (no masking)
-        self.B_output_region = "airgap"
+        # Output region for exported fields.
+        # Per project requirement: export the full-domain solution as-is (including outer air box),
+        # and do not clip/filter/project to motor-only volumes in code.
+        self.B_output_region = "full"
         # -----------------------------
         # Linear solver tuning knobs
         # -----------------------------
@@ -84,16 +83,16 @@ class SimulationConfig3D:
         # A-block apply inside the preconditioner.
         # "fgmres" with a few iterations gives much stronger convergence than a single AMS apply.
         self.ksp_A_type = "fgmres"  # "preonly" | "fgmres"
-        self.ksp_A_max_it = 8
+        self.ksp_A_max_it = 20
         self.ksp_A_restart = 50
         
         # V-block solve for additive fieldsplit (0 keeps it as preonly).
-        self.ksp_V_max_it = 0
+        self.ksp_V_max_it = 10
         
         # Outer KSP limits (keep small for quick runs; increase when diagnosing).
         # With the current additive preconditioner, rtol ~2e-2 is realistic for <=50 its.
-        self.outer_rtol = 2e-2
-        self.outer_max_it = 50
+        self.outer_rtol = 1e-6
+        self.outer_max_it = 100
         
         # Timestep acceptance threshold (ratio = ||b-Ax|| / ||b-Ax0||).
         # With the current preconditioner we typically get ~0.31 at 50 its; 0.35 keeps marching stable.

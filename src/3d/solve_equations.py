@@ -681,7 +681,8 @@ def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd=None,
     opts.setValue("-fieldsplit_V_pc_hypre_boomeramg_coarsen_type", "HMIS")
     opts.setValue("-fieldsplit_V_pc_hypre_boomeramg_interp_type", "ext+i")
     opts.setValue("-fieldsplit_V_pc_hypre_boomeramg_relax_type_all", "symmetric-SOR/Jacobi")
-    opts.setValue("-fieldsplit_V_pc_hypre_boomeramg_max_iter", "1")
+    # Allow AMG to do more work per application when V-block iterations are enabled.
+    opts.setValue("-fieldsplit_V_pc_hypre_boomeramg_max_iter", "10")
     opts.setValue("-ksp_monitor_true_residual", "")
     opts.setValue("-ksp_converged_reason", "")
     opts.setValue("-fieldsplit_A_pc_hypre_ams_print_level", "0")
