@@ -35,14 +35,14 @@ This writes `meshes/3d/pmesh3D_ipm.xdmf` (and `.h5`).
 
 ```bash
 cd src/3d
-python run_solver.py
+python main.py
 ```
 
 MPI is supported and often faster/more robust for larger meshes:
 
 ```bash
 cd src/3d
-mpirun -np 4 python run_solver.py
+mpirun -np 4 python main.py
 ```
 
 ### Output files (ParaView)
