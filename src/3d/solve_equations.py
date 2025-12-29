@@ -13,7 +13,7 @@ _keepalive = []
 
 
 def build_forms(mesh, A_space, V_space, sigma, nu, J_z, M_vec, A_prev,
-                dx, dx_conductors, dx_coils, dx_magnets, ds, config, exterior_facet_tag=None):
+                dx, dx_cond_stat, dx_cond_rot, dx_coils, dx_magnets, ds, config, exterior_facet_tag=None):
     dt = fem.Constant(mesh, PETSc.ScalarType(config.dt))
     mu0 = config.mu0
     xcoord = ufl.SpatialCoordinate(mesh)
@@ -34,10 +34,11 @@ def build_forms(mesh, A_space, V_space, sigma, nu, J_z, M_vec, A_prev,
     #   ∫ nu curl(A)·curl(v)  +  ∫_{cond} (sigma/dt) A^{n+1}·v  +  ∫_{cond} sigma ∇V^{n+1}·v  = RHS
     # Fixes:
     # - remove spurious μ0 multiplying σ-terms
-    # - restrict all σ-terms to dx_conductors
+    # - restrict all σ-terms to dx_cond_stat / dx_cond_rot
     a00 = (
         nu * ufl.inner(curlA, curlv) * dx
-        + (sigma * inv_dt) * ufl.inner(A, v) * dx_conductors
+        + (sigma * inv_dt) * ufl.inner(A, v) * dx_cond_stat
+        - sigma * ufl.inner(ufl.cross(u_rot, curlA), v) * dx_cond_rot
     )
     epsA_full = fem.Constant(mesh, PETSc.ScalarType(float(getattr(config, "epsilon_A_full", 0.0))))
     a00 += epsA_full * ufl.inner(A, v) * dx
@@ -45,20 +46,24 @@ def build_forms(mesh, A_space, V_space, sigma, nu, J_z, M_vec, A_prev,
     epsilon_A_spd = float(getattr(config, "epsilon_A_spd", 1e-6))
     epsilon = fem.Constant(mesh, PETSc.ScalarType(epsilon_A_spd))
     # AMS-friendly SPD approximation of (dt * a00): dt*nu*curlcurl + sigma*mass (conductors only) + regularization
+    dx_cond_all = dx_cond_stat + dx_cond_rot
     a00_spd = (
         dt * nu * ufl.inner(curlA, curlv) * dx
-        + sigma * ufl.inner(A, v) * dx_conductors
+        + sigma * ufl.inner(A, v) * dx_cond_all
         + epsilon * ufl.inner(A, v) * dx
     )
     
     # A–V coupling terms (conductors only, no μ0):
     # - a01: ∫_{cond} sigma ∇V^{n+1}·v
     # - a10/a11: V-equation ∫_{cond} sigma ∇V^{n+1}·∇q + ∫_{cond} (sigma/dt) A^{n+1}·∇q = RHS(A^n)
-    a01 = sigma * ufl.inner(ufl.grad(S), v) * dx_conductors
-    a10 = (sigma * inv_dt) * ufl.inner(A, ufl.grad(q)) * dx_conductors
-    a11_core = sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_conductors
+    a01 = sigma * ufl.inner(ufl.grad(S), v) * dx_cond_stat
+    a10 = (
+        -(sigma * inv_dt) * ufl.inner(A, ufl.grad(q)) * dx_cond_stat
+        + sigma * ufl.inner(ufl.cross(u_rot, curlA), ufl.grad(q)) * dx_cond_rot
+    )
+    a11_core = sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_cond_stat
     epsV = fem.Constant(mesh, PETSc.ScalarType(1e-8 * mu0))
-    a11 = a11_core + epsV * ufl.inner(S, q) * dx_conductors
+    a11 = a11_core + epsV * ufl.inner(S, q) * dx_cond_stat
 
     # IMPORTANT: do NOT scale (a10, a11) by dt here — that would cancel the time derivative
     # in the V-equation and break the standard eddy-current A–V formulation.
@@ -67,14 +72,14 @@ def build_forms(mesh, A_space, V_space, sigma, nu, J_z, M_vec, A_prev,
     # Impressed current density is applied only in the coil subdomains.
     J_term = J_z * v[2] * dx_coils
     # Fix: σ-term uses (sigma/dt) A^n and is restricted to conductors; remove μ0.
-    lagging_A = (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_conductors
+    lagging_A = (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_cond_stat
     # PM source term (standard): uses rotating M_vec(t) updated each timestep.
     pm_term = ufl.inner(nu * mu0 * M_vec, curlv) * dx_magnets
     L0 = J_term + lagging_A + pm_term
     
     zero_scalar = fem.Constant(mesh, PETSc.ScalarType(0))
     # V-equation RHS: move -(sigma/dt) A^n·∇q to the RHS (do not cancel the time derivative).
-    L1 = (sigma * inv_dt) * ufl.inner(A_prev, ufl.grad(q)) * dx_conductors + zero_scalar * q * dx
+    L1 = (sigma * inv_dt) * ufl.inner(A_prev, ufl.grad(q)) * dx_cond_stat + zero_scalar * q * dx
     
     a_blocks = ((fem.form(a00), fem.form(a01)), (fem.form(a10), fem.form(a11)))
     a00_spd_form = fem.form(a00_spd)

@@ -27,7 +27,7 @@ def make_config():
     return SimpleNamespace(
         dt=dt,
         # Keep this small for quick runs / debugging / visualization
-        num_steps=20,
+        num_steps=8,
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),

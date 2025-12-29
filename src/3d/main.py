@@ -12,7 +12,15 @@ from dolfinx import fem, io
 from mpi4py import MPI
 import ufl
 
-from load_mesh import COILS, MAGNETS, conducting, load_mesh, setup_boundary_conditions, setup_materials
+from load_mesh import (
+    COILS,
+    MAGNETS,
+    conducting_rotating,
+    conducting_stationary,
+    load_mesh,
+    setup_boundary_conditions,
+    setup_materials,
+)
 from solve_equations import (
         assemble_system_matrix,
         build_forms,
@@ -35,7 +43,8 @@ def main():
     # Mesh + region tags
     mesh, ct, ft = load_mesh(config.mesh_path)
     dx = ufl.Measure("dx", domain=mesh, subdomain_data=ct)
-    dx_conductors = measure_over(dx, conducting())
+    dx_cond_stat = measure_over(dx, conducting_stationary())
+    dx_cond_rot = measure_over(dx, conducting_rotating())
     dx_coils = measure_over(dx, COILS)
     dx_magnets = measure_over(dx, MAGNETS)
 
@@ -53,7 +62,7 @@ def main():
 
     # Boundary conditions (block_bcs is what the solver needs)
     _, _, block_bcs = setup_boundary_conditions(mesh, ft, A_space, V_space)
-    block_bcs[1].append(make_ground_bc_V(V_space, ct, conducting()))
+    block_bcs[1].append(make_ground_bc_V(V_space, ct, conducting_stationary()))
 
     # Sources (coil currents + permanent magnets)
     J_z, M_vec = setup_sources(mesh)
@@ -72,7 +81,8 @@ def main():
         M_vec,
         A_prev,
         dx,
-        dx_conductors,
+        dx_cond_stat,
+        dx_cond_rot,
         dx_coils,
         dx_magnets,
         None,

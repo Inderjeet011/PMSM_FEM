@@ -19,6 +19,16 @@ def conducting():
     # Conducting regions for σ-terms and the V-equation (include coils).
     return ROTOR + ALUMINIUM + MAGNETS + COILS
 
+
+def conducting_stationary():
+    """Stationary conducting regions (used for σ∂A/∂t and σ∇V terms)."""
+    return COILS
+
+
+def conducting_rotating():
+    """Rotating conducting regions (used for motional EMF σ(u×B) terms)."""
+    return ROTOR + ALUMINIUM + MAGNETS
+
 # Current mapping
 CURRENT_MAP = {
     7: {"alpha": 1.0, "beta": 0.0},
