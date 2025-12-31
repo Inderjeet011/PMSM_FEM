@@ -16,18 +16,24 @@ def make_config():
     from mesh_3D import model_parameters
 
     freq = float(model_parameters["freq"])
-    pole_pairs = 2
-    steps_per_period = 3
+    pole_pairs = 5  # number of pole pairs (10 poles => 5 pole pairs)
+    # Time resolution: number of timesteps per *electrical* period (1/freq).
+    # 3 is very coarse; use a higher default for better transient accuracy.
+    steps_per_period = 40
     dt = (1.0 / freq) / steps_per_period
 
     omega_e = 2.0 * np.pi * freq
-    omega_m = omega_e / max(pole_pairs, 1)
+    # Rotation direction convention:
+    # +omega_m => CCW in the x–y plane when viewed from +z (right-hand rule).
+    # Set to -1.0 to reverse rotation (CW when viewed from +z).
+    rotation_direction = -1.0
+    omega_m = rotation_direction * (omega_e / max(pole_pairs, 1))
 
     root = Path(__file__).parents[2]
     return SimpleNamespace(
         dt=dt,
-        # Keep this small for quick runs / debugging / visualization
-        num_steps=8,
+        # Run a few electrical periods by default (helps reach periodic behavior).
+        num_steps=3 * steps_per_period,
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),
