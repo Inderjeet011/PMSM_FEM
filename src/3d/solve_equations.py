@@ -6,19 +6,21 @@ from dolfinx.cpp.fem.petsc import discrete_gradient
 from petsc4py import PETSc
 import ufl
 
-_keepalive = []
+_keepalive = []   #PETSc object created in Python is passed to PETSc but not stored in Python, it WILL be destroyed
 
 
 
 
 
 def build_forms(mesh, A_space, V_space, sigma, nu, J_z, M_vec, A_prev,
-                dx, dx_cond_stat, dx_cond_rot, dx_coils, dx_magnets, ds, config, exterior_facet_tag=None):
+                dx, dx_rs, dx_rpm, dx_c, dx_pm, ds, config, exterior_facet_tag=None):
     dt = fem.Constant(mesh, PETSc.ScalarType(config.dt))
     mu0 = config.mu0
     xcoord = ufl.SpatialCoordinate(mesh)
     omega = fem.Constant(mesh, PETSc.ScalarType(config.omega_m))
-    u_rot = ufl.as_vector((-omega * xcoord[1], omega * xcoord[0], 0.0))
+    #rigid rotation: u = ω × r with ω=(0,0,ω) and r=(x,y,z)
+    omega_vec = ufl.as_vector((0.0, 0.0, omega))
+    u_rot = ufl.cross(omega_vec, xcoord)
     
     A = ufl.TrialFunction(A_space)
     v = ufl.TestFunction(A_space)
@@ -30,23 +32,18 @@ def build_forms(mesh, A_space, V_space, sigma, nu, J_z, M_vec, A_prev,
     
     inv_dt = fem.Constant(mesh, PETSc.ScalarType(1.0 / config.dt))
 
-    # A-equation (eddy-current A–V formulation):
-    #   ∫ nu curl(A)·curl(v)  +  ∫_{cond} (sigma/dt) A^{n+1}·v  +  ∫_{cond} sigma ∇V^{n+1}·v  = RHS
-    # Fixes:
-    # - remove spurious μ0 multiplying σ-terms
-    # - restrict all σ-terms to dx_cond_stat / dx_cond_rot
+    # A-equation (A–V formulation):
     a00 = (
         nu * ufl.inner(curlA, curlv) * dx
-        + (sigma * inv_dt) * ufl.inner(A, v) * dx_cond_stat
-        - sigma * ufl.inner(ufl.cross(u_rot, curlA), v) * dx_cond_rot
+        + (sigma * inv_dt) * ufl.inner(A, v) * dx_rs
+        - sigma * ufl.inner(ufl.cross(u_rot, curlA), v) * dx_rpm
     )
-    epsA_full = fem.Constant(mesh, PETSc.ScalarType(float(getattr(config, "epsilon_A_full", 0.0))))
-    a00 += epsA_full * ufl.inner(A, v) * dx
     
     epsilon_A_spd = float(getattr(config, "epsilon_A_spd", 1e-6))
     epsilon = fem.Constant(mesh, PETSc.ScalarType(epsilon_A_spd))
+    
     # AMS-friendly SPD approximation of (dt * a00): dt*nu*curlcurl + sigma*mass (conductors only) + regularization
-    dx_cond_all = dx_cond_stat + dx_cond_rot
+    dx_cond_all = dx_rs + dx_rpm
     a00_spd = (
         dt * nu * ufl.inner(curlA, curlv) * dx
         + sigma * ufl.inner(A, v) * dx_cond_all
@@ -56,52 +53,35 @@ def build_forms(mesh, A_space, V_space, sigma, nu, J_z, M_vec, A_prev,
     # A–V coupling terms (conductors only, no μ0):
     # - a01: ∫_{cond} sigma ∇V^{n+1}·v
     # - a10/a11: V-equation ∫_{cond} sigma ∇V^{n+1}·∇q + ∫_{cond} (sigma/dt) A^{n+1}·∇q = RHS(A^n)
-    a01 = sigma * ufl.inner(ufl.grad(S), v) * dx_cond_stat
+    a01 = sigma * ufl.inner(ufl.grad(S), v) * dx_rs
     a10 = (
-        -(sigma * inv_dt) * ufl.inner(A, ufl.grad(q)) * dx_cond_stat
-        + sigma * ufl.inner(ufl.cross(u_rot, curlA), ufl.grad(q)) * dx_cond_rot
+        -(sigma * inv_dt) * ufl.inner(A, ufl.grad(q)) * dx_rs
+        + sigma * ufl.inner(ufl.cross(u_rot, curlA), ufl.grad(q)) * dx_rpm
     )
-    a11_core = sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_cond_stat
-    epsV = fem.Constant(mesh, PETSc.ScalarType(1e-8 * mu0))
-    a11 = a11_core + epsV * ufl.inner(S, q) * dx_cond_stat
-
-    # IMPORTANT: do NOT scale (a10, a11) by dt here — that would cancel the time derivative
-    # in the V-equation and break the standard eddy-current A–V formulation.
+    #integrates σ∇V·∇q over Ω; σ=0 elsewhere applies restriction implicitly.
+    a11 = sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx
     
     #Right hand side
-    # Impressed current density is applied only in the coil subdomains.
-    J_term = J_z * v[2] * dx_coils
-    # Fix: σ-term uses (sigma/dt) A^n and is restricted to conductors; remove μ0.
-    lagging_A = (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_cond_stat
-    # PM source term (standard): uses rotating M_vec(t) updated each timestep.
-    pm_term = ufl.inner(nu * mu0 * M_vec, curlv) * dx_magnets
-    L0 = J_term + lagging_A + pm_term
-    
-    zero_scalar = fem.Constant(mesh, PETSc.ScalarType(0))
-    # V-equation RHS: move -(sigma/dt) A^n·∇q to the RHS (do not cancel the time derivative).
-    L1 = (sigma * inv_dt) * ufl.inner(A_prev, ufl.grad(q)) * dx_cond_stat + zero_scalar * q * dx
+    L0 = J_z * v[2] * dx_c + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_rs +  ufl.inner(nu * mu0 * M_vec, curlv) * dx_pm
+    L1 = (sigma * inv_dt) * ufl.inner(A_prev, ufl.grad(q)) * dx_rs
     
     a_blocks = ((fem.form(a00), fem.form(a01)), (fem.form(a10), fem.form(a11)))
     a00_spd_form = fem.form(a00_spd)
-    # No motional EMF term in this (original) formulation; keep return value for compatibility.
-    zero_scalar = fem.Constant(mesh, PETSc.ScalarType(0))
-    a00_motional_form = fem.form(zero_scalar * v[0] * dx)
     L_blocks = (fem.form(L0), fem.form(L1))
 
-    return a_blocks, L_blocks, a00_spd_form, a00_motional_form
+    return a_blocks, L_blocks, a00_spd_form
 
 
 
 
 
-def assemble_system_matrix(mesh, a_blocks, block_bcs, a00_spd_form=None, a00_motional_form=None, beta_pc=0.3):
+def assemble_system_matrix(mesh, a_blocks, block_bcs, a00_spd_form):
     mats = [[None, None], [None, None]]
     for i in range(2):
         for j in range(2):
             bcs_for_block = []
-            if block_bcs[i]:
-                bcs_for_block.extend(block_bcs[i])
-            mat = petsc.assemble_matrix(a_blocks[i][j], bcs=bcs_for_block if bcs_for_block else None)
+            bcs_for_block.extend(block_bcs[i])
+            mat = petsc.assemble_matrix(a_blocks[i][j], bcs=bcs_for_block)
             mat.assemble()
             mats[i][j] = mat
     
@@ -110,11 +90,9 @@ def assemble_system_matrix(mesh, a_blocks, block_bcs, a00_spd_form=None, a00_mot
     mat_nest = PETSc.Mat().createNest(mats, comm=mesh.comm)
     mat_nest.assemble()
     
-    A00_spd = None
-    if a00_spd_form is not None:
-        A00_spd = petsc.assemble_matrix(a00_spd_form, bcs=None)
-        A00_spd.assemble()
-        A00_spd.setOption(PETSc.Mat.Option.SPD, True)
+    A00_spd = petsc.assemble_matrix(a00_spd_form, bcs=None)
+    A00_spd.assemble()
+    A00_spd.setOption(PETSc.Mat.Option.SPD, True)
 
     return mats, mat_nest, A00_standalone, A00_spd, None
 
@@ -166,7 +144,7 @@ def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, conf
     ksp_A.setType("fgmres")
     ksp_A.setTolerances(rtol=0.0, atol=0.0, max_it=int(getattr(config, "ksp_A_max_it", 2)))
     ksp_A.setGMRESRestart(int(getattr(config, "ksp_A_restart", 30)))
-    ksp_A.setOperators(A00_full, A00_spd if A00_spd is not None else A00_full)
+    ksp_A.setOperators(A00_full, A00_spd)
 
     pc_A = ksp_A.getPC()
     pc_A.setType("hypre")

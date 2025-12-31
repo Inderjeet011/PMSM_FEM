@@ -19,15 +19,39 @@ def conducting():
     # Conducting regions for σ-terms and the V-equation (include coils).
     return ROTOR + ALUMINIUM + MAGNETS + COILS
 
+# ---------------------------------------------------------------------------
+# r = rotor, s = stator, pm = permanent magnets, c = coils.
+# Shaft/center-rod (ALUMINIUM) is treated as part of the rotor.
+# ---------------------------------------------------------------------------
 
-def conducting_stationary():
-    """Stationary conducting regions (used for σ∂A/∂t and σ∇V terms)."""
+def omega_r():
+    """Ω_r: rotor assembly (rotor + shaft/rod)."""
+    return ROTOR + ALUMINIUM
+
+
+def omega_s():
+    """Ω_s: stator."""
+    return STATOR
+
+
+def omega_pm():
+    """Ω_pm: permanent magnets."""
+    return MAGNETS
+
+
+def omega_c():
+    """Ω_c: coils."""
     return COILS
 
 
-def conducting_rotating():
-    """Rotating conducting regions (used for motional EMF σ(u×B) terms)."""
-    return ROTOR + ALUMINIUM + MAGNETS
+def omega_rs():
+    """Ω_{r,s} = Ω_r ∪ Ω_s."""
+    return omega_r() + omega_s()
+
+
+def omega_rpm():
+    """Ω_{r,pm} = Ω_r ∪ Ω_pm."""
+    return omega_r() + omega_pm()
 
 # Current mapping
 CURRENT_MAP = {
@@ -74,9 +98,9 @@ def load_mesh(mesh_path):
 def setup_materials(mesh, cell_tags, config):
     """Material parameters as DG0 Functions (sigma, nu, density)."""
     DG0 = fem.functionspace(mesh, ("DG", 0))
-    sigma = fem.Function(DG0, name="sigma")
-    nu = fem.Function(DG0, name="nu")
-    density = fem.Function(DG0, name="density")
+    sigma = fem.Function(DG0, name="sigma")       #array of sigma values for each cell
+    nu = fem.Function(DG0, name="nu")             #array of reluctivity values for each cell
+    density = fem.Function(DG0, name="density")   #array of density values for each cell
     
     mu_r = model_parameters["mu_r"]
     sigma_dict = model_parameters["sigma"]

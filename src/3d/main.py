@@ -15,9 +15,12 @@ import ufl
 from load_mesh import (
     COILS,
     MAGNETS,
-    conducting_rotating,
-    conducting_stationary,
+    conducting,
     load_mesh,
+    omega_c,
+    omega_pm,
+    omega_rpm,
+    omega_rs,
     setup_boundary_conditions,
     setup_materials,
 )
@@ -43,10 +46,11 @@ def main():
     # Mesh + region tags
     mesh, ct, ft = load_mesh(config.mesh_path)
     dx = ufl.Measure("dx", domain=mesh, subdomain_data=ct)
-    dx_cond_stat = measure_over(dx, conducting_stationary())
-    dx_cond_rot = measure_over(dx, conducting_rotating())
-    dx_coils = measure_over(dx, COILS)
-    dx_magnets = measure_over(dx, MAGNETS)
+    # Paper-consistent measures
+    dx_rs = measure_over(dx, omega_rs())
+    dx_rpm = measure_over(dx, omega_rpm())
+    dx_c = measure_over(dx, omega_c())
+    dx_pm = measure_over(dx, omega_pm())
 
     # Materials
     sigma, nu, _density = setup_materials(mesh, ct, config)
@@ -62,7 +66,7 @@ def main():
 
     # Boundary conditions (block_bcs is what the solver needs)
     _, _, block_bcs = setup_boundary_conditions(mesh, ft, A_space, V_space)
-    block_bcs[1].append(make_ground_bc_V(V_space, ct, conducting_stationary()))
+    block_bcs[1].append(make_ground_bc_V(V_space, ct, conducting()))
 
     # Sources (coil currents + permanent magnets)
     J_z, M_vec = setup_sources(mesh)
@@ -71,7 +75,7 @@ def main():
     # Assemble + solver
     from load_mesh import EXTERIOR_FACET_TAG
 
-    a_blocks, L_blocks, a00_spd_form, _ = build_forms(
+    a_blocks, L_blocks, a00_spd_form = build_forms(
         mesh,
         A_space,
         V_space,
@@ -81,10 +85,10 @@ def main():
         M_vec,
         A_prev,
         dx,
-        dx_cond_stat,
-        dx_cond_rot,
-        dx_coils,
-        dx_magnets,
+        dx_rs,
+        dx_rpm,
+        dx_c,
+        dx_pm,
         None,
         config,
         exterior_facet_tag=EXTERIOR_FACET_TAG,
