@@ -31,6 +31,8 @@ from solve_equations import (
 )
 from solver_utils import (
         compute_B_field,
+        compute_B_in_airgap,
+        compute_torque_maxwell_surface,
         initialise_magnetisation,
         make_config,
         make_ground_bc_V,
@@ -134,8 +136,35 @@ def main():
             mesh, A_sol, B_space, B_magnitude_space
         )
 
+        # Compute B-field statistics in airgap (use B_sol for better accuracy)
+        B_airgap_stats = compute_B_in_airgap(mesh, B_dg, ct, B_sol=B_sol)
+        
+        # Calculate electromagnetic torque (Maxwell stress tensor on MidAir surface)
+        torque = compute_torque_maxwell_surface(mesh, A_sol, ft, config, midair_tag=2)
+
         if mesh.comm.rank == 0:
-            print(f"step {step+1}/{config.num_steps}: t={t*1e3:.3f} ms, max|B|={max_B:.3e} T")
+            try:
+                its = ksp.getIterationNumber()
+                reason = ksp.getConvergedReason()
+            except Exception:
+                its = None
+                reason = None
+            print(
+                f"step {step+1}/{config.num_steps}: t={t*1e3:.3f} ms, "
+                f"max|B|={max_B:.3e} T, its={its}, reason={reason}"
+            )
+            print(f"  Airgap B: avg={B_airgap_stats['B_avg']:.3e} T, "
+                  f"max={B_airgap_stats['B_max']:.3e} T, "
+                  f"radial={B_airgap_stats['B_radial_avg']:.3e} T, "
+                  f"tangential={B_airgap_stats['B_tangential_avg']:.3e} T")
+            print(f"  Torque: {torque:.4e} N·m ({torque*1e3:.4f} mN·m)")
+            if B_airgap_stats.get('B_magnet_avg', 0) > 0:
+                print(f"  Comparison: Magnet avg={B_airgap_stats['B_magnet_avg']:.3e} T, "
+                      f"Rotor avg={B_airgap_stats['B_rotor_avg']:.3e} T")
+                if B_airgap_stats.get('airgap_radii'):
+                    r_min, r_max = B_airgap_stats['airgap_radii']
+                    print(f"  Airgap region: r=[{r_min:.4f}, {r_max:.4f}] m "
+                          f"(expected: [0.042, 0.044] m)")
 
         if writer is not None:
             try:

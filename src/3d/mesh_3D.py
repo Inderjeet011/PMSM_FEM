@@ -574,8 +574,9 @@ def generate_PMSM_mesh(
     # ------------------------------------------------------------
     # Step 8: Read MSH into DOLFINx and retag cells if needed
     # ------------------------------------------------------------
-    from dolfinx.io import gmshio
-    from dolfinx.io import XDMFFile
+    # In newer DOLFINx (e.g. 0.10+), gmsh I/O lives in dolfinx.io.gmsh.
+    # Avoid shadowing the top-level gmsh module used for geometry creation.
+    from dolfinx.io import gmsh as gmshio, XDMFFile
     import dolfinx.mesh as dmesh
 
     result = gmshio.read_from_msh(
@@ -709,6 +710,11 @@ def generate_PMSM_mesh(
         xdmf.write_mesh(mesh)
         
         if ct is not None:
+            # Ensure a stable, readable name in XDMF (and avoid clobbering facet tags)
+            try:
+                ct.name = "cell_tags"
+            except Exception:
+                pass
             # Write meshtags (default name will be used)
             xdmf.write_meshtags(ct, mesh.geometry)
             
@@ -730,6 +736,11 @@ def generate_PMSM_mesh(
             xdmf.write_function(cell_tag_function, 0.0)
         
         if ft is not None:
+            # Ensure a stable, readable name in XDMF (and avoid clobbering cell tags)
+            try:
+                ft.name = "facet_tags"
+            except Exception:
+                pass
             xdmf.write_meshtags(ft, mesh.geometry)
 
     if rank == root:

@@ -73,8 +73,14 @@ def load_mesh(mesh_path):
     
     with io.XDMFFile(MPI.COMM_WORLD, str(mesh_path), "r") as xdmf:
         mesh = xdmf.read_mesh()
+        # Needed for reading facet (tdim-1) MeshTags from XDMF in some DOLFINx versions
+        # (avoids: "Missing IndexMap in Topology. Maybe you need to create_entities(2).")
+        try:
+            mesh.topology.create_entities(mesh.topology.dim - 1)
+        except Exception:
+            pass
         cell_tags = None
-        for name in ["Cell_markers", "mesh_tags"]:
+        for name in ["cell_tags", "Cell_markers", "mesh_tags", "CellTags"]:
             try:
                 cell_tags = xdmf.read_meshtags(mesh, name=name)
                 break
@@ -82,7 +88,7 @@ def load_mesh(mesh_path):
                 continue
         
         facet_tags = None
-        for name in ["Facet_markers", "facet_tags"]:
+        for name in ["facet_tags", "Facet_markers", "facet_tags", "facets", "FacetTags"]:
             try:
                 facet_tags = xdmf.read_meshtags(mesh, name=name)
                 break

@@ -1,0 +1,64 @@
+PMSM_FEM 3D mesh environment and run instructions
+===============================================
+
+1) System packages (Ubuntu/WSL)
+--------------------------------
+Install base tools, MPI, and shared libraries required by mpi4py and gmsh:
+
+  sudo apt-get update
+  sudo apt-get install -y \
+      python3 python3-pip python3.12-venv \
+      libopenmpi-dev openmpi-bin \
+      libglu1-mesa libgl1 libxrender1 libxcursor1 libxinerama1 libxft2 \
+      wget
+
+
+2) Install Miniforge (conda)
+----------------------------
+
+  cd /root
+  wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O Miniforge3.sh
+  bash Miniforge3.sh -b -p /root/miniforge3
+
+
+3) Create FEniCSx / DOLFINx environment
+--------------------------------------
+
+Create a dedicated conda environment with FEniCSx/DOLFINx and core Python deps:
+
+  /root/miniforge3/bin/conda create -y -n fenicsx -c conda-forge \
+      fenics-dolfinx python=3.11 gmsh mpi4py numpy
+
+If gmsh is not importable, install the wheel explicitly inside the env:
+
+  . /root/miniforge3/bin/activate fenicsx
+  python -m pip install gmsh
+
+
+4) Python package requirements (for reference)
+---------------------------------------------
+
+The repo-level Python requirements are also captured in requirements.txt:
+
+  numpy
+  mpi4py
+  gmsh
+  dolfinx
+
+In practice we install these via conda in the `fenicsx` environment as above.
+
+
+5) Running the 3D mesh generator
+--------------------------------
+
+Activate the environment and run `mesh_3D.py`:
+
+  . /root/miniforge3/bin/activate fenicsx
+  cd /root/PMSM_FEM/src/3d
+  python mesh_3D.py --res 0.01 --depth 0.057
+
+This generates the 3D mesh files:
+
+  /root/PMSM_FEM/meshes/3d/pmesh3D_ipm.xdmf
+  /root/PMSM_FEM/meshes/3d/pmesh3D_ipm.h5 (and the intermediate .msh file)
+

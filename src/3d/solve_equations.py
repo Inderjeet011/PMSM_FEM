@@ -32,22 +32,25 @@ def build_forms(mesh, A_space, V_space, sigma, nu, J_z, M_vec, A_prev,
     
     inv_dt = fem.Constant(mesh, PETSc.ScalarType(1.0 / config.dt))
 
-    # A-equation (A–V formulation):
+    epsilon_A = float(getattr(config, "epsilon_A", 0.0))
+    epsilon_A_spd = float(getattr(config, "epsilon_A_spd", 1e-6))
+    eps_A = fem.Constant(mesh, PETSc.ScalarType(epsilon_A))
+    eps_spd = fem.Constant(mesh, PETSc.ScalarType(epsilon_A_spd))
+
+    # A-equation (A–V formulation) + optional small mass regularization:
     a00 = (
         nu * ufl.inner(curlA, curlv) * dx
         + (sigma * inv_dt) * ufl.inner(A, v) * dx_rs
         - sigma * ufl.inner(ufl.cross(u_rot, curlA), v) * dx_rpm
+        + eps_A * ufl.inner(A, v) * dx
     )
-    
-    epsilon_A_spd = float(getattr(config, "epsilon_A_spd", 1e-6))
-    epsilon = fem.Constant(mesh, PETSc.ScalarType(epsilon_A_spd))
     
     # AMS-friendly SPD approximation of (dt * a00): dt*nu*curlcurl + sigma*mass (conductors only) + regularization
     dx_cond_all = dx_rs + dx_rpm
     a00_spd = (
         dt * nu * ufl.inner(curlA, curlv) * dx
         + sigma * ufl.inner(A, v) * dx_cond_all
-        + epsilon * ufl.inner(A, v) * dx
+        + eps_spd * ufl.inner(A, v) * dx
     )
     
     # A–V coupling terms (conductors only, no μ0):
