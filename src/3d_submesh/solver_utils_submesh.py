@@ -139,10 +139,8 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space):
     return B_sol, B_mag, float(vals.max()), float(vals.min()), float(np.linalg.norm(vals)), B_dg
 
 
-def assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space,
-                        mesh_parent=None, mesh_conductor=None, sigma_submesh=None,
-                        A_prev=None, dof_mapper=None, config=None):
-    """Assemble nested RHS vector for the submesh-based A–V system."""
+def assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space):
+    """Assemble nested RHS vector from block forms (entity_maps)."""
     comm = A_space.mesh.comm
     nA = A_space.dofmap.index_map.size_global
     nV = V_space.dofmap.index_map.size_global
@@ -153,18 +151,7 @@ def assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space,
     tmp_bA.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
 
     tmp_bV = petsc.create_vector(V_space)
-    if (mesh_parent is not None and mesh_conductor is not None and sigma_submesh is not None
-            and A_prev is not None and dof_mapper is not None and config is not None):
-        from assemble_coupling_A10_quadrature_direct import assemble_L1_rhs_quadrature
-        inv_dt = 1.0 / config.dt
-        L1_vec = assemble_L1_rhs_quadrature(
-            mesh_parent, mesh_conductor, A_space, V_space,
-            sigma_submesh, A_prev, inv_dt, dof_mapper, config
-        )
-        L1_vec.copy(tmp_bV)
-    else:
-        tmp_bV.set(0.0)
-
+    petsc.assemble_vector(tmp_bV, L_blocks[1])
     petsc.set_bc(tmp_bV, block_bcs[1])
     tmp_bV.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
 
@@ -181,8 +168,7 @@ def assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space,
 def solve_one_step_submesh(mesh_parent, mesh_conductor, A_space, V_space,
                            cell_tags_parent, config, ksp, mat_nest,
                            a_blocks, L_blocks, block_bcs,
-                           J_z, M_vec, A_prev, t,
-                           sigma_submesh=None, dof_mapper=None):
+                           J_z, M_vec, A_prev, t):
     """Single time step solve for the submesh-based A–V system."""
     update_currents(cell_tags_parent, J_z, config, t)
     rotate_magnetization(cell_tags_parent, M_vec, config, t)
@@ -190,12 +176,7 @@ def solve_one_step_submesh(mesh_parent, mesh_conductor, A_space, V_space,
     comm = mesh_parent.comm
     nA = A_space.dofmap.index_map.size_global
     nV = V_space.dofmap.index_map.size_global
-    rhs = assemble_rhs_submesh(
-        a_blocks, L_blocks, block_bcs, A_space, V_space,
-        mesh_parent=mesh_parent, mesh_conductor=mesh_conductor,
-        sigma_submesh=sigma_submesh, A_prev=A_prev,
-        dof_mapper=dof_mapper, config=config,
-    )
+    rhs = assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space)
 
     xA = PETSc.Vec().createMPI(nA, comm=comm)
     xV = PETSc.Vec().createMPI(nV, comm=comm)

@@ -65,6 +65,8 @@ def main():
     dx_c = measure_over(dx_parent, omega_c())
     dx_pm = measure_over(dx_parent, omega_pm())
     dx_conductor = ufl.Measure("dx", domain=mesh_conductor)
+    # Conductor measure on parent (for entity_maps coupling: a01, a10, a11 use this)
+    dx_cond_parent = measure_over(dx_parent, conducting())
 
     print("\n=== Materials ===")
     sigma, nu, density = setup_materials(mesh_parent, cell_tags_parent, config)
@@ -109,20 +111,19 @@ def main():
     )
 
     print("\n=== Forms ===")
-    a_blocks, L_blocks, a00_spd_form, interpolation_data = build_forms_submesh(
+    a_blocks, L_blocks, a00_spd_form, interpolation_data, a_block_form, L_block_form = build_forms_submesh(
         mesh_parent, mesh_conductor, A_space, V_space,
         sigma, nu, J_z, M_vec, A_prev,
         dx_parent, dx_rs, dx_rpm, dx_c, dx_pm,
-        dx_conductor, config,
+        dx_conductor, config, entity_map, dx_cond_parent,
     )
     interpolation_data["sigma_submesh"] = sigma_submesh
-    interpolation_data["sigma_submesh_placeholder"].x.array[:] = sigma_submesh.x.array[:]
 
     print("\n=== Assembly ===")
     mats, mat_nest, A00_standalone, A00_spd, interpolation_data = assemble_system_matrix_submesh(
-        mesh_parent, mesh_conductor, a_blocks, block_bcs,
+        mesh_parent, a_blocks, block_bcs,
         a00_spd_form, interpolation_data, A_space, V_space,
-        dof_mapper=dof_mapper, sigma_parent=sigma, config=config,
+        a_block_form,
     )
 
     print("\n=== Solver ===")
@@ -150,8 +151,6 @@ def main():
             cell_tags_parent, config, ksp, mat_nest,
             a_blocks, L_blocks, block_bcs,
             J_z, M_vec, A_prev, t,
-            sigma_submesh=sigma_submesh,
-            dof_mapper=dof_mapper,
         )
 
         if mesh_parent.comm.rank == 0:

@@ -81,11 +81,6 @@ def load_mesh_and_extract_submesh(mesh_path):
             for i in range(n_submesh_cells):
                 parent_cell = entity_dict.get(i, -1)
                 submesh_tags[i] = cell_to_tag_parent.get(parent_cell, conductor_markers[0])
-        else:
-            if mesh_parent.comm.rank == 0:
-                print("Warning: Could not extract entity map, using default tags")
-            submesh_tags[:] = conductor_markers[0]
-
         cell_tags_conductor = meshtags(mesh_conductor, tdim, submesh_cell_indices, submesh_tags)
 
     return (

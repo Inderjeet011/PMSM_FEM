@@ -1,21 +1,5 @@
 """3D A-V solver with submesh: forms, assembly, and PETSc solver setup.
 A lives on parent mesh, V lives on conductor submesh.
-
-Overall execution order (main_submesh.py):
-  1. load_mesh_submesh: load mesh, extract submesh, setup materials, BCs
-  2. interpolate_materials: sigma_submesh from parent sigma
-  3. dof_mapping: create_dof_mapper for coupling
-  4. solve_equations_submesh: build forms, assemble matrix, configure solver
-  5. Time loop: solver_utils_submesh.solve_one_step_submesh
-
-Order of execution within this module (called from main_submesh.py):
-  1. build_forms_submesh() - define UFL forms (a00, a01, a10, a11, L0, L1)
-  2. assemble_system_matrix_submesh() - assemble blocks in order:
-     (a) A00 (petsc.assemble_matrix)
-     (b) A01 (assemble_A01_block_quadrature_direct)
-     (c) A10 (assemble_A10_block_quadrature_direct)
-     (d) A11 (petsc.assemble_matrix)
-  3. configure_solver_submesh() - set up PETSc KSP, fieldsplit PC, AMS for A-block
 """
 
 from dolfinx import fem
@@ -27,37 +11,23 @@ import numpy as np
 _keepalive = []  # Keep PETSc objects alive (AMS gradient, vectors, etc.)
 
 
-def build_forms_submesh(mesh_parent, mesh_conductor, A_space, V_space, 
+def build_forms_submesh(mesh_parent, mesh_conductor, A_space, V_space,
                         sigma, nu, J_z, M_vec, A_prev,
-                        dx_parent, dx_rs, dx_rpm, dx_c, dx_pm, 
-                        dx_conductor, config, exterior_facet_tag=None):
+                        dx_parent, dx_rs, dx_rpm, dx_c, dx_pm,
+                        dx_conductor, config, entity_map, dx_cond_parent,
+                        exterior_facet_tag=None):
     """
     Build forms for A-V system with A on parent mesh and V on conductor submesh.
-    
+    Uses entity_maps for automatic cross-mesh coupling (no manual quadrature).
+
     Parameters:
     -----------
-    mesh_parent : dolfinx.mesh.Mesh
-        Full parent mesh (for A)
-    mesh_conductor : dolfinx.mesh.Mesh
-        Conductor submesh (for V)
-    A_space : dolfinx.fem.FunctionSpace
-        Function space for A on parent mesh
-    V_space : dolfinx.fem.FunctionSpace
-        Function space for V on conductor submesh
-    sigma, nu : dolfinx.fem.Function
-        Material properties on parent mesh
-    J_z, M_vec : dolfinx.fem.Function
-        Sources on parent mesh
-    A_prev : dolfinx.fem.Function
-        Previous timestep A on parent mesh
-    dx_parent : ufl.Measure
-        Integration measure on parent mesh
-    dx_rs, dx_rpm, dx_c, dx_pm : ufl.Measure
-        Restricted measures on parent mesh
-    dx_conductor : ufl.Measure
-        Integration measure on conductor submesh
-    config : SimpleNamespace
-        Configuration parameters
+    entity_map : dolfinx.mesh.EntityMap
+        Cell entity map submesh -> parent from create_submesh.
+    dx_cond_parent : ufl.Measure
+        Integration over conductor region on parent (e.g. dx_rs + dx_rpm + dx_c + dx_pm).
+    (Other parameters as before: mesh_parent, mesh_conductor, A_space, V_space,
+     sigma, nu, J_z, M_vec, A_prev, dx_*, config.)
     """
     dt = fem.Constant(mesh_parent, PETSc.ScalarType(config.dt))
     mu0 = config.mu0
@@ -98,207 +68,67 @@ def build_forms_submesh(mesh_parent, mesh_conductor, A_space, V_space,
         + eps_spd * ufl.inner(A, v) * dx_parent
     )
     
-    # A–V coupling terms
-    #
-    # In this submesh-based implementation, the true A01 and A10 coupling blocks
-    # are assembled via custom quadrature kernels that use the DOF mapper and
-    # entity maps. To avoid cross-mesh UFL complications (which require
-    # entity_maps when compiling forms), we keep the UFL-level a01 and a10
-    # identically zero and rely entirely on the custom PETSc assembly for
-    # these blocks.
-    #
-    # This preserves the correct block structure for lifting/boundary handling
-    # while delegating all physical coupling to the quadrature routines.
-    # Use trivial scalar forms (no A–V coupling at UFL level); the actual
-    # A01 and A10 blocks are provided by custom quadrature assembly.
-    a01 = 0 * ufl.inner(ufl.grad(S), ufl.grad(S)) * dx_parent
-    a10 = 0 * ufl.inner(ufl.grad(S), ufl.grad(S)) * dx_conductor
-    
-    # a11: sigma * grad(V)·grad(q) on conductor submesh
-    # Need sigma on submesh - will be provided via interpolation_data
-    # Create placeholder for now (will be replaced with interpolated sigma)
-    DG0_submesh = fem.functionspace(mesh_conductor, ("DG", 0))
-    sigma_submesh_placeholder = fem.Function(DG0_submesh)
-    a11 = sigma_submesh_placeholder * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_conductor
-    
-    # Right-hand side
+    # A–V coupling: conductor integrals on parent measure; entity_maps at form compile
+    a01 = dt * sigma * ufl.inner(ufl.grad(S), v) * dx_cond_parent
+    a10 = sigma * ufl.inner(ufl.grad(q), A) * dx_cond_parent
+    a11 = dt * sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_cond_parent
+
     L0 = (
-        J_z * v[2] * dx_c 
-        + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_rs 
+        J_z * v[2] * dx_c
+        + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_rs
         + ufl.inner(nu * mu0 * M_vec, curlv) * dx_pm
     )
-    
-    # L1: keep RHS for V-equation zero at UFL level; any coupling from
-    # previous-step A can be added later via custom assembly if needed.
-    L1 = 0 * S * dx_conductor
-    
-    # Store interpolation functions for later use
+    L1 = ufl.inner(ufl.grad(q), sigma * A_prev) * dx_cond_parent
+
     interpolation_data = {
         'V_space_parent': None,
         'V_parent': None,
         'A_space_submesh': None,
         'A_submesh': None,
-        'sigma_submesh': None,  # Will be set externally via interpolate_materials
-        'sigma_submesh_placeholder': sigma_submesh_placeholder,  # For form building
+        'sigma_submesh': None,
     }
-    
-    a_blocks = ((fem.form(a00), fem.form(a01)), (fem.form(a10), fem.form(a11)))
+
+    em = [entity_map]
+    a_blocks = (
+        (fem.form(a00), fem.form(a01, entity_maps=em)),
+        (fem.form(a10, entity_maps=em), fem.form(a11, entity_maps=em)),
+    )
+    L_blocks = (fem.form(L0), fem.form(L1, entity_maps=em))
     a00_spd_form = fem.form(a00_spd)
-    L_blocks = (fem.form(L0), fem.form(L1))
-    
-    return a_blocks, L_blocks, a00_spd_form, interpolation_data
+    a_block_form = fem.form([[a00, a01], [a10, a11]], entity_maps=em)
+    L_block_form = fem.form([L0, L1], entity_maps=em)
+    return a_blocks, L_blocks, a00_spd_form, interpolation_data, a_block_form, L_block_form
 
 
-def assemble_system_matrix_submesh(mesh_parent, mesh_conductor, a_blocks, block_bcs, 
+def assemble_system_matrix_submesh(mesh_parent, a_blocks, block_bcs,
                                     a00_spd_form, interpolation_data, A_space_parent, V_space_submesh,
-                                    dof_mapper=None, sigma_parent=None, config=None):
+                                    a_block_form):
     """
-    Assemble system matrix for mixed parent/submesh system.
-    
-    Note: This is a simplified assembly. A full implementation would:
-    1. Use entity maps to properly couple parent and submesh DOFs
-    2. Handle the interpolation between meshes during assembly
+    Assemble system matrix from block form (entity_maps); extract blocks for nested solver.
     """
     comm = mesh_parent.comm
-
-    # Global DOF counts
     n_A_dofs = A_space_parent.dofmap.index_map.size_global
     n_V_dofs = V_space_submesh.dofmap.index_map.size_global
 
-    # Assemble blocks separately
-    mats = [[None, None], [None, None]]
-    
-    # A00 block (A-A coupling on parent): (nA x nA)
-    bcs_A = block_bcs[0] if block_bcs else []
-    mats[0][0] = petsc.assemble_matrix(a_blocks[0][0], bcs=bcs_A)
-    mats[0][0].assemble()
-    if dof_mapper is not None and config is not None:
-        from assemble_coupling_A10_quadrature_direct import assemble_A01_block_quadrature_direct
+    bcs_flat = [bc for bclist in (block_bcs or [[], []]) for bc in bclist]
+    A_mono = petsc.assemble_matrix(a_block_form, bcs=bcs_flat)
+    A_mono.assemble()
+    is_A = PETSc.IS().createGeneral(np.arange(0, n_A_dofs, dtype=np.int32), comm=comm)
+    is_V = PETSc.IS().createGeneral(
+        np.arange(n_A_dofs, n_A_dofs + n_V_dofs, dtype=np.int32), comm=comm
+    )
+    mats = [
+        [A_mono.createSubMatrix(is_A, is_A), A_mono.createSubMatrix(is_A, is_V)],
+        [A_mono.createSubMatrix(is_V, is_A), A_mono.createSubMatrix(is_V, is_V)],
+    ]
+    is_A.destroy()
+    is_V.destroy()
 
-        # Use same sigma_submesh as for A10
-        sigma_submesh = interpolation_data.get('sigma_submesh')
-        if sigma_submesh is None:
-            from dolfinx import fem as _fem
-            DG0_submesh = _fem.functionspace(mesh_conductor, ("DG", 0))
-            sigma_submesh = _fem.Function(DG0_submesh)
-            sigma_submesh.x.array[:] = 1e6
-
-        # dx_conductor was passed in via build_forms_submesh and is not available
-        # here; recreate it locally.
-        import ufl as _ufl
-        dx_c_local = _ufl.Measure("dx", domain=mesh_conductor)
-
-        mats[0][1] = assemble_A01_block_quadrature_direct(
-            mesh_parent, mesh_conductor, A_space_parent, V_space_submesh,
-            sigma_submesh, dx_c_local, dof_mapper, config, sigma_parent=sigma_parent
-        )
-    else:
-        # Fallback: zero matrix if no DOF mapper/config
-        A01_mat = PETSc.Mat().create(comm)
-        A01_mat.setType(PETSc.Mat.Type.AIJ)
-        A01_mat.setSizes([(n_A_dofs, None), (n_V_dofs, None)])
-        A01_mat.setUp()
-        A01_mat.assemble()
-        mats[0][1] = A01_mat
-    
-    # A10 block (A→V coupling): A on parent affects V on submesh
-    # This is the one-way coupling we're implementing
-    if dof_mapper is not None and config is not None:
-        from assemble_coupling_A10_quadrature_direct import assemble_A10_block_quadrature_direct
-        from dolfinx import fem as _fem
-        import ufl
-        from petsc4py import PETSc as PETSc_type
-        
-        # Get sigma_submesh from interpolation_data
-        sigma_submesh = interpolation_data.get('sigma_submesh')
-        if sigma_submesh is None:
-            # Fallback
-            from dolfinx import fem
-            DG0_submesh = fem.functionspace(mesh_conductor, ("DG", 0))
-            sigma_submesh = fem.Function(DG0_submesh)
-            sigma_submesh.x.array[:] = 1e6
-        
-        # Create constants for form
-        inv_dt = _fem.Constant(mesh_parent, PETSc_type.ScalarType(1.0 / config.dt))
-        omega = _fem.Constant(mesh_parent, PETSc_type.ScalarType(config.omega_m))
-        
-        # Get dx_conductor measure (should be passed or created)
-        dx_conductor = ufl.Measure("dx", domain=mesh_conductor)
-        
-        # Assemble A10 block using direct quadrature evaluation
-        mats[1][0] = assemble_A10_block_quadrature_direct(
-            mesh_parent, mesh_conductor, A_space_parent, V_space_submesh,
-            sigma_submesh, inv_dt, omega, dx_conductor, dof_mapper, config
-        )
-    else:
-        # Fallback: create zero matrix
-        A10_mat = PETSc.Mat().create(comm)
-        A10_mat.setType(PETSc.Mat.Type.AIJ)
-        A10_mat.setSizes([(n_V_dofs, None), (n_A_dofs, None)])
-        A10_mat.setUp()
-        A10_mat.assemble()
-        mats[1][0] = A10_mat
-    
-    # A11 block (V-V coupling on submesh)
-    bcs_V = block_bcs[1] if block_bcs else []
-    mats[1][1] = petsc.assemble_matrix(a_blocks[1][1], bcs=bcs_V)
-    mats[1][1].assemble()
-    
-    # Use interpolated sigma from interpolation_data
-    # This should have been set externally via interpolate_materials module
-    sigma_submesh = interpolation_data.get('sigma_submesh', None)
-    if sigma_submesh is None:
-        # Fallback: create placeholder (should not happen if called correctly)
-        from dolfinx import fem
-        DG0_submesh = fem.functionspace(mesh_conductor, ("DG", 0))
-        sigma_submesh = fem.Function(DG0_submesh)
-        sigma_submesh.x.array[:] = 1e6  # Approximate conductor conductivity
-        interpolation_data['sigma_submesh'] = sigma_submesh
-        if mesh_parent.comm.rank == 0:
-            print("Warning: sigma_submesh not provided, using fallback constant value")
-    
-    # Sanity checks: block sizes and communicators
-    A00 = mats[0][0]
-    A01 = mats[0][1]
-    A10 = mats[1][0]
-    A11 = mats[1][1]
-
-    m00, n00 = A00.getSize()
-    m01, n01 = A01.getSize()
-    m10, n10 = A10.getSize()
-    m11, n11 = A11.getSize()
-
-    assert m00 == n_A_dofs and n00 == n_A_dofs, f"A00 shape {m00}x{n00} != {n_A_dofs}x{n_A_dofs}"
-    assert m01 == n_A_dofs and n01 == n_V_dofs, f"A01 shape {m01}x{n01} != {n_A_dofs}x{n_V_dofs}"
-    assert m10 == n_V_dofs and n10 == n_A_dofs, f"A10 shape {m10}x{n10} != {n_V_dofs}x{n_A_dofs}"
-    assert m11 == n_V_dofs and n11 == n_V_dofs, f"A11 shape {m11}x{n11} != {n_V_dofs}x{n_V_dofs}"
-
-    # Check communicators are compatible with mesh_parent.comm
-    assert A00.getComm().size == comm.size, "A00 communicator size mismatch"
-    assert A01.getComm().size == comm.size, "A01 communicator size mismatch"
-    assert A10.getComm().size == comm.size, "A10 communicator size mismatch"
-    assert A11.getComm().size == comm.size, "A11 communicator size mismatch"
-
-    # Standalone A00 for AMS preconditioner
-    A00_standalone = A00.copy()
+    A00_standalone = mats[0][0].copy()
     A00_standalone.assemble()
-    
-    # Create nested matrix with strict [[A00, A01], [A10, A11]] ordering
+
     mat_nest = PETSc.Mat().createNest(mats, comm=comm)
     mat_nest.assemble()
-
-    # Quick MatVec sanity check: A * x = b with consistent VecNest layouts
-    xA = PETSc.Vec().createMPI(n_A_dofs, comm=comm)
-    xV = PETSc.Vec().createMPI(n_V_dofs, comm=comm)
-    xA.setRandom()
-    xV.setRandom()
-    x_nest = PETSc.Vec().createNest([xA, xV], comm=comm)
-
-    bA = PETSc.Vec().createMPI(n_A_dofs, comm=comm)
-    bV = PETSc.Vec().createMPI(n_V_dofs, comm=comm)
-    b_nest = PETSc.Vec().createNest([bA, bV], comm=comm)
-
-    mat_nest.mult(x_nest, b_nest)
 
     # SPD approximation for A-block
     A00_spd = petsc.assemble_matrix(a00_spd_form, bcs=None)
