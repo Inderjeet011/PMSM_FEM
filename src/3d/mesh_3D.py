@@ -167,10 +167,13 @@ def _angle_diff(a: float, b: float) -> float:
 # ---------------------------------------------------------------------------
 
 def generate_PMSM_mesh(
-    filename: Path, single: bool, res: np.float64, L: np.float64, depth: np.float64
+    filename: Path, single: bool, res: np.float64, L: np.float64, depth: np.float64,
+    lc_max_ratio: float = 25.0, dist_max_ratio: float = 8.0,
+    optimize: str = "Netgen",
 ):
     """
     Generate PMSM 3D mesh with motor centered in an air box.
+    Mesh is finer near the motor (distance < r5) and coarser as distance increases.
     Air box covers motor from all directions (x, y, z).
     Returns: (mesh, cell_tags, facet_tags)
     """
@@ -542,9 +545,13 @@ def generate_PMSM_mesh(
             gmsh.model.addPhysicalGroup(2, exterior_faces, surface_map["Exterior"])
 
         # ------------------------------------------------------------
-        # Step 7: Mesh generation
+        # Step 7: Mesh generation (finer near motor, coarser away)
         # ------------------------------------------------------------
         res_base = float(res)
+        lc_max = float(lc_max_ratio) * res_base
+        dist_max = float(dist_max_ratio) * r5
+        if rank == root:
+            print(f"\n📐 Mesh grading: LcMin={res_base:.4e} (near motor r<{r5:.4f}), LcMax={lc_max:.4e} (far r>{dist_max:.4f})")
 
         gmsh.model.mesh.field.add("Distance", 1)
         gmsh.model.mesh.field.setNumbers(1, "EdgesList", [cline])
@@ -552,9 +559,9 @@ def generate_PMSM_mesh(
         gmsh.model.mesh.field.add("Threshold", 2)
         gmsh.model.mesh.field.setNumber(2, "IField", 1)
         gmsh.model.mesh.field.setNumber(2, "LcMin", res_base)
-        gmsh.model.mesh.field.setNumber(2, "LcMax", 10.0 * res_base)
+        gmsh.model.mesh.field.setNumber(2, "LcMax", lc_max)
         gmsh.model.mesh.field.setNumber(2, "DistMin", r5)
-        gmsh.model.mesh.field.setNumber(2, "DistMax", 6.0 * r5)
+        gmsh.model.mesh.field.setNumber(2, "DistMax", dist_max)
 
         gmsh.model.mesh.field.add("Min", 3)
         gmsh.model.mesh.field.setNumbers(3, "FieldsList", [2])
@@ -562,7 +569,10 @@ def generate_PMSM_mesh(
 
         gmsh.option.setNumber("General.Terminal", 1)
         gmsh.model.mesh.generate(gdim)
-        gmsh.model.mesh.optimize("Netgen")
+        if optimize and optimize.lower() not in ("none", "off", ""):
+            if rank == root:
+                print(f"\n🔧 Running mesh optimization ({optimize})...")
+            gmsh.model.mesh.optimize(optimize)
 
         msh_file = str(filename.with_suffix(".msh"))
         gmsh.write(msh_file)
@@ -760,10 +770,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--res",
-        default=0.01,
+        default=0.005,
         type=np.float64,
         dest="res",
-        help="Base mesh resolution near motor",
+        help="Base mesh resolution near motor (5mm=0.005). Finer near motor, coarser with distance.",
     )
     parser.add_argument(
         "--L",
@@ -779,6 +789,26 @@ if __name__ == "__main__":
         dest="depth",
         help="Axial depth of the motor (extrusion length)",
     )
+    parser.add_argument(
+        "--lc-max-ratio",
+        default=40.0,
+        type=np.float64,
+        dest="lc_max_ratio",
+        help="LcMax/LcMin ratio: element size increases with distance from motor (e.g. 40 = 40x coarser far field)",
+    )
+    parser.add_argument(
+        "--dist-max-ratio",
+        default=8.0,
+        type=np.float64,
+        dest="dist_max_ratio",
+        help="DistMax/r5 ratio: distance beyond which mesh is coarsest (e.g. 8 = coarse beyond 8*r5)",
+    )
+    parser.add_argument(
+        "--no-optimize",
+        action="store_true",
+        dest="no_optimize",
+        help="Skip Netgen mesh optimization (much faster, but lower quality elements)",
+    )
 
     args = parser.parse_args()
     res = args.res
@@ -788,4 +818,5 @@ if __name__ == "__main__":
     folder.mkdir(parents=True, exist_ok=True)
     fname = folder / "pmesh3D_ipm"
 
-    generate_PMSM_mesh(fname, False, res, args.L, depth)
+    opt = "" if args.no_optimize else "Netgen"
+    generate_PMSM_mesh(fname, False, res, args.L, depth, lc_max_ratio=args.lc_max_ratio, dist_max_ratio=args.dist_max_ratio, optimize=opt)

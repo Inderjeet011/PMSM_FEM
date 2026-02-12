@@ -42,7 +42,7 @@ def make_config():
         mesh_path=root / "meshes" / "3d" / "pmesh3D_ipm.xdmf",
         results_path=root / "results" / "3d_submesh" / "av_solver_submesh.xdmf",
         write_results=True,
-        outer_max_it=600,
+        outer_max_it=300,
         outer_rtol=1e-4,
         outer_norm_type="unpreconditioned",  # "unpreconditioned"|"preconditioned"|"natural"|"none"
         ksp_A_max_it=5,

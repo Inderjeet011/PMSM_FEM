@@ -1,5 +1,6 @@
 """3D A-V solver helpers: forms, assembly, and PETSc solver setup."""
 
+import numpy as np
 from dolfinx import fem
 from dolfinx.fem import petsc
 from dolfinx.cpp.fem.petsc import discrete_gradient
@@ -7,6 +8,32 @@ from petsc4py import PETSc
 import ufl
 
 _keepalive = []   #PETSc object created in Python is passed to PETSc but not stored in Python, it WILL be destroyed
+
+
+def _build_interior_nodes_for_ams(mesh, cell_tags, conductor_markers, degree=1):
+    """
+    Build CG(degree) vector for HYPRE AMS setHYPREAMSSetInteriorNodes.
+    Values 1.0 = exterior (non-conductor), 0.0 = interior (conductor).
+    Same convention as copper-rod: nodes in conductor cells get 0.0.
+    """
+    W = fem.functionspace(mesh, ("Lagrange", degree))
+    interior_nodes_array = fem.Function(W)
+    interior_nodes_array.x.array[:] = 1.0
+    interior_nodes_array.x.scatter_forward()
+
+    dofmap = W.dofmap
+    num_dofs_per_cell = dofmap.dof_layout.num_dofs
+    cell_dofs = dofmap.list.reshape(-1, num_dofs_per_cell)
+
+    conductor_cells = np.concatenate([cell_tags.find(tag) for tag in conductor_markers])
+    conductor_cells = np.unique(conductor_cells)
+    if conductor_cells.size > 0:
+        tagged_cell_dofs = cell_dofs[conductor_cells].flatten()
+        unique_dofs = np.unique(tagged_cell_dofs)
+        interior_nodes_array.x.array[unique_dofs] = 0.0
+        interior_nodes_array.x.scatter_forward()
+
+    return interior_nodes_array
 
 
 
@@ -101,7 +128,8 @@ def assemble_system_matrix(mesh, a_blocks, block_bcs, a00_spd_form):
 
 
 
-def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, config):
+def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, config,
+                     cell_tags=None, conductor_markers=None):
     A00_full = mat_blocks[0][0]
 
     ksp = PETSc.KSP().create(mesh.comm)
@@ -124,7 +152,7 @@ def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, conf
     pc.setUp()
     ksp_A, ksp_V = pc.getFieldSplitSubKSP()
 
-    # A-block AMS
+    # A-block AMS (discrete gradient from CG1 to Nédélec)
     V_ams = fem.functionspace(mesh, ("Lagrange", 1))
     G = discrete_gradient(V_ams._cpp_object, A_space._cpp_object)
     G.assemble()
@@ -145,7 +173,7 @@ def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, conf
     G.mult(verts[2], e2)
 
     ksp_A.setType("fgmres")
-    ksp_A.setTolerances(rtol=0.0, atol=0.0, max_it=int(getattr(config, "ksp_A_max_it", 2)))
+    ksp_A.setTolerances(rtol=0.0, atol=0.0, max_it=int(getattr(config, "ksp_A_max_it", 10)))
     ksp_A.setGMRESRestart(int(getattr(config, "ksp_A_restart", 30)))
     ksp_A.setOperators(A00_full, A00_spd)
 
@@ -154,6 +182,31 @@ def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, conf
     pc_A.setHYPREType("ams")
     pc_A.setHYPREDiscreteGradient(G)
     pc_A.setHYPRESetEdgeConstantVectors(e0, e1, e2)
+
+    # Interior nodes for AMS (copper-rod style: 0 = conductor, 1 = non-conductor)
+    if cell_tags is not None and conductor_markers is not None and len(conductor_markers) > 0:
+        interior_nodes_array = _build_interior_nodes_for_ams(
+            mesh, cell_tags, conductor_markers, degree=1
+        )
+        pc_A.setHYPREAMSSetInteriorNodes(interior_nodes_array.x.petsc_vec)
+        _keepalive.append(interior_nodes_array)
+
+    # AMS tuning similar to copper-rod setup
+    opts = PETSc.Options()
+    opts["pc_hypre_ams_cycle_type"] = 13
+    opts["pc_hypre_ams_tol"] = 0.0
+    opts["pc_hypre_ams_max_iter"] = 1
+    opts["pc_hypre_ams_amg_beta_theta"] = 0.25
+    opts["pc_hypre_ams_print_level"] = 1
+    opts["pc_hypre_ams_amg_alpha_options"] = "10,1,6,6,4"
+    opts["pc_hypre_ams_amg_beta_options"] = "10,1,6,6,4"
+    opts["pc_hypre_ams_relax_type"] = 2
+    opts["pc_hypre_ams_relax_weight"] = 1.0
+    opts["pc_hypre_ams_relax_times"] = 1
+    opts["pc_hypre_ams_omega"] = 1.0
+    opts["pc_hypre_ams_projection_frequency"] = 25
+
+    ksp_A.setFromOptions()
 
     ksp_V.setType("preonly")
     pc_V = ksp_V.getPC()

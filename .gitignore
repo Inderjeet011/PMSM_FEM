@@ -40,6 +40,8 @@ meshes/**/*.msh
 # Exclude directories
 latest_fem/
 team_30/
+src/arshads_code/
+src/team30/
 
 # Exclude specific files
 motor_mesh_quality.png

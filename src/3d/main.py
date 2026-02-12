@@ -96,7 +96,10 @@ def main():
         exterior_facet_tag=EXTERIOR_FACET_TAG,
     )
     mat_blocks, mat_nest, _, A00_spd, _ = assemble_system_matrix(mesh, a_blocks, block_bcs, a00_spd_form)
-    ksp = configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, config)
+    ksp = configure_solver(
+        mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, config,
+        cell_tags=ct, conductor_markers=conducting(),
+    )
 
     # Optional output
     writer = None
