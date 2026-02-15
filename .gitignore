@@ -42,6 +42,8 @@ latest_fem/
 team_30/
 src/arshads_code/
 src/team30/
+src/maxwell_curl_curl/
+src/3d_submesh/history/
 
 # Exclude specific files
 motor_mesh_quality.png
