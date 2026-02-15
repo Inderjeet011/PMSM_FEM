@@ -1,8 +1,8 @@
 #!/bin/bash
 # Generate mesh and run submesh solver.
 # Default: 2mm near motor, grading to coarser elements with distance.
-# Usage: ./run_coarse.sh [res]   e.g. ./run_coarse.sh 0.005  (5mm), ./run_coarse.sh 0.003 (3mm)
-RES=${1:-0.005}
+# Usage: ./run_coarse.sh [res]   e.g. ./run_coarse.sh 0.006  (6mm), ./run_coarse.sh 0.005 (5mm)
+RES=${1:-0.006}
 LCRATIO=${2:-40}
 cd "$(dirname "$0")/../3d"
 echo "=== Generating mesh: res=${RES}m, lc-max-ratio=${LCRATIO} ==="

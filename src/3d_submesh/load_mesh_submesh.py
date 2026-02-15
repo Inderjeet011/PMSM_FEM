@@ -28,15 +28,24 @@ COILS = (7, 8, 9, 10, 11, 12)
 MAGNETS = (13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
 
 
-def conducting():
-    """Conducting regions for σ-terms and the V-equation (include coils)."""
-    return ROTOR + ALUMINIUM + MAGNETS + COILS
+def conducting(config=None):
+    """
+    Conducting regions for the *V-submesh* and A–V coupling.
+
+    Key option:
+    - include_pm_in_av_coupling (bool, default True when config is None):
+        If False, exclude permanent magnets from the V submesh / coupling.
+        This matches the original `src/3d` solver intent and avoids strong B suppression
+        from A–V coupling inside PM.
+    """
+    include_pm = True if config is None else bool(getattr(config, "include_pm_in_av_coupling", True))
+    return (ROTOR + ALUMINIUM + COILS) + (MAGNETS if include_pm else ())
 
 
 EXTERIOR_FACET_TAG = surface_map["Exterior"]
 
 
-def load_mesh_and_extract_submesh(mesh_path):
+def load_mesh_and_extract_submesh(mesh_path, config=None):
     """
     Load mesh and extract conductor-only submesh.
 
@@ -54,7 +63,7 @@ def load_mesh_and_extract_submesh(mesh_path):
         cell_tags_parent = xdmf.read_meshtags(mesh_parent, name="cell_tags")
         facet_tags_parent = xdmf.read_meshtags(mesh_parent, name="facet_tags")
 
-    conductor_markers = conducting()
+    conductor_markers = conducting(config)
     conductor_cells = np.array([], dtype=np.int32)
     for marker in conductor_markers:
         cells = cell_tags_parent.find(marker)
@@ -126,6 +135,14 @@ def setup_materials(mesh, cell_tags, config):
         sigma.x.array[cells] = sig
         density.x.array[cells] = densities.get(mat_name, 0.0)
         nu.x.array[cells] = 1.0 / (mu0 * mu_r[mat_name])
+
+    # Cu sigma override: model_parameters has Cu=0 (for prescribed J). For voltage drive to induce currents, use sigma_cu_override (e.g. 5.96e7).
+    sigma_cu_override = float(getattr(config, "sigma_cu_override", 0.0))
+    if sigma_cu_override > 0:
+        for m in COILS:
+            cells = cell_tags.find(m)
+            if cells.size > 0:
+                sigma.x.array[cells] = sigma_cu_override
 
     return sigma, nu, density
 

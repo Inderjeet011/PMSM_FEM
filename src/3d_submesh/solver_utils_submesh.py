@@ -31,7 +31,7 @@ def make_config():
     root = Path(__file__).parents[2]
     return SimpleNamespace(
         dt=dt,
-        num_steps=1,
+        num_steps=15,
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),
@@ -42,22 +42,34 @@ def make_config():
         mesh_path=root / "meshes" / "3d" / "pmesh3D_ipm.xdmf",
         results_path=root / "results" / "3d_submesh" / "av_solver_submesh.xdmf",
         write_results=True,
+        diagnose_divJ=False,
+        outer_rtol=3e-4,          # rel_res typically 2.5-2.6e-4 with sigma_pm_coupling_scale=0.1
         outer_max_it=600,
-        outer_rtol=1e-4,
-        outer_norm_type="unpreconditioned",  # "unpreconditioned"|"preconditioned"|"natural"|"none"
+        outer_norm_type="unpreconditioned",
         ksp_A_max_it=5,
-        epsilon_A=1e-8,
-        epsilon_A_spd=1e-6,
-        # Small sigma in air regions to help solver convergence (0 = use mesh_3D values only)
+
+        # Regularization (mass term) disabled for experiment
+        epsilon_A=0.0,
+        epsilon_A_spd=0.0,
         sigma_air_min=1e-8,
-        # Source: "current" = prescribed J in coils; "voltage" = potential difference (V on coils)
-        source_type="voltage",
+        # Use prescribed coil current density (stable, does not require conductive Cu).
+        source_type="current",
         voltage_amplitude=10.0,
-        # --- Convergence postmortem: flip one at a time to see effect on rel_res ---
-        use_schur=False,           # True = SCHUR fieldsplit + mat_nest as P; False = ADDITIVE + block diag P
-        use_interior_nodes=True,   # True = pass interior nodes to AMS; False = skip
-        use_motion_term=True,     # True = add -sigma*(u_rot × curl A)·v in a00 (dx_rpm); False = skip
-        diagnostic_direct_solve=False,  # True = try one LU/MUMPS solve to check if system itself is OK
+        # Keep coils non-conducting unless explicitly studying eddy currents in copper.
+        sigma_cu_override=0.0,
+        use_schur=False,
+        use_interior_nodes=True,
+        use_motion_term=True,
+        use_magnet_initial_guess=True,
+        magnet_A_prev_scale=0.4,
+        use_magnet_as_ksp_x0=True,
+        sigma_pm_coupling_scale=0.1,   # Weaken A-V coupling in PM (best balance: B~0.09 T, rel_res~2.6e-4)
+        # Exclude PM from V-submesh / A–V coupling to avoid severe B suppression.
+        # (Matches original `src/3d` formulation intent.)
+        include_pm_in_av_coupling=False,
+        # Use magnet-only solve each step as a background field A_bg(t),
+        # and solve the coupled A–V system only for the eddy/current correction.
+        use_magnet_background=True,
     )
 
 
@@ -150,8 +162,87 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space):
     )
     B_mag.x.scatter_forward()
 
-    vals = B_mag.x.array
-    return B_sol, B_mag, float(vals.max()), float(vals.min()), float(np.linalg.norm(vals)), B_dg
+    # MPI-safe statistics: use owned dofs only and reduce globally.
+    imap = B_magnitude_space.dofmap.index_map
+    n_owned = imap.size_local
+    vals_owned = B_mag.x.array[:n_owned]
+    local_max = float(vals_owned.max()) if vals_owned.size else -np.inf
+    local_min = float(vals_owned.min()) if vals_owned.size else np.inf
+    local_sq = float(np.dot(vals_owned, vals_owned))
+    comm = mesh.comm
+    max_B = comm.allreduce(local_max, op=MPI.MAX)
+    min_B = comm.allreduce(local_min, op=MPI.MIN)
+    norm_B = float(np.sqrt(comm.allreduce(local_sq, op=MPI.SUM)))
+    return B_sol, B_mag, max_B, min_B, norm_B, B_dg
+
+
+def solve_magnet_only_initial_guess(mesh_parent, A_space, nu, M_vec, cell_tags_parent,
+                                    facet_tags_parent, dx_parent, dx_pm, config):
+    """
+    Solve magnet-only curl-curl: nu*curl(A)·curl(v) = nu*mu0*M·curl(v) in PM.
+    Returns PETSc Vec for A to use as Krylov initial guess (improves B-field).
+    """
+    import ufl
+    import basix.ufl
+    from load_mesh_submesh import setup_boundary_conditions_parent
+
+    dx_pm_measure = dx_pm
+    bc_A = setup_boundary_conditions_parent(mesh_parent, facet_tags_parent, A_space)
+
+    A = ufl.TrialFunction(A_space)
+    v = ufl.TestFunction(A_space)
+    curlA = ufl.curl(A)
+    curlv = ufl.curl(v)
+    mu0 = config.mu0
+    eps = fem.Constant(mesh_parent, PETSc.ScalarType(1e-6))
+
+    a00 = nu * ufl.inner(curlA, curlv) * dx_parent + eps * ufl.inner(A, v) * dx_parent
+    L0 = ufl.inner(nu * mu0 * M_vec, curlv) * dx_pm_measure
+
+    a_form = fem.form(a00)
+    L_form = fem.form(L0)
+
+    A_mat = petsc.assemble_matrix(a_form, bcs=[bc_A])
+    A_mat.assemble()
+    b_vec = petsc.create_vector(A_space)
+    petsc.assemble_vector(b_vec, L_form)
+    petsc.set_bc(b_vec, [bc_A])
+    b_vec.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+
+    from dolfinx.cpp.fem.petsc import discrete_gradient
+    V_ams = fem.functionspace(mesh_parent, ("Lagrange", 1))
+    G = discrete_gradient(V_ams._cpp_object, A_space._cpp_object)
+    G.assemble()
+    xcoord = ufl.SpatialCoordinate(mesh_parent)
+    verts = []
+    for dim in range(3):
+        f = fem.Function(V_ams)
+        f.interpolate(fem.Expression(xcoord[dim], V_ams.element.interpolation_points))
+        f.x.scatter_forward()
+        verts.append(f.x.petsc_vec)
+    e0, e1, e2 = G.createVecLeft(), G.createVecLeft(), G.createVecLeft()
+    G.mult(verts[0], e0)
+    G.mult(verts[1], e1)
+    G.mult(verts[2], e2)
+    nullsp = PETSc.NullSpace().create(vectors=[e0, e1, e2], comm=mesh_parent.comm)
+    A_mat.setNullSpace(nullsp)
+    A_mat.setTransposeNullSpace(nullsp)
+
+    ksp = PETSc.KSP().create(mesh_parent.comm)
+    ksp.setOperators(A_mat, A_mat)
+    ksp.setType("preonly")
+    pc = ksp.getPC()
+    pc.setType("lu")
+    try:
+        pc.setFactorSolverType("mumps")
+    except Exception:
+        pass
+    ksp.setFromOptions()
+
+    x_mag = b_vec.duplicate()
+    x_mag.set(0.0)
+    ksp.solve(b_vec, x_mag)
+    return x_mag
 
 
 def assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space):
@@ -162,11 +253,17 @@ def assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space):
 
     tmp_bA = petsc.create_vector(A_space)
     petsc.assemble_vector(tmp_bA, L_blocks[0])
+    # IMPORTANT: apply lifting for coupling block with Dirichlet BCs on V.
+    # Without this, the coupled system RHS is inconsistent with the BC-eliminated matrix,
+    # and the solve can produce severely distorted A (and thus B).
+    petsc.apply_lifting(tmp_bA, [a_blocks[0][1]], bcs=[block_bcs[1]])
     petsc.set_bc(tmp_bA, block_bcs[0])
     tmp_bA.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
 
     tmp_bV = petsc.create_vector(V_space)
     petsc.assemble_vector(tmp_bV, L_blocks[1])
+    # Apply lifting for coupling block with Dirichlet BCs on A.
+    petsc.apply_lifting(tmp_bV, [a_blocks[1][0]], bcs=[block_bcs[0]])
     petsc.set_bc(tmp_bV, block_bcs[1])
     tmp_bV.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
 
@@ -184,10 +281,13 @@ def solve_one_step_submesh(mesh_parent, mesh_conductor, A_space, V_space,
                            cell_tags_parent, config, ksp, mat_nest,
                            a_blocks, L_blocks, block_bcs,
                            J_z, M_vec, A_prev, t,
-                           voltage_update_data=None):
+                           voltage_update_data=None, x0_A_vec=None, x0_V_vec=None):
     """Single time step solve for the submesh-based A–V system."""
     update_currents(cell_tags_parent, J_z, config, t)
-    rotate_magnetization(cell_tags_parent, M_vec, config, t)
+    # If using background-magnet decomposition, magnetization is rotated in the main loop
+    # to keep the magnet-only solve and the coupled solve consistent.
+    if not bool(getattr(config, "use_magnet_background", False)):
+        rotate_magnetization(cell_tags_parent, M_vec, config, t)
 
     if voltage_update_data is not None:
         u_voltage, voltage_dofs, phase = voltage_update_data
@@ -208,8 +308,14 @@ def solve_one_step_submesh(mesh_parent, mesh_conductor, A_space, V_space,
 
     xA = PETSc.Vec().createMPI(nA, comm=comm)
     xV = PETSc.Vec().createMPI(nV, comm=comm)
-    xA.set(0.0)
-    xV.set(0.0)
+    if x0_A_vec is not None:
+        x0_A_vec.copy(xA)
+    else:
+        xA.set(0.0)
+    if x0_V_vec is not None:
+        x0_V_vec.copy(xV)
+    else:
+        xV.set(0.0)
     sol = PETSc.Vec().createNest([xA, xV], comm=comm)
 
     # Diagnostic: try a direct solve (LU) on monolithic AIJ to determine if the system itself is solvable.
@@ -281,4 +387,5 @@ def solve_one_step_submesh(mesh_parent, mesh_conductor, A_space, V_space,
     V_sol.x.scatter_forward()
 
     A_prev.x.array[:] = A_sol.x.array[:]
+    A_prev.x.scatter_forward()
     return A_sol, V_sol, residual_norm, rhs_norm, relative_residual

@@ -15,7 +15,9 @@ def build_forms_submesh(mesh_parent, mesh_conductor, A_space, V_space,
                         sigma, nu, J_z, M_vec, A_prev,
                         dx_parent, dx_rs, dx_rpm, dx_c, dx_pm,
                         dx_conductor, config, entity_map, dx_cond_parent,
-                        dx_air=None, exterior_facet_tag=None):
+                        dx_air=None, exterior_facet_tag=None, sigma_coupling=None,
+                        A_background=None, A_background_prev=None,
+                        include_magnet_source_in_coupled=True):
     """
     Build forms for A-V system with A on parent mesh and V on conductor submesh.
     Uses entity_maps for automatic cross-mesh coupling (no manual quadrature).
@@ -72,19 +74,41 @@ def build_forms_submesh(mesh_parent, mesh_conductor, A_space, V_space,
         + eps_spd * ufl.inner(A, v) * dx_parent
     )
     
-    # A–V coupling: conductor integrals on parent measure; entity_maps at form compile
-    a01 = dt * sigma * ufl.inner(ufl.grad(S), v) * dx_cond_parent
-    a10 = sigma * ufl.inner(ufl.grad(q), A) * dx_cond_parent
-    a11 = dt * sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_cond_parent
+    # A–V coupling: use sigma_coupling if provided (e.g. weakened in PM to reduce B suppression)
+    sig_c = sigma_coupling if sigma_coupling is not None else sigma
+    a01 = dt * sig_c * ufl.inner(ufl.grad(S), v) * dx_cond_parent
+    a10 = sig_c * ufl.inner(ufl.grad(q), A) * dx_cond_parent
+    a11 = dt * sig_c * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_cond_parent
 
+    # RHS:
+    # - Transient/history terms use A_prev (previous step of the unknown A)
+    # - Optionally treat the magnetization field as a *background* solution A_background(t)
+    #   and solve the coupled system only for an eddy/current correction.
     L0 = (
         J_z * v[2] * dx_c
         + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_rs
-        + ufl.inner(nu * mu0 * M_vec, curlv) * dx_pm
     )
+    if include_magnet_source_in_coupled:
+        L0 += ufl.inner(nu * mu0 * M_vec, curlv) * dx_pm
     if dx_air is not None:
         L0 += (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_air
-    L1 = ufl.inner(ufl.grad(q), sigma * A_prev) * dx_cond_parent
+
+    # Background magnet field decomposition:
+    # If A_background is provided, the coupled solve is intended to compute only the correction A_ec.
+    # Then the transient terms must account for (A_bg^{n} - A_bg^{n+1}) on the RHS, and the motion term
+    # must include the known background contribution.
+    if A_background is not None and A_background_prev is not None:
+        L0 += (sigma * inv_dt) * ufl.inner(A_background_prev - A_background, v) * dx_rs
+        if dx_air is not None:
+            L0 += (sigma * inv_dt) * ufl.inner(A_background_prev - A_background, v) * dx_air
+        if getattr(config, "use_motion_term", False):
+            x = ufl.SpatialCoordinate(mesh_parent)
+            omega_m = float(config.omega_m)
+            u_rot = ufl.as_vector((-omega_m * x[1], omega_m * x[0], 0.0))
+            L0 += sigma * ufl.inner(ufl.cross(u_rot, ufl.curl(A_background)), v) * dx_rpm
+    L1 = ufl.inner(ufl.grad(q), sig_c * A_prev) * dx_cond_parent
+    if A_background is not None and A_background_prev is not None:
+        L1 += ufl.inner(ufl.grad(q), sig_c * (A_background_prev - A_background)) * dx_cond_parent
 
     interpolation_data = {
         'V_space_parent': None,
@@ -180,7 +204,7 @@ def configure_solver_submesh(mesh_parent, mat_nest, mat_blocks, A_space, V_space
         ksp = PETSc.KSP().create(comm)
         ksp.setOperators(mat_nest, mat_nest)
         ksp.setType("gmres")
-        ksp.setGMRESRestart(100)
+        ksp.setGMRESRestart(150)   # Larger restart improves convergence
         ksp.setNormType(norm_type)
         ksp.setTolerances(
             rtol=float(getattr(config, "outer_rtol", 1e-4)),
@@ -205,7 +229,7 @@ def configure_solver_submesh(mesh_parent, mat_nest, mat_blocks, A_space, V_space
         ksp = PETSc.KSP().create(comm)
         ksp.setOperators(mat_nest, P_nest)
         ksp.setType("gmres")
-        ksp.setGMRESRestart(100)
+        ksp.setGMRESRestart(150)   # Larger restart improves convergence
         ksp.setNormType(norm_type)
         ksp.setTolerances(
             rtol=float(getattr(config, "outer_rtol", 1e-4)),
@@ -325,5 +349,9 @@ def configure_solver_submesh(mesh_parent, mat_nest, mat_blocks, A_space, V_space
         _keepalive.append((G, V_ams, edge_vecs))
     else:
         _keepalive.append((G, V_ams, Pi))
+
+    # Allow PETSc command-line options (e.g. -ksp_monitor, -ksp_view) to take effect
+    # on the *outer* KSP, not just sub-KSPs.
+    ksp.setFromOptions()
 
     return ksp
