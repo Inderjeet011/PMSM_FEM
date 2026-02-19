@@ -28,24 +28,22 @@ COILS = (7, 8, 9, 10, 11, 12)
 MAGNETS = (13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
 
 
-def conducting(config=None):
+def conducting():
     """
-    Conducting regions for the *V-submesh* and A–V coupling.
+    Conducting regions for σ-terms and the V-equation (include coils).
 
-    Key option:
-    - include_pm_in_av_coupling (bool, default True when config is None):
-        If False, exclude permanent magnets from the V submesh / coupling.
-        This matches the original `src/3d` solver intent and avoids strong B suppression
-        from A–V coupling inside PM.
+    IMPORTANT:
+    - Use COILS only for the A–V coupling / V-submesh (typical A–V formulation for driven windings).
+    - Including rotor/aluminium here introduces strong eddy-current damping and extreme stiffness
+      (sigma/dt) that can collapse the magnet field for small dt.
     """
-    include_pm = True if config is None else bool(getattr(config, "include_pm_in_av_coupling", True))
-    return (ROTOR + ALUMINIUM + COILS) + (MAGNETS if include_pm else ())
+    return COILS
 
 
 EXTERIOR_FACET_TAG = surface_map["Exterior"]
 
 
-def load_mesh_and_extract_submesh(mesh_path, config=None):
+def load_mesh_and_extract_submesh(mesh_path):
     """
     Load mesh and extract conductor-only submesh.
 
@@ -63,7 +61,7 @@ def load_mesh_and_extract_submesh(mesh_path, config=None):
         cell_tags_parent = xdmf.read_meshtags(mesh_parent, name="cell_tags")
         facet_tags_parent = xdmf.read_meshtags(mesh_parent, name="facet_tags")
 
-    conductor_markers = conducting(config)
+    conductor_markers = conducting()
     conductor_cells = np.array([], dtype=np.int32)
     for marker in conductor_markers:
         cells = cell_tags_parent.find(marker)
@@ -136,13 +134,39 @@ def setup_materials(mesh, cell_tags, config):
         density.x.array[cells] = densities.get(mat_name, 0.0)
         nu.x.array[cells] = 1.0 / (mu0 * mu_r[mat_name])
 
-    # Cu sigma override: model_parameters has Cu=0 (for prescribed J). For voltage drive to induce currents, use sigma_cu_override (e.g. 5.96e7).
-    sigma_cu_override = float(getattr(config, "sigma_cu_override", 0.0))
-    if sigma_cu_override > 0:
-        for m in COILS:
+    # Optional override: treat PMs as non-conducting for this solve to prevent transient
+    # (sigma/dt) damping of the magnetization field.
+    sigma_pm_override = getattr(config, "sigma_pm_override", None)
+    if sigma_pm_override is not None:
+        sig_pm = float(sigma_pm_override)
+        for m in MAGNETS:
             cells = cell_tags.find(m)
             if cells.size > 0:
-                sigma.x.array[cells] = sigma_cu_override
+                sigma.x.array[cells] = sig_pm
+
+    # Optional overrides: disable rotor/aluminium conductivity (eddy-current damping) for debugging
+    # and for recovering the magnetostatic-like B-field strength.
+    sigma_rotor_override = getattr(config, "sigma_rotor_override", None)
+    if sigma_rotor_override is not None:
+        cells = cell_tags.find(ROTOR[0])
+        if cells.size > 0:
+            sigma.x.array[cells] = float(sigma_rotor_override)
+    sigma_al_override = getattr(config, "sigma_al_override", None)
+    if sigma_al_override is not None:
+        cells = cell_tags.find(ALUMINIUM[0])
+        if cells.size > 0:
+            sigma.x.array[cells] = float(sigma_al_override)
+
+    # Optional Cu conductivity override: mesh_3D sets Cu sigma=0 for prescribed-J runs.
+    # If we want a well-posed V-block (or voltage drive), we must make coils conductive.
+    sigma_cu_override = getattr(config, "sigma_cu_override", None)
+    if sigma_cu_override is not None:
+        sig_cu = float(sigma_cu_override)
+        if sig_cu > 0:
+            for m in COILS:
+                cells = cell_tags.find(m)
+                if cells.size > 0:
+                    sigma.x.array[cells] = sig_cu
 
     return sigma, nu, density
 
@@ -171,20 +195,27 @@ def setup_boundary_conditions_submesh(mesh_conductor, V_space, cell_tags_conduct
     """
     source_type = getattr(config, "source_type", "current") if config is not None else "current"
 
-    # Ground: one dof from first conductor with cells (coil 7 for symmetry with voltage on coil 8)
-    ground_marker = COILS[0] if source_type == "voltage" else conductor_markers[0]
-    ground_dofs = np.array([], dtype=np.int32)
-    for m in (ground_marker,) if source_type == "voltage" else conductor_markers:
-        cells = cell_tags_conductor.find(m)
-        if cells.size == 0:
-            continue
-        dofs = V_space.dofmap.cell_dofs(int(cells[0]))
-        if len(dofs) == 0:
-            continue
-        ground_dofs = np.array([int(dofs[0])], dtype=np.int32)
-        break
     u0 = fem.Function(V_space)
     u0.x.array[:] = 0.0
+    def _pick_one_dof(marker: int):
+        cells = cell_tags_conductor.find(marker)
+        if cells.size == 0:
+            return None
+        dofs = V_space.dofmap.cell_dofs(int(cells[0]))
+        if len(dofs) == 0:
+            return None
+        return int(dofs[0])
+
+    # IMPORTANT:
+    # V is only defined up to an additive constant on *each disconnected conductor region*.
+    # If coils are disconnected, we must pin one DOF per marker to remove the nullspace;
+    # otherwise the V-block (and hence the coupled solve) can behave singular/unstable.
+    ground_dofs_list = []
+    for m in conductor_markers:
+        dof0 = _pick_one_dof(int(m))
+        if dof0 is not None:
+            ground_dofs_list.append(dof0)
+    ground_dofs = np.unique(np.array(ground_dofs_list, dtype=np.int32))
     bc_ground = fem.dirichletbc(u0, ground_dofs)
 
     if source_type != "voltage":
