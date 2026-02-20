@@ -42,14 +42,14 @@ def make_config():
         mesh_path=root / "meshes" / "3d" / "pmesh3D_ipm.xdmf",
         results_path=root / "results" / "3d_submesh" / "av_solver_submesh.xdmf",
         write_results=True,
-        # Absolute convergence target: stop when ||Ax-b|| < outer_atol
-        outer_max_it=220,
+        # Fast run: 100 its max, looser inner solve; stop when ||b-Ax|| < 0.5
+        outer_max_it=100,
         outer_rtol=0.0,
-        outer_atol=10.0,
+        outer_atol=0.5,
         outer_norm_type="unpreconditioned",  # "unpreconditioned"|"preconditioned"|"natural"|"none"
-        ksp_A_max_it=15,
-        ksp_A_restart=50,
-        ksp_A_rtol=1e-2,
+        ksp_A_max_it=8,
+        ksp_A_restart=35,
+        ksp_A_rtol=2e-2,
         # Regularization (disabled per request)
         epsilon_A=0.0,
         epsilon_A_spd=0.0,
