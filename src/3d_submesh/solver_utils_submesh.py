@@ -3,7 +3,6 @@
 import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
-from mpi4py import MPI
 
 from dolfinx import fem
 from dolfinx.fem import petsc
@@ -12,12 +11,10 @@ import ufl
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
-from load_mesh import CURRENT_MAP, MAGNETS, AIR_GAP
+from load_mesh import CURRENT_MAP, MAGNETS
 
 
 def make_config():
-    """Create configuration (same as original)."""
-    sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
     from mesh_3D import model_parameters
 
     freq = float(model_parameters["freq"])
@@ -42,38 +39,14 @@ def make_config():
         mesh_path=root / "meshes" / "3d" / "pmesh3D_ipm.xdmf",
         results_path=root / "results" / "3d_submesh" / "av_solver_submesh.xdmf",
         write_results=True,
-        # Fast run: 100 its max, looser inner solve; stop when ||b-Ax|| < 0.5
         outer_max_it=100,
         outer_rtol=0.0,
         outer_atol=0.5,
-        outer_norm_type="unpreconditioned",  # "unpreconditioned"|"preconditioned"|"natural"|"none"
         ksp_A_max_it=8,
         ksp_A_restart=35,
         ksp_A_rtol=2e-2,
-        # Regularization (disabled per request)
-        epsilon_A=0.0,
-        epsilon_A_spd=0.0,
-        gauge_alpha=0.0,
-        # Small sigma in air regions to help solver convergence (0 = use mesh_3D values only)
-        sigma_air_min=1e-8,
-        # Set PM conductivity used in the solve. Use 0.0 to avoid sigma/dt damping in PMs.
-        sigma_pm_override=0.0,
-        # Disable rotor/aluminium eddy-current damping for B-field recovery (debug/default).
-        sigma_rotor_override=0.0,
         sigma_al_override=0.0,
-        # Make coils conductive so the V-block is well-posed (otherwise sigma_Cu=0 in mesh_3D).
         sigma_cu_override=5.96e7,
-        # Source: "current" = prescribed J in coils; "voltage" = potential difference (V on coils)
-        source_type="current",
-        voltage_amplitude=10.0,
-        # --- Convergence postmortem: flip one at a time to see effect on rel_res ---
-        use_schur=True,           # True = SCHUR fieldsplit + mat_nest as P; False = ADDITIVE + block diag P
-        schur_pre_type="selfp",   # "a11"|"selfp" (Schur preconditioning strategy)
-        schur_fact_type="lower",  # "lower"|"full" (Schur factorization)
-        use_interior_nodes=True,   # True = pass interior nodes to AMS; False = skip
-        use_motion_term=True,     # True = add -sigma*(u_rot × curl A)·v in a00 (dx_rpm); False = skip
-        diagnostic_direct_solve=False,  # True = try one LU/MUMPS solve to check if system itself is OK
-        ams_use_spd_pc=False,     # Use A00_full (not SPD approx) for AMS PC
     )
 
 
@@ -131,10 +104,6 @@ def rotate_magnetization(cell_tags, M_vec, config, t):
 
 
 def update_currents(cell_tags, J_z, config, t):
-    """Update coil currents on parent mesh (current source) or zero J for voltage drive."""
-    if getattr(config, "source_type", "current") == "voltage":
-        J_z.x.array[:] = 0.0
-        return
     omega = config.omega_e
     J_peak = config.coil_current_peak
     J_z.x.array[:] = 0.0
@@ -152,7 +121,6 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space):
     B_dg = fem.Function(DG_vec, name="B_dg")
     B_dg.interpolate(fem.Expression(curlA, DG_vec.element.interpolation_points))
     B_dg.x.scatter_forward()
-    # Robust statistics: curl(A) is naturally DG0 for N1curl; compute max|B| from DG0.
     B_dg_vals = B_dg.x.array.reshape((-1, 3))
     B_dg_mag = np.linalg.norm(B_dg_vals, axis=1) if B_dg_vals.size else np.array([], dtype=float)
 
@@ -169,36 +137,23 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space):
     )
     B_mag.x.scatter_forward()
 
-    # Use DG0-derived magnitude for min/max/norm (more reliable than CG interpolation for diagnostics).
-    if B_dg_mag.size:
-        max_B = float(B_dg_mag.max())
-        min_B = float(B_dg_mag.min())
-        norm_B = float(np.linalg.norm(B_dg_mag))
-    else:
-        max_B = 0.0
-        min_B = 0.0
-        norm_B = 0.0
-    return B_sol, B_mag, max_B, min_B, norm_B, B_dg
+    max_B = float(B_dg_mag.max()) if B_dg_mag.size else 0.0
+    return B_sol, B_mag, max_B
 
 
 def assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space):
-    """Assemble nested RHS vector from block forms (entity_maps)."""
     comm = A_space.mesh.comm
     nA = A_space.dofmap.index_map.size_global
     nV = V_space.dofmap.index_map.size_global
 
     tmp_bA = petsc.create_vector(A_space)
     petsc.assemble_vector(tmp_bA, L_blocks[0])
-    # Apply lifting for coupling block with Dirichlet BCs on V.
-    # Without this, the coupled RHS is inconsistent with the BC-eliminated matrix,
-    # and the solve can severely distort A (and thus B).
     petsc.apply_lifting(tmp_bA, [a_blocks[0][1]], bcs=[block_bcs[1]])
     petsc.set_bc(tmp_bA, block_bcs[0])
     tmp_bA.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
 
     tmp_bV = petsc.create_vector(V_space)
     petsc.assemble_vector(tmp_bV, L_blocks[1])
-    # Apply lifting for coupling block with Dirichlet BCs on A.
     petsc.apply_lifting(tmp_bV, [a_blocks[1][0]], bcs=[block_bcs[0]])
     petsc.set_bc(tmp_bV, block_bcs[1])
     tmp_bV.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
@@ -213,89 +168,26 @@ def assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space):
     return PETSc.Vec().createNest([bA, bV], comm=comm)
 
 
-def solve_one_step_submesh(mesh_parent, mesh_conductor, A_space, V_space,
+def solve_one_step_submesh(mesh_parent, A_space, V_space,
                            cell_tags_parent, config, ksp, mat_nest,
                            a_blocks, L_blocks, block_bcs,
-                           J_z, M_vec, A_prev, t,
-                           voltage_update_data=None):
-    """Single time step solve for the submesh-based A–V system."""
+                           J_z, M_vec, A_prev, t):
     update_currents(cell_tags_parent, J_z, config, t)
     rotate_magnetization(cell_tags_parent, M_vec, config, t)
 
-    if voltage_update_data is not None:
-        u_voltage, voltage_dofs, phase = voltage_update_data
-        V_amp = float(getattr(config, "voltage_amplitude", 10.0))
-        omega = config.omega_e
-        val = V_amp * np.sin(omega * t + phase)
-        imap = V_space.dofmap.index_map
-        local_start, local_end = imap.local_range
-        for g in voltage_dofs:
-            if local_start <= g < local_end:
-                u_voltage.x.array[g - local_start] = val
-        u_voltage.x.scatter_forward()
-
     comm = mesh_parent.comm
     rhs = assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space)
-    # IMPORTANT: use rhs.duplicate() to guarantee the nest layout matches mat_nest.
-    # Manually creating sub-vectors can lead to VecNest layout mismatches that break MatNest.mult()
-    # (and thus corrupt the reported true residual).
     sol = rhs.duplicate()
     sol.set(0.0)
 
-    # Diagnostic: try a direct solve (LU) on monolithic AIJ to determine if the system itself is solvable.
-    # If this yields a tiny residual, the formulation/assembly is fine and the issue is the iterative solver/PC.
-    if bool(getattr(config, "diagnostic_direct_solve", False)):
-        try:
-            A_mono = mat_nest.convert("aij")
-            # Build monolithic RHS b_mono from nested rhs using the nest index sets
-            b_mono = A_mono.createVecRight()
-            b_mono.set(0.0)
-            isA, isV = mat_nest.getNestISs()
-            rhsA, rhsV = rhs.getNestSubVecs()
-            scatA = PETSc.Scatter().create(rhsA, None, b_mono, isA[0])
-            scatV = PETSc.Scatter().create(rhsV, None, b_mono, isV[1])
-            scatA.scatter(rhsA, b_mono, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
-            scatV.scatter(rhsV, b_mono, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
-            b_mono.assemble()
-            x_mono = b_mono.duplicate()
-            x_mono.set(0.0)
-
-            ksp_dir = PETSc.KSP().create(comm)
-            ksp_dir.setOperators(A_mono)
-            ksp_dir.setType("preonly")
-            pc_dir = ksp_dir.getPC()
-            pc_dir.setType("lu")
-            try:
-                pc_dir.setFactorSolverType("mumps")
-            except Exception:
-                pass
-            ksp_dir.setFromOptions()
-            ksp_dir.solve(b_mono, x_mono)
-
-            r = b_mono.duplicate()
-            A_mono.mult(x_mono, r)    # r = A x
-            r.aypx(-1.0, b_mono)      # r = b - A x
-            bnorm = b_mono.norm(PETSc.NormType.NORM_2)
-            rnorm = r.norm(PETSc.NormType.NORM_2)
-            rel = rnorm / bnorm if bnorm > 1e-30 else float("inf")
-            if comm.rank == 0:
-                print(f"  [direct LU diagnostic] ||b-Ax||={rnorm:.6e}, ||b||={bnorm:.6e}, rel={rel:.4e}, its={ksp_dir.getIterationNumber()}, reason={ksp_dir.getConvergedReason()}")
-        except Exception as e:
-            if comm.rank == 0:
-                print(f"  [direct LU diagnostic] failed: {type(e).__name__}: {e}")
-
     ksp.solve(rhs, sol)
 
-    # Robust residual diagnostics: compute ||b-Ax|| and ||b|| on a monolithic AIJ system.
-    # (VecNest norms / MatNest mult outputs are not consistently supported across PETSc builds.)
     A_mono = mat_nest.convert("aij")
     b_mono = A_mono.createVecRight()
     b_mono.set(0.0)
     x_mono = b_mono.duplicate()
     x_mono.set(0.0)
 
-    # Build monolithic block index sets.
-    # Prefer MatNest-provided IS (correct even if the monolithic ordering is not contiguous).
     try:
         isA_list, isV_list = mat_nest.getNestISs()
         isA = isA_list[0]
@@ -307,6 +199,8 @@ def solve_one_step_submesh(mesh_parent, mesh_conductor, A_space, V_space,
         isV = PETSc.IS().createGeneral(np.arange(nA, nA + nV, dtype=np.int32), comm=comm)
     rhsA, rhsV = rhs.getNestSubVecs()
     xA, xV = sol.getNestSubVecs()
+    A_arr = xA.getArray(readonly=True)
+    V_arr = xV.getArray(readonly=True)
     PETSc.Scatter().create(rhsA, None, b_mono, isA).scatter(
         rhsA, b_mono, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD
     )
@@ -331,14 +225,6 @@ def solve_one_step_submesh(mesh_parent, mesh_conductor, A_space, V_space,
 
     A_sol = fem.Function(A_space, name="A")
     V_sol = fem.Function(V_space, name="V")
-
-    xA_sub = sol.getNestSubVecs()[0]
-    xV_sub = sol.getNestSubVecs()[1]
-
-    # IMPORTANT: copy the solved sub-vectors into DOLFINx Functions directly.
-    # Using intermediate vectors can silently drop/permute entries (and corrupt B diagnostics).
-    A_arr = xA_sub.getArray(readonly=True)
-    V_arr = xV_sub.getArray(readonly=True)
     A_sol.x.array[:] = A_arr[:A_sol.x.array.size]
     A_sol.x.scatter_forward()
     V_sol.x.array[:] = V_arr[:V_sol.x.array.size]

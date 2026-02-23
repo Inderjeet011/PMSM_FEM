@@ -1,24 +1,15 @@
-"""Setup functions for 3D solver with submesh approach.
+"""Setup functions for 3D solver with submesh approach."""
 
-Order of execution (called from main_submesh.py):
-  1. load_mesh_and_extract_submesh() - load parent mesh, create conductor submesh
-  2. setup_materials() - assign sigma, nu, density on parent mesh
-  3. setup_boundary_conditions_parent() - A=0 on exterior
-  4. setup_boundary_conditions_submesh() - ground V on conductor
-"""
-
-import numpy as np
-from dolfinx import fem, io
-from dolfinx.mesh import locate_entities_boundary, create_submesh
-from mpi4py import MPI
+import numpy as np  # type: ignore
+from dolfinx import fem, io  # type: ignore
+from dolfinx.mesh import locate_entities_boundary, create_submesh  # type: ignore
+from mpi4py import MPI  # type: ignore
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
-from mesh_3D import model_parameters, surface_map
-from load_mesh import CURRENT_MAP
+from mesh_3D import model_parameters, surface_map  # type: ignore
 
-# Domain tags (same as original)
 AIR = (1,)
 AIR_GAP = (2, 3)
 ALUMINIUM = (4,)
@@ -29,29 +20,13 @@ MAGNETS = (13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
 
 
 def conducting():
-    """
-    Conducting regions for σ-terms and the V-equation (include coils).
-
-    IMPORTANT:
-    - Use COILS only for the A–V coupling / V-submesh (typical A–V formulation for driven windings).
-    - Including rotor/aluminium here introduces strong eddy-current damping and extreme stiffness
-      (sigma/dt) that can collapse the magnet field for small dt.
-    """
-    return COILS
+    return COILS + MAGNETS + ROTOR
 
 
 EXTERIOR_FACET_TAG = surface_map["Exterior"]
 
 
 def load_mesh_and_extract_submesh(mesh_path):
-    """
-    Load mesh and extract conductor-only submesh.
-
-    Returns:
-    --------
-    mesh_parent, mesh_conductor, cell_tags_parent, cell_tags_conductor,
-    facet_tags_parent, conductor_cells, entity_map
-    """
     if not mesh_path.exists():
         raise FileNotFoundError(f"Mesh file {mesh_path} not found.")
 
@@ -76,19 +51,17 @@ def load_mesh_and_extract_submesh(mesh_path):
 
     cell_tags_conductor = None
     if cell_tags_parent is not None:
-        from dolfinx.mesh import meshtags
-        from entity_map_utils import entity_map_to_dict
+        from dolfinx.mesh import meshtags  # type: ignore
+        from entity_map_utils import entity_map_to_dict  # type: ignore
 
         n_submesh_cells = mesh_conductor.topology.index_map(tdim).size_local
         submesh_cell_indices = np.arange(n_submesh_cells, dtype=np.int32)
         submesh_tags = np.empty(n_submesh_cells, dtype=np.int32)
         cell_to_tag_parent = {int(i): int(v) for i, v in zip(cell_tags_parent.indices, cell_tags_parent.values)}
         entity_dict = entity_map_to_dict(entity_map, n_submesh_cells, mesh_parent.comm)
-
-        if len(entity_dict) > 0:
-            for i in range(n_submesh_cells):
-                parent_cell = entity_dict.get(i, -1)
-                submesh_tags[i] = cell_to_tag_parent.get(parent_cell, conductor_markers[0])
+        for i in range(n_submesh_cells):
+            parent_cell = entity_dict.get(i, -1)
+            submesh_tags[i] = cell_to_tag_parent.get(parent_cell, conductor_markers[0])
         cell_tags_conductor = meshtags(mesh_conductor, tdim, submesh_cell_indices, submesh_tags)
 
     return (
@@ -97,82 +70,47 @@ def load_mesh_and_extract_submesh(mesh_path):
         cell_tags_parent,
         cell_tags_conductor,
         facet_tags_parent,
-        conductor_cells,
         entity_map,
     )
 
 
 def setup_materials(mesh, cell_tags, config):
-    """Material parameters as DG0 Functions (sigma, nu, density) on parent mesh."""
     DG0 = fem.functionspace(mesh, ("DG", 0))
     sigma = fem.Function(DG0, name="sigma")
     nu = fem.Function(DG0, name="nu")
-    density = fem.Function(DG0, name="density")
 
     mu_r = model_parameters["mu_r"]
     sigma_dict = model_parameters["sigma"]
-    densities = model_parameters["densities"]
 
     marker_to_material = {
         1: "Air", 2: "AirGap", 3: "AirGap", 4: "Al", 5: "Rotor", 6: "Stator",
         **{m: "Cu" for m in COILS}, **{m: "PM" for m in MAGNETS},
     }
 
-    # Small conductivity in air/air-gap regions to help solver convergence (optional)
-    sigma_air_min = float(getattr(config, "sigma_air_min", 0.0))
-    air_like_markers = AIR + AIR_GAP  # only bump sigma in these regions
-
     mu0 = config.mu0
     for marker, mat_name in marker_to_material.items():
         cells = cell_tags.find(marker)
         if cells.size == 0:
             continue
-        sig = sigma_dict[mat_name]
-        if sigma_air_min > 0 and sig == 0 and marker in air_like_markers:
-            sig = sigma_air_min
-        sigma.x.array[cells] = sig
-        density.x.array[cells] = densities.get(mat_name, 0.0)
+        sigma.x.array[cells] = sigma_dict[mat_name]
         nu.x.array[cells] = 1.0 / (mu0 * mu_r[mat_name])
 
-    # Optional override: treat PMs as non-conducting for this solve to prevent transient
-    # (sigma/dt) damping of the magnetization field.
-    sigma_pm_override = getattr(config, "sigma_pm_override", None)
-    if sigma_pm_override is not None:
-        sig_pm = float(sigma_pm_override)
-        for m in MAGNETS:
-            cells = cell_tags.find(m)
-            if cells.size > 0:
-                sigma.x.array[cells] = sig_pm
-
-    # Optional overrides: disable rotor/aluminium conductivity (eddy-current damping) for debugging
-    # and for recovering the magnetostatic-like B-field strength.
-    sigma_rotor_override = getattr(config, "sigma_rotor_override", None)
-    if sigma_rotor_override is not None:
-        cells = cell_tags.find(ROTOR[0])
-        if cells.size > 0:
-            sigma.x.array[cells] = float(sigma_rotor_override)
     sigma_al_override = getattr(config, "sigma_al_override", None)
     if sigma_al_override is not None:
         cells = cell_tags.find(ALUMINIUM[0])
-        if cells.size > 0:
-            sigma.x.array[cells] = float(sigma_al_override)
+        sigma.x.array[cells] = float(sigma_al_override)
 
-    # Optional Cu conductivity override: mesh_3D sets Cu sigma=0 for prescribed-J runs.
-    # If we want a well-posed V-block (or voltage drive), we must make coils conductive.
     sigma_cu_override = getattr(config, "sigma_cu_override", None)
-    if sigma_cu_override is not None:
+    if sigma_cu_override is not None and float(sigma_cu_override) > 0:
         sig_cu = float(sigma_cu_override)
-        if sig_cu > 0:
-            for m in COILS:
-                cells = cell_tags.find(m)
-                if cells.size > 0:
-                    sigma.x.array[cells] = sig_cu
+        for m in COILS:
+            cells = cell_tags.find(m)
+            sigma.x.array[cells] = sig_cu
 
-    return sigma, nu, density
+    return sigma, nu
 
 
 def setup_boundary_conditions_parent(mesh_parent, facet_tags_parent, A_space):
-    """Strong Dirichlet BCs (A=0) on the exterior boundary of parent mesh."""
     tdim = mesh_parent.topology.dim
     mesh_parent.topology.create_connectivity(tdim - 1, tdim)
     exterior_facets = (
@@ -186,54 +124,15 @@ def setup_boundary_conditions_parent(mesh_parent, facet_tags_parent, A_space):
     return fem.dirichletbc(u0, dofs)
 
 
-def setup_boundary_conditions_submesh(mesh_conductor, V_space, cell_tags_conductor, conductor_markers, config=None):
-    """
-    Set up boundary conditions for V on conductor submesh.
-    - Current source: ground one DOF (first conductor cell).
-    - Voltage source: ground one coil (e.g. coil 7), set V = V_amp*sin(omega*t+phase) on another coil (e.g. coil 8).
-    Returns (bc_list, voltage_update_data). voltage_update_data is None for current drive, else (u_voltage, voltage_dofs, phase).
-    """
-    source_type = getattr(config, "source_type", "current") if config is not None else "current"
-
+def setup_boundary_conditions_submesh(mesh_conductor, V_space, cell_tags_conductor, conductor_markers):
     u0 = fem.Function(V_space)
     u0.x.array[:] = 0.0
-    def _pick_one_dof(marker: int):
-        cells = cell_tags_conductor.find(marker)
-        if cells.size == 0:
-            return None
-        dofs = V_space.dofmap.cell_dofs(int(cells[0]))
-        if len(dofs) == 0:
-            return None
-        return int(dofs[0])
-
-    # IMPORTANT:
-    # V is only defined up to an additive constant on *each disconnected conductor region*.
-    # If coils are disconnected, we must pin one DOF per marker to remove the nullspace;
-    # otherwise the V-block (and hence the coupled solve) can behave singular/unstable.
     ground_dofs_list = []
     for m in conductor_markers:
-        dof0 = _pick_one_dof(int(m))
-        if dof0 is not None:
-            ground_dofs_list.append(dof0)
-    ground_dofs = np.unique(np.array(ground_dofs_list, dtype=np.int32))
-    bc_ground = fem.dirichletbc(u0, ground_dofs)
-
-    if source_type != "voltage":
-        return [bc_ground], None
-
-    # Voltage drive: impose V on all dofs of one coil (e.g. coil 8)
-    voltage_coil_marker = COILS[1]  # 8
-    phase = CURRENT_MAP.get(voltage_coil_marker, {}).get("beta", 0.0)
-    voltage_dofs_list = []
-    for m in (voltage_coil_marker,):
         cells = cell_tags_conductor.find(m)
-        for c in cells:
-            dofs = V_space.dofmap.cell_dofs(int(c))
-            voltage_dofs_list.extend(dofs.tolist())
-    voltage_dofs = np.unique(np.array(voltage_dofs_list, dtype=np.int32))
-    if voltage_dofs.size == 0:
-        return [bc_ground], None
-    u_voltage = fem.Function(V_space)
-    u_voltage.x.array[:] = 0.0
-    bc_voltage = fem.dirichletbc(u_voltage, voltage_dofs)
-    return [bc_ground, bc_voltage], (u_voltage, voltage_dofs, phase)
+        if cells.size > 0:
+            dofs = V_space.dofmap.cell_dofs(int(cells[0]))
+            if len(dofs) > 0:
+                ground_dofs_list.append(int(dofs[0]))
+    ground_dofs = np.unique(np.array(ground_dofs_list, dtype=np.int32))
+    return [fem.dirichletbc(u0, ground_dofs)]
