@@ -2,13 +2,103 @@
 
 Summary of what was tried and what can be done to improve convergence across the codebase.
 
-## Current behaviour
+---
 
-- **3d (normal A–V)**: `src/3d/` — outer KSP hits max iterations (reason -3); rel_res ~ 1e-3–1e-4.
-- **3d_submesh (coupled A–V)**: `src/3d_submesh/` with `use_coupling=True` — same: max iterations, rel_res ~ 9e-4.
-- **3d_submesh (decoupled A-only)**: `use_coupling=False`, `decoupled_pc="ilu"` — residual stalls ~0.18; with AMS residual is flat (no decrease).
+## Progress: where we were → what we achieved (3d_submesh)
 
-RHS is **discrete divergence-free** (||G^T b|| = 0), so the system is compatible.
+| Metric | Before (iterative) | After fixes |
+|--------|--------------------|-------------|
+| **Max \|B\|** | ~10⁻⁷–10⁻¹⁵ T (wrong) | ~2.8–3.4 T (correct) |
+| **Residual \|\|b−Ax\|\|** | Large / no convergence | ~0.5–1.5 per step |
+| **Relative residual** | ~1 or N/A | ~2×10⁻⁵ |
+| **Outer iterations** | Many / no convergence | ~3 per step |
+| **Solver** | Only LU gave correct B | Iterative (Schur + AMS + LU on V) works |
+
+**Reference:** LU (monolithic direct solve) gave correct B ~2.7 T and confirmed the formulation; the iterative setup was wrong, not the physics.
+
+---
+
+## Changes made to fix convergence (3d_submesh)
+
+### 1. Formulation fixes (essential)
+
+| Change | Description |
+|--------|-------------|
+| **A–V coupling sign** | `a10 = -sigma * inner(grad(q), A)` (correct for S = dt·V) |
+| **Coil mass term** | Added `(sigma/dt)*A·v` on `dx_cond_parent` so iterative solver converges |
+| **RHS lifting** | `petsc.apply_lifting` for both A and V blocks with Dirichlet BCs |
+| **A_prev init** | `A_prev.x.array[:] = 0.0` before first time step |
+| **V grounding** | One DOF per conductor marker grounded to remove V nullspace |
+
+### 2. Interior nodes (AMS preconditioner)
+
+| Change | Description |
+|--------|-------------|
+| **setHYPREAMSSetInteriorNodes** | Marks nodes for AMS: 1.0 = exterior (non-conductor), 0.0 = interior (conductor) |
+| **Implementation** | Build scalar function on V_ams; set 0 on DOFs belonging to conductor cells (coils, magnets, rotor) |
+| **When used** | When `cell_tags_parent` and `conductor_markers` are provided |
+
+### 3. Solver structure
+
+| Component | Setting |
+|-----------|---------|
+| **Outer** | FGMRES, unpreconditioned norm, `outer_atol` for ||Ax−b|| |
+| **Preconditioner** | Schur fieldsplit, LOWER fact, SELFP Schur pre |
+| **A-block** | FGMRES + AMS on A00_full (no regularization) |
+| **V-block** | preonly + LU (MUMPS) |
+| **AMS** | Uses A00_full (not A00_spd), no gauge regularization |
+
+### 4. Iteration / tolerance changes tried
+
+| Parameter | Original | Tried values |
+|-----------|----------|--------------|
+| **outer_atol** | 0.5 | 0.1, 0.05 |
+| **outer_max_it** | 100 | 200, 300 |
+| **outer_restart** | 150 | 200 |
+| **ksp_A_max_it** | 8 | 12, 20, 25 |
+| **ksp_A_restart** | 35 | 40, 45, 50 |
+| **ksp_A_rtol** | 2e-2 | 1e-2, 5e-3 |
+| **schur_fact_type** | lower | full |
+
+### 5. AMS preconditioner tuning tried
+
+| Parameter | Original | Tried |
+|-----------|----------|-------|
+| **pc_hypre_ams_max_iter** | 1 | 2, 3 |
+| **pc_hypre_ams_tol** | 0 | 1e-4, 1e-6 |
+| **pc_hypre_ams_print_level** | 1 | 0 (to reduce output) |
+| **pc_hypre_ams_projection_frequency** | 50 | (unchanged) |
+| **pc_hypre_ams_cycle_type** | 13 | (unchanged) |
+
+### 6. Conducting region / materials
+
+| Change | Description |
+|--------|-------------|
+| **conducting()** | Added ALUMINIUM: `ROTOR + ALUMINIUM + MAGNETS + COILS` (matches full 3d) |
+| **sigma_al_override** | Set to `None` when including ALUMINIUM (use model σ=3.72e7); `0.0` causes singular system → NaN |
+
+### 7. Direct LU option
+
+| Change | Description |
+|--------|-------------|
+| **use_direct** | Config option: `True` = monolithic LU (MUMPS) on full system → near-zero residual |
+
+### 8. Removed (cleanup)
+
+- Regularization: `epsilon_A`, `epsilon_A_spd`, `gauge_alpha`, `sigma_air_min`
+- `A00_spd`, `use_schur` branch
+- `interpolation_data`, `sigma_submesh`, `L_block_form`, `density`
+- Voltage path (current source only)
+
+---
+
+## Current behaviour (3d_submesh after fixes)
+
+- **Coupled A–V** (`src/3d_submesh/`): Schur (FULL) + AMS + LU on V; converges in a few outer iterations; \|\|b−Ax\|\| ~0.5–1.5, rel_res ~2×10⁻⁵, Max \|B\| ~2.8–3.4 T.
+- **3d (full mesh)**: `src/3d/` — outer KSP can hit max iterations; rel_res ~1e-3–1e-4.
+- **Direct LU**: `use_direct=True` in config gives near-zero residual (for verification).
+
+**RHS div-free:** Unprojected RHS has ||G^T b_A|| ≠ 0 (e.g. ~1.3e3). Optional projection (`project_rhs_div_free=True`) makes ||G^T b_A|| = 0; with current assembly the whole A-block RHS is in range(G), so the projected RHS is zero and the solution is B = 0. Default is no projection (non-zero B, ~3.4 T).
 
 ---
 

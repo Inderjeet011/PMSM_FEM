@@ -770,10 +770,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--res",
-        default=0.006,
+        default=0.005,
         type=np.float64,
         dest="res",
-        help="Base mesh resolution near motor (6mm=0.006). Finer near motor, coarser with distance.",
+        help="Base mesh resolution near motor (2mm=0.002). Finer near motor, coarser with distance.",
     )
     parser.add_argument(
         "--L",

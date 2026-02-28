@@ -8,13 +8,11 @@ from petsc4py import PETSc  # type: ignore
 import ufl  # type: ignore
 import numpy as np  # type: ignore
 
-_keepalive = []
-
 
 def build_forms_submesh(mesh_parent, A_space, V_space,
                         sigma, nu, J_z, M_vec, A_prev,
                         dx_parent, dx_rs, dx_rpm, dx_c, dx_pm,
-                        config, entity_map, dx_cond_parent, dx_air=None):
+                        config, entity_map, dx_cond_parent):
     dt = fem.Constant(mesh_parent, PETSc.ScalarType(config.dt))
     mu0 = config.mu0
 
@@ -31,28 +29,29 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
     
     inv_dt = fem.Constant(mesh_parent, PETSc.ScalarType(1.0 / config.dt))
     
+    # A-block: (σ/dt) in dx_rs (rotor, stator, aluminium) + dx_c + dx_pm (coils, magnets) for iterative convergence.
+    # Avoid double-counting rotor: dx_rs already has rotor; dx_c + dx_pm add only coils and magnets.
     a00 = (
         nu * ufl.inner(curlA, curlv) * dx_parent
         + (sigma * inv_dt) * ufl.inner(A, v) * dx_rs
+        + (sigma * inv_dt) * ufl.inner(A, v) * dx_c
+        + (sigma * inv_dt) * ufl.inner(A, v) * dx_pm
+        - sigma * ufl.inner(ufl.cross(u_rot, curlA), v) * dx_rpm
     )
-    if dx_air is not None:
-        a00 += (sigma * inv_dt) * ufl.inner(A, v) * dx_air
-    a00 += (sigma * inv_dt) * ufl.inner(A, v) * dx_cond_parent
-    a00 += -sigma * ufl.inner(ufl.cross(u_rot, curlA), v) * dx_rpm
 
-    a01 = dt * sigma * ufl.inner(ufl.grad(S), v) * dx_cond_parent
-    a10 = -sigma * ufl.inner(ufl.grad(q), A) * dx_cond_parent
-    a11 = dt * sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_cond_parent
+    # A–V coupling (match 3d: σ, σ/dt). Rotation term on dx_rpm causes IndexMap error with submesh entity_maps.
+    a01 = sigma * ufl.inner(ufl.grad(S), v) * dx_cond_parent
+    a10 = -(sigma * inv_dt) * ufl.inner(A, ufl.grad(q)) * dx_cond_parent
+    a11 = sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_cond_parent
 
     L0 = (
         J_z * v[2] * dx_c
         + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_rs
+        + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_c
+        + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_pm
         + ufl.inner(nu * mu0 * M_vec, curlv) * dx_pm
     )
-    if dx_air is not None:
-        L0 += (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_air
-    L0 += (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_cond_parent
-    L1 = ufl.inner(ufl.grad(q), sigma * A_prev) * dx_cond_parent
+    L1 = (sigma * inv_dt) * ufl.inner(A_prev, ufl.grad(q)) * dx_cond_parent
 
     em = [entity_map]
     a_blocks = (
@@ -70,7 +69,7 @@ def assemble_system_matrix_submesh(mesh_parent, a_blocks, block_bcs,
     n_A_dofs = A_space_parent.dofmap.index_map.size_global
     n_V_dofs = V_space_submesh.dofmap.index_map.size_global
 
-    bcs_flat = [bc for bclist in (block_bcs or [[], []]) for bc in bclist]
+    bcs_flat = [bc for bclist in block_bcs for bc in bclist]
     A_mono = petsc.assemble_matrix(a_block_form, bcs=bcs_flat)
     A_mono.assemble()
     is_A = PETSc.IS().createGeneral(np.arange(0, n_A_dofs, dtype=np.int32), comm=comm)
@@ -86,13 +85,11 @@ def assemble_system_matrix_submesh(mesh_parent, a_blocks, block_bcs,
 
     mat_nest = PETSc.Mat().createNest(mats, comm=comm)
     mat_nest.assemble()
+
     return mats, mat_nest
 
 
-def configure_solver_submesh(mesh_parent, mat_nest, mat_blocks, A_space, V_space,
-                             config, cell_tags_parent=None, conductor_markers=()):
-    from dolfinx.cpp.fem.petsc import discrete_gradient  # type: ignore
-
+def configure_solver_submesh(mesh_parent, mat_nest, mat_blocks, A_space, V_space, config):
     comm = mesh_parent.comm
     A00_full = mat_blocks[0][0]
 
@@ -102,110 +99,49 @@ def configure_solver_submesh(mesh_parent, mat_nest, mat_blocks, A_space, V_space
     ksp.setGMRESRestart(150)
     ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
     ksp.setTolerances(
-        rtol=float(getattr(config, "outer_rtol", 1e-4)),
-        atol=float(getattr(config, "outer_atol", 0.0)),
-        max_it=int(getattr(config, "outer_max_it", 200)),
+        rtol=0.0,  # disable relative tol so solver runs until atol or max_it
+        atol=float(config.outer_atol),
+        max_it=int(config.outer_max_it),
     )
+    def _outer_ksp_monitor(ksp_obj, its, rnorm):
+        if comm.rank == 0:
+            print(f"  [outer KSP] it={its:3d}  |r|={rnorm:.6e}")
+
+    ksp.setMonitor(_outer_ksp_monitor)
     pc = ksp.getPC()
     pc.setType("fieldsplit")
-    pc.setFieldSplitType(PETSc.PC.CompositeType.SCHUR)
-    pc.setFieldSplitSchurFactType(PETSc.PC.SchurFactType.LOWER)
-    pc.setFieldSplitSchurPreType(PETSc.PC.SchurPreType.SELFP)
+    pc.setFieldSplitType(PETSc.PC.CompositeType.ADDITIVE)
     isA, isV = mat_nest.getNestISs()
     pc.setFieldSplitIS(("A", isA[0]), ("V", isV[1]))
     pc.setUp()
 
     ksp_A, ksp_V = pc.getFieldSplitSubKSP()
 
-    V_ams = fem.functionspace(mesh_parent, ("Lagrange", 1))
-    G = discrete_gradient(V_ams._cpp_object, A_space._cpp_object)
-    G.assemble()
-
-    cvec_0 = fem.Function(A_space)
-    cvec_0.interpolate(
-        lambda x: np.vstack(
-            (np.ones_like(x[0]), np.zeros_like(x[0]), np.zeros_like(x[0]))
-        )
-    )
-    cvec_1 = fem.Function(A_space)
-    cvec_1.interpolate(
-        lambda x: np.vstack(
-            (np.zeros_like(x[0]), np.ones_like(x[0]), np.zeros_like(x[0]))
-        )
-    )
-    cvec_2 = fem.Function(A_space)
-    cvec_2.interpolate(
-        lambda x: np.vstack(
-            (np.zeros_like(x[0]), np.zeros_like(x[0]), np.ones_like(x[0]))
-        )
-    )
-    ams_keepalive = (G, V_ams, (cvec_0, cvec_1, cvec_2))
-
     ksp_A.setType("fgmres")
-    ksp_A.setGMRESRestart(int(getattr(config, "ksp_A_restart", 50)))
+    ksp_A.setGMRESRestart(int(config.ksp_A_restart))
     ksp_A.setTolerances(
-        rtol=float(getattr(config, "ksp_A_rtol", 1e-2)),
-        atol=0.0,
-        max_it=int(getattr(config, "ksp_A_max_it", 5)),
+        max_it=int(config.ksp_A_max_it),
     )
     ksp_A.setOperators(A00_full, A00_full)
 
     pc_A = ksp_A.getPC()
     pc_A.setType("hypre")
-    pc_A.setHYPREType("ams")
-    pc_A.setHYPREDiscreteGradient(G)
-    pc_A.setHYPRESetEdgeConstantVectors(
-        cvec_0.x.petsc_vec, cvec_1.x.petsc_vec, cvec_2.x.petsc_vec
-    )
-
-    if cell_tags_parent is not None and conductor_markers:
-        W = V_ams
-        interior_nodes_array = fem.Function(W)
-        interior_nodes_array.x.array[:] = 1.0
-        interior_nodes_array.x.scatter_forward()
-
-        dofmap = W.dofmap
-        num_dofs_per_cell = dofmap.dof_layout.num_dofs
-        cell_dofs = dofmap.list.reshape(-1, num_dofs_per_cell)
-
-        tagged_cell_dofs_list = []
-        for marker in conductor_markers:
-            tagged_cells = cell_tags_parent.find(marker)
-            if tagged_cells.size > 0:
-                tagged_cell_dofs_list.append(cell_dofs[tagged_cells].flatten())
-        if tagged_cell_dofs_list:
-            unique_dofs = np.unique(np.concatenate(tagged_cell_dofs_list))
-            interior_nodes_array.x.array[unique_dofs] = 0.0
-            interior_nodes_array.x.scatter_forward()
-
-        pc_A.setHYPREAMSSetInteriorNodes(interior_nodes_array.x.petsc_vec)
-        _keepalive.append(interior_nodes_array)
-
+    pc_A.setHYPREType("boomeramg")
     opts = PETSc.Options()
-    opts[f"{ksp_A.prefix}pc_hypre_ams_cycle_type"] = 13
-    opts[f"{ksp_A.prefix}pc_hypre_ams_tol"] = 0
-    opts[f"{ksp_A.prefix}pc_hypre_ams_max_iter"] = 1
-    opts[f"{ksp_A.prefix}pc_hypre_ams_amg_beta_theta"] = 0.25
-    opts[f"{ksp_A.prefix}pc_hypre_ams_print_level"] = 1
-    opts[f"{ksp_A.prefix}pc_hypre_ams_amg_alpha_options"] = "10,1,6,6,4"
-    opts[f"{ksp_A.prefix}pc_hypre_ams_amg_beta_options"] = "10,1,6,6,4"
-    opts[f"{ksp_A.prefix}pc_hypre_ams_relax_type"] = 2
-    opts[f"{ksp_A.prefix}pc_hypre_ams_relax_weight"] = 1.0
-    opts[f"{ksp_A.prefix}pc_hypre_ams_relax_times"] = 1
-    opts[f"{ksp_A.prefix}pc_hypre_ams_omega"] = 1.0
-    opts[f"{ksp_A.prefix}pc_hypre_ams_projection_frequency"] = 50
+    opts[f"{ksp_A.prefix}pc_hypre_boomeramg_max_iter"] = 20
+    opts[f"{ksp_A.prefix}pc_hypre_boomeramg_tol"] = 0.0
+    opts[f"{ksp_A.prefix}pc_hypre_boomeramg_coarsen_type"] = "HMIS"
     ksp_A.setFromOptions()
 
     ksp_V.setType("preonly")
     pc_V = ksp_V.getPC()
-    pc_V.setType("lu")
-    try:
-        pc_V.setFactorSolverType("mumps")
-    except Exception:
-        pass
+    pc_V.setType("hypre")
+    pc_V.setHYPREType("boomeramg")
+    opts = PETSc.Options()
+    opts[f"{ksp_V.prefix}pc_hypre_boomeramg_max_iter"] = 20
+    opts[f"{ksp_V.prefix}pc_hypre_boomeramg_tol"] = 0.0
+    opts[f"{ksp_V.prefix}pc_hypre_boomeramg_coarsen_type"] = "HMIS"
     ksp_V.setFromOptions()
-
-    _keepalive.append(ams_keepalive)
 
     ksp.setFromOptions()
     return ksp

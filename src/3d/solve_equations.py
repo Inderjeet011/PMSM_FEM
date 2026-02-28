@@ -191,13 +191,13 @@ def configure_solver(mesh, mat_nest, mat_blocks, A_space, V_space, A00_spd, conf
         pc_A.setHYPREAMSSetInteriorNodes(interior_nodes_array.x.petsc_vec)
         _keepalive.append(interior_nodes_array)
 
-    # AMS tuning similar to copper-rod setup
+    # AMS tuning similar to copper-rod setup; disable verbose AMS logs (print_level=0)
     opts = PETSc.Options()
     opts["pc_hypre_ams_cycle_type"] = 13
     opts["pc_hypre_ams_tol"] = 0.0
     opts["pc_hypre_ams_max_iter"] = 1
     opts["pc_hypre_ams_amg_beta_theta"] = 0.25
-    opts["pc_hypre_ams_print_level"] = 1
+    opts["pc_hypre_ams_print_level"] = 0
     opts["pc_hypre_ams_amg_alpha_options"] = "10,1,6,6,4"
     opts["pc_hypre_ams_amg_beta_options"] = "10,1,6,6,4"
     opts["pc_hypre_ams_relax_type"] = 2

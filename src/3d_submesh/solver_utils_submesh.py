@@ -11,7 +11,7 @@ import ufl
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
-from load_mesh import CURRENT_MAP, MAGNETS
+from load_mesh import MAGNETS
 
 
 def make_config():
@@ -28,25 +28,26 @@ def make_config():
     root = Path(__file__).parents[2]
     return SimpleNamespace(
         dt=dt,
-        num_steps=1,
+        num_steps=1,  # ~1 electrical period; rotor rotates ~72° for visible animation
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),
-        coil_current_peak=float(model_parameters["J"]),
         magnet_remanence=1.2,
         omega_e=omega_e,
         omega_m=omega_m,
         mesh_path=root / "meshes" / "3d" / "pmesh3D_ipm.xdmf",
         results_path=root / "results" / "3d_submesh" / "av_solver_submesh.xdmf",
         write_results=True,
-        outer_max_it=100,
-        outer_rtol=0.0,
-        outer_atol=0.5,
-        ksp_A_max_it=8,
+        outer_max_it=500,
+        outer_atol=2e-4,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
+        ksp_A_max_it=15,
         ksp_A_restart=35,
-        ksp_A_rtol=2e-2,
+        ksp_A_rtol=2e-5,
         sigma_al_override=0.0,
         sigma_cu_override=5.96e7,
+        coil_drive_marker=7,
+        coil_ground_marker=8,
+        I_amp=10.0,  # [A] peak current in drive coil: I(t) = I_amp * sin(omega_e * t)
     )
 
 
@@ -103,15 +104,20 @@ def rotate_magnetization(cell_tags, M_vec, config, t):
     M_vec.x.scatter_forward()
 
 
-def update_currents(cell_tags, J_z, config, t):
-    omega = config.omega_e
-    J_peak = config.coil_current_peak
+def update_currents(J_z, mesh_parent, cell_tags_parent, config, t):
+    """Set J_z: uniform J = I(t)/V_drive in drive coil (current source)."""
     J_z.x.array[:] = 0.0
-    for marker, meta in CURRENT_MAP.items():
-        cells = cell_tags.find(marker)
-        if cells.size == 0:
-            continue
-        J_z.x.array[cells] = J_peak * meta["alpha"] * np.sin(omega * t + meta["beta"])
+    I_amp = float(getattr(config, "I_amp", 10.0))
+    drive_volume = float(getattr(config, "drive_coil_volume", 1.0))
+    if drive_volume <= 0:
+        return
+    I_t = I_amp * np.sin(config.omega_e * t)
+    j_z_val = I_t / drive_volume
+    coil_drive = int(getattr(config, "coil_drive_marker", 7))
+    cells_drive = cell_tags_parent.find(coil_drive)
+    if cells_drive.size > 0:
+        J_z.x.array[cells_drive] = j_z_val
+    J_z.x.scatter_forward()
 
 
 def compute_B_field(mesh, A_sol, B_space, B_magnitude_space):
@@ -172,11 +178,12 @@ def solve_one_step_submesh(mesh_parent, A_space, V_space,
                            cell_tags_parent, config, ksp, mat_nest,
                            a_blocks, L_blocks, block_bcs,
                            J_z, M_vec, A_prev, t):
-    update_currents(cell_tags_parent, J_z, config, t)
+    update_currents(J_z, mesh_parent, cell_tags_parent, config, t)
     rotate_magnetization(cell_tags_parent, M_vec, config, t)
 
     comm = mesh_parent.comm
     rhs = assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space)
+
     sol = rhs.duplicate()
     sol.set(0.0)
 
@@ -192,7 +199,7 @@ def solve_one_step_submesh(mesh_parent, A_space, V_space,
         isA_list, isV_list = mat_nest.getNestISs()
         isA = isA_list[0]
         isV = isV_list[1]
-    except Exception:
+    except PETSc.Error:
         nA = A_space.dofmap.index_map.size_global
         nV = V_space.dofmap.index_map.size_global
         isA = PETSc.IS().createGeneral(np.arange(0, nA, dtype=np.int32), comm=comm)
@@ -218,10 +225,9 @@ def solve_one_step_submesh(mesh_parent, A_space, V_space,
 
     r_mono = b_mono.duplicate()
     A_mono.mult(x_mono, r_mono)
-    r_mono.aypx(-1.0, b_mono)  # r = b - A x
+    r_mono.aypx(-1.0, b_mono)
     rhs_norm = float(b_mono.norm(PETSc.NormType.NORM_2))
     residual_norm = float(r_mono.norm(PETSc.NormType.NORM_2))
-    relative_residual = residual_norm / rhs_norm if rhs_norm > 1e-30 else float("inf")
 
     A_sol = fem.Function(A_space, name="A")
     V_sol = fem.Function(V_space, name="V")
@@ -232,4 +238,4 @@ def solve_one_step_submesh(mesh_parent, A_space, V_space,
 
     A_prev.x.array[:] = A_sol.x.array[:]
     A_prev.x.scatter_forward()
-    return A_sol, V_sol, residual_norm, rhs_norm, relative_residual
+    return A_sol, V_sol, residual_norm, rhs_norm
