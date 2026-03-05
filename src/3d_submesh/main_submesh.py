@@ -15,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
 from load_mesh import omega_rs, omega_rpm, omega_c, omega_pm
 
 from load_mesh_submesh import (
-    COIL_DRIVE,
     conducting,
     load_mesh_and_extract_submesh,
     setup_boundary_conditions_parent,
@@ -77,16 +76,10 @@ def main():
         mesh_conductor,
         basix.ufl.element("Lagrange", mesh_conductor.basix_cell(), config.degree_V)
     )
-    bc_V_list = setup_boundary_conditions_submesh(
+    bc_V_list, v_drive_funcs = setup_boundary_conditions_submesh(
         mesh_conductor, V_space, cell_tags_conductor, conducting(), config
     )
     block_bcs = [[bc_A], bc_V_list]
-
-    # Drive coil volume: I(t) applied as J_z = I(t) / V_drive
-    dx_drive = measure_over(dx_parent, (COIL_DRIVE,))
-    config.drive_coil_volume = float(fem.assemble_scalar(fem.form(1.0 * dx_drive)))
-    if rank0:
-        print(f"  Drive coil volume: {config.drive_coil_volume:.6e} m³")
 
     J_z, M_vec = setup_sources(mesh_parent)
     initialise_magnetisation(mesh_parent, cell_tags_parent, M_vec, config)
@@ -127,6 +120,14 @@ def main():
         t += config.dt
         if rank0:
             print(f"\nStep {step+1}/{config.num_steps}: t={t*1e3:.3f} ms")
+
+        # Update 3-phase voltage BCs: V_pos = +V_amp·sin(ω_e·t + β), V_neg = -V_amp·sin(ω_e·t + β)
+        for phase in v_drive_funcs:
+            v_val = float(config.V_amp) * np.sin(config.omega_e * t + phase["beta"])
+            phase["pos"].x.array[:] = v_val
+            phase["pos"].x.scatter_forward()
+            phase["neg"].x.array[:] = -v_val
+            phase["neg"].x.scatter_forward()
 
         A_sol, V_sol, residual_norm, rhs_norm = solve_one_step_submesh(
             mesh_parent, A_space, V_space,

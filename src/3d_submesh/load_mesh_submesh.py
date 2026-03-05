@@ -16,6 +16,18 @@ MAGNETS = (13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
 COIL_DRIVE = 7
 COIL_GROUND = 8
 
+# 3-phase voltage drive map.
+# Each entry is one phase: positive terminal coil, negative terminal coil, phase offset beta [rad].
+# alpha=+1 on positive terminal, alpha=-1 on negative terminal (matches CURRENT_MAP signs).
+# Phase A: coils 7(+) / 10(-), beta=0
+# Phase B: coils 9(+) / 12(-), beta=4π/3
+# Phase C: coils 11(+) / 8(-),  beta=2π/3
+VOLTAGE_MAP = [
+    {"pos": 7,  "neg": 10, "beta": 0.0},
+    {"pos": 9,  "neg": 12, "beta": 4 * np.pi / 3},
+    {"pos": 11, "neg": 8,  "beta": 2 * np.pi / 3},
+]
+
 
 def conducting():
     return COILS + MAGNETS + ROTOR
@@ -109,11 +121,23 @@ def setup_boundary_conditions_parent(mesh_parent, facet_tags_parent, A_space):
 
 
 def setup_boundary_conditions_submesh(mesh_conductor, V_space, cell_tags_conductor, conductor_markers, config):
-    """Return bc_V_list. Current source: ground at 0 V only."""
+    """Return (bc_V_list, v_drive_funcs).
+
+    Implements 3-phase voltage drive using VOLTAGE_MAP.  For each phase, two
+    fem.Functions are created: V_pos (applied to the positive-terminal coil)
+    and V_neg (applied to the negative-terminal coil).  The caller updates
+    these functions every time step before solving.
+
+    Conductor regions not driven by any phase (rotor, magnets) have one DOF
+    pinned to 0 to fix the gauge.
+
+    Returns:
+        bcs           : list of DirichletBC objects
+        v_drive_funcs : list of dicts, one per phase:
+                        {"pos": fem.Function, "neg": fem.Function, "beta": float}
+    """
     u0 = fem.Function(V_space)
     u0.x.array[:] = 0.0
-    coil_drive = COIL_DRIVE
-    coil_ground = COIL_GROUND
 
     def dofs_for_marker(marker):
         cells = cell_tags_conductor.find(marker)
@@ -122,14 +146,36 @@ def setup_boundary_conditions_submesh(mesh_conductor, V_space, cell_tags_conduct
         dofs_list = [V_space.dofmap.cell_dofs(int(c)) for c in cells]
         return np.unique(np.concatenate(dofs_list))
 
-    dofs_ground = dofs_for_marker(coil_ground)
-    bcs = [fem.dirichletbc(u0, dofs_ground)]
+    bcs = []
+    v_drive_funcs = []
+    driven_markers = set()
+
+    for phase in VOLTAGE_MAP:
+        V_pos = fem.Function(V_space, name=f"V_pos_{phase['pos']}")
+        V_neg = fem.Function(V_space, name=f"V_neg_{phase['neg']}")
+        V_pos.x.array[:] = 0.0
+        V_neg.x.array[:] = 0.0
+
+        dofs_pos = dofs_for_marker(phase["pos"])
+        dofs_neg = dofs_for_marker(phase["neg"])
+
+        if dofs_pos.size > 0:
+            bcs.append(fem.dirichletbc(V_pos, dofs_pos))
+        if dofs_neg.size > 0:
+            bcs.append(fem.dirichletbc(V_neg, dofs_neg))
+
+        driven_markers.add(phase["pos"])
+        driven_markers.add(phase["neg"])
+        v_drive_funcs.append({"pos": V_pos, "neg": V_neg, "beta": phase["beta"]})
+
+    # Gauge-fix any conductor region not covered by a phase voltage BC
     for m in conductor_markers:
-        if m == coil_drive or m == coil_ground:
+        if m in driven_markers:
             continue
         cells = cell_tags_conductor.find(m)
         if cells.size > 0:
             fdofs = V_space.dofmap.cell_dofs(int(cells[0]))
             if fdofs.size > 0:
                 bcs.append(fem.dirichletbc(u0, np.array([int(fdofs[0])], dtype=np.int32)))
-    return bcs
+
+    return bcs, v_drive_funcs

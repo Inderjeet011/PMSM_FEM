@@ -35,7 +35,7 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
         nu * ufl.inner(curlA, curlv) * dx_parent
         + (sigma * inv_dt) * ufl.inner(A, v) * dx_rs
         + (sigma * inv_dt) * ufl.inner(A, v) * dx_c
-        + (sigma * inv_dt) * ufl.inner(A, v) * dx_pm
+        #+ (sigma * inv_dt) * ufl.inner(A, v) * dx_pm
         - sigma * ufl.inner(ufl.cross(u_rot, curlA), v) * dx_rpm
     )
 
@@ -50,8 +50,7 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
     a11 = sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_cond_parent
 
     L0 = (
-        J_z * v[2] * dx_c
-        + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_rs
+        (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_rs
         + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_c
         + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_pm
         + ufl.inner(nu * mu0 * M_vec, curlv) * dx_pm

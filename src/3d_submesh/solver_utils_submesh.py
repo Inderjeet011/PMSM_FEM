@@ -21,7 +21,7 @@ def make_config():
 
     freq = float(model_parameters["freq"])
     pole_pairs = 5
-    steps_per_period = 40
+    steps_per_period = 10
     dt = (1.0 / freq) / steps_per_period
     omega_e = 2.0 * np.pi * freq
     rotation_direction = -1.0
@@ -30,7 +30,7 @@ def make_config():
     root = Path(__file__).parents[2]
     return SimpleNamespace(
         dt=dt,
-        num_steps=4,  # ~1 electrical period; rotor rotates ~72° for visible animation
+        num_steps=1,  # ~1 electrical period; rotor rotates ~72° for visible animation
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),
@@ -41,11 +41,11 @@ def make_config():
         results_path=root / "results" / "3d_submesh" / "av_solver_submesh.xdmf",
         write_results=True,
         outer_max_it=500,
-        outer_atol=9e-1,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
+        outer_atol=9e-7,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
         ksp_A_max_it=15,
         ksp_A_restart=35,
         ksp_A_rtol=2e-5,
-        I_amp=10.0,  # [A] peak current in drive coil: I(t) = I_amp * sin(omega_e * t)
+        V_amp=10.0,  # [V] peak voltage applied to drive coil: V(t) = V_amp * sin(omega_e * t)
     )
 
 
@@ -176,7 +176,6 @@ def solve_one_step_submesh(mesh_parent, A_space, V_space,
                            cell_tags_parent, config, ksp, mat_nest,
                            a_blocks, L_blocks, block_bcs,
                            J_z, M_vec, A_prev, t):
-    update_currents(J_z, mesh_parent, cell_tags_parent, config, t)
     rotate_magnetization(cell_tags_parent, M_vec, config, t)
 
     comm = mesh_parent.comm
