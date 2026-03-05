@@ -12,6 +12,8 @@ import ufl
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
 from load_mesh import MAGNETS
+sys.path.insert(0, str(Path(__file__).parent))
+from load_mesh_submesh import COIL_DRIVE
 
 
 def make_config():
@@ -28,7 +30,7 @@ def make_config():
     root = Path(__file__).parents[2]
     return SimpleNamespace(
         dt=dt,
-        num_steps=1,  # ~1 electrical period; rotor rotates ~72° for visible animation
+        num_steps=4,  # ~1 electrical period; rotor rotates ~72° for visible animation
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),
@@ -39,14 +41,10 @@ def make_config():
         results_path=root / "results" / "3d_submesh" / "av_solver_submesh.xdmf",
         write_results=True,
         outer_max_it=500,
-        outer_atol=2e-4,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
+        outer_atol=9e-1,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
         ksp_A_max_it=15,
         ksp_A_restart=35,
         ksp_A_rtol=2e-5,
-        sigma_al_override=0.0,
-        sigma_cu_override=5.96e7,
-        coil_drive_marker=7,
-        coil_ground_marker=8,
         I_amp=10.0,  # [A] peak current in drive coil: I(t) = I_amp * sin(omega_e * t)
     )
 
@@ -113,7 +111,7 @@ def update_currents(J_z, mesh_parent, cell_tags_parent, config, t):
         return
     I_t = I_amp * np.sin(config.omega_e * t)
     j_z_val = I_t / drive_volume
-    coil_drive = int(getattr(config, "coil_drive_marker", 7))
+    coil_drive = COIL_DRIVE
     cells_drive = cell_tags_parent.find(coil_drive)
     if cells_drive.size > 0:
         J_z.x.array[cells_drive] = j_z_val
@@ -144,7 +142,7 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space):
     B_mag.x.scatter_forward()
 
     max_B = float(B_dg_mag.max()) if B_dg_mag.size else 0.0
-    return B_sol, B_mag, max_B
+    return B_sol, B_mag, B_dg, max_B
 
 
 def assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space):

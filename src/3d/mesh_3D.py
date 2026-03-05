@@ -29,9 +29,9 @@ model_parameters = {
     },
     "sigma": {
         "Rotor": 1.6e6,
-        "Al": 3.72e7,
+        "Al": 0,  # aluminium treated as non-conducting (no eddy currents)
         "Stator": 0,
-        "Cu": 0,
+        "Cu": 5.96e7,  # copper conductivity [S/m]; coils treated as conductors
         "Air": 0,
         "AirGap": 0,
         "PM": 6.25e5,

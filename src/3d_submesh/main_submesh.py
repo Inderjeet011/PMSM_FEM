@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
 from load_mesh import omega_rs, omega_rpm, omega_c, omega_pm
 
 from load_mesh_submesh import (
+    COIL_DRIVE,
     conducting,
     load_mesh_and_extract_submesh,
     setup_boundary_conditions_parent,
@@ -82,8 +83,7 @@ def main():
     block_bcs = [[bc_A], bc_V_list]
 
     # Drive coil volume: I(t) applied as J_z = I(t) / V_drive
-    coil_drive = int(getattr(config, "coil_drive_marker", 7))
-    dx_drive = measure_over(dx_parent, (coil_drive,))
+    dx_drive = measure_over(dx_parent, (COIL_DRIVE,))
     config.drive_coil_volume = float(fem.assemble_scalar(fem.form(1.0 * dx_drive)))
     if rank0:
         print(f"  Drive coil volume: {config.drive_coil_volume:.6e} m³")
@@ -135,7 +135,7 @@ def main():
             J_z, M_vec, A_prev, t,
         )
 
-        B_sol, B_mag, max_B = compute_B_field(
+        B_sol, B_mag, B_dg, max_B = compute_B_field(
             mesh_parent, A_sol, B_space, B_magnitude_space
         )
 
@@ -145,6 +145,8 @@ def main():
         if writer is not None:
             A_lag.interpolate(A_sol)
             writer.write_function(A_lag, t)
+            writer.write_function(V_sol, t)
+            writer.write_function(B_dg, t)
             writer.write_function(B_sol, t)
             writer.write_function(B_mag, t)
 

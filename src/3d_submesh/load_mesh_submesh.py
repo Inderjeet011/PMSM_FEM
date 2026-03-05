@@ -10,11 +10,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
 from mesh_3D import model_parameters, surface_map  # type: ignore
 
-ALUMINIUM = (4,)
 ROTOR = (5,)
-STATOR = (6,)
 COILS = (7, 8, 9, 10, 11, 12)
 MAGNETS = (13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
+COIL_DRIVE = 7
+COIL_GROUND = 8
 
 
 def conducting():
@@ -91,18 +91,6 @@ def setup_materials(mesh, cell_tags, config):
         sigma.x.array[cells] = sigma_dict[mat_name]
         nu.x.array[cells] = 1.0 / (mu0 * mu_r[mat_name])
 
-    sigma_al_override = getattr(config, "sigma_al_override", None)
-    if sigma_al_override is not None:
-        cells = cell_tags.find(ALUMINIUM[0])
-        sigma.x.array[cells] = float(sigma_al_override)
-
-    sigma_cu_override = getattr(config, "sigma_cu_override", None)
-    if sigma_cu_override is not None and float(sigma_cu_override) > 0:
-        sig_cu = float(sigma_cu_override)
-        for m in COILS:
-            cells = cell_tags.find(m)
-            sigma.x.array[cells] = sig_cu
-
     return sigma, nu
 
 
@@ -124,8 +112,8 @@ def setup_boundary_conditions_submesh(mesh_conductor, V_space, cell_tags_conduct
     """Return bc_V_list. Current source: ground at 0 V only."""
     u0 = fem.Function(V_space)
     u0.x.array[:] = 0.0
-    coil_drive = int(getattr(config, "coil_drive_marker", 7))
-    coil_ground = int(getattr(config, "coil_ground_marker", 8))
+    coil_drive = COIL_DRIVE
+    coil_ground = COIL_GROUND
 
     def dofs_for_marker(marker):
         cells = cell_tags_conductor.find(marker)

@@ -29,8 +29,8 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
     
     inv_dt = fem.Constant(mesh_parent, PETSc.ScalarType(1.0 / config.dt))
     
-    # A-block: (σ/dt) in dx_rs (rotor, stator, aluminium) + dx_c + dx_pm (coils, magnets) for iterative convergence.
-    # Avoid double-counting rotor: dx_rs already has rotor; dx_c + dx_pm add only coils and magnets.
+    # A-block: curl-curl on full domain + (σ/dt) mass on conducting regions
+    # dx_c term stabilizes the coil region (coils excluded from V-submesh, so no V-block stabilization there)
     a00 = (
         nu * ufl.inner(curlA, curlv) * dx_parent
         + (sigma * inv_dt) * ufl.inner(A, v) * dx_rs
@@ -39,9 +39,14 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
         - sigma * ufl.inner(ufl.cross(u_rot, curlA), v) * dx_rpm
     )
 
-    # A–V coupling (match 3d: σ, σ/dt). Rotation term on dx_rpm causes IndexMap error with submesh entity_maps.
+    # A–V coupling. Rotation term restricted to rotor iron only (marker 5, σ≠0 and in submesh).
+    # Al (marker 4) is in omega_rpm but has σ=0 and is not in submesh → excluded via dx_rotor_iron.
+    dx_rotor_iron = dx_parent(5)
     a01 = sigma * ufl.inner(ufl.grad(S), v) * dx_cond_parent
-    a10 = -(sigma * inv_dt) * ufl.inner(A, ufl.grad(q)) * dx_cond_parent
+    a10 = (
+        -(sigma * inv_dt) * ufl.inner(A, ufl.grad(q)) * dx_cond_parent
+        + sigma * ufl.inner(ufl.cross(u_rot, curlA), ufl.grad(q)) * dx_rotor_iron
+    )
     a11 = sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_cond_parent
 
     L0 = (
@@ -128,7 +133,7 @@ def configure_solver_submesh(mesh_parent, mat_nest, mat_blocks, A_space, V_space
     pc_A.setType("hypre")
     pc_A.setHYPREType("boomeramg")
     opts = PETSc.Options()
-    opts[f"{ksp_A.prefix}pc_hypre_boomeramg_max_iter"] = 20
+    opts[f"{ksp_A.prefix}pc_hypre_boomeramg_max_iter"] = 10
     opts[f"{ksp_A.prefix}pc_hypre_boomeramg_tol"] = 0.0
     opts[f"{ksp_A.prefix}pc_hypre_boomeramg_coarsen_type"] = "HMIS"
     ksp_A.setFromOptions()
@@ -138,7 +143,7 @@ def configure_solver_submesh(mesh_parent, mat_nest, mat_blocks, A_space, V_space
     pc_V.setType("hypre")
     pc_V.setHYPREType("boomeramg")
     opts = PETSc.Options()
-    opts[f"{ksp_V.prefix}pc_hypre_boomeramg_max_iter"] = 20
+    opts[f"{ksp_V.prefix}pc_hypre_boomeramg_max_iter"] = 10
     opts[f"{ksp_V.prefix}pc_hypre_boomeramg_tol"] = 0.0
     opts[f"{ksp_V.prefix}pc_hypre_boomeramg_coarsen_type"] = "HMIS"
     ksp_V.setFromOptions()

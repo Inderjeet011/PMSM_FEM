@@ -34,7 +34,7 @@ def make_config():
     return SimpleNamespace(
         dt=dt,
         # Run a few electrical periods by default (helps reach periodic behavior).
-        num_steps=1,  # Run 10 time steps to see torque evolution
+        num_steps=3,  # Run 10 time steps to see torque evolution
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),
