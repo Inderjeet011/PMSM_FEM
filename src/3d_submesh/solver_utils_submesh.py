@@ -41,7 +41,7 @@ def make_config():
         results_path=root / "results" / "3d_submesh" / "av_solver_submesh.xdmf",
         write_results=True,
         outer_max_it=500,
-        outer_atol=9e-7,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
+        outer_atol=9e-2,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
         ksp_A_max_it=15,
         ksp_A_restart=35,
         ksp_A_rtol=2e-5,

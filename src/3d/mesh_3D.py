@@ -569,10 +569,6 @@ def generate_PMSM_mesh(
 
         gmsh.option.setNumber("General.Terminal", 1)
         gmsh.model.mesh.generate(gdim)
-        if optimize and optimize.lower() not in ("none", "off", ""):
-            if rank == root:
-                print(f"\n🔧 Running mesh optimization ({optimize})...")
-            gmsh.model.mesh.optimize(optimize)
 
         msh_file = str(filename.with_suffix(".msh"))
         gmsh.write(msh_file)
@@ -770,7 +766,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--res",
-        default=0.005,
+        default=0.006,
         type=np.float64,
         dest="res",
         help="Base mesh resolution near motor (2mm=0.002). Finer near motor, coarser with distance.",
@@ -803,13 +799,6 @@ if __name__ == "__main__":
         dest="dist_max_ratio",
         help="DistMax/r5 ratio: distance beyond which mesh is coarsest (e.g. 8 = coarse beyond 8*r5)",
     )
-    parser.add_argument(
-        "--no-optimize",
-        action="store_true",
-        dest="no_optimize",
-        help="Skip Netgen mesh optimization (much faster, but lower quality elements)",
-    )
-
     args = parser.parse_args()
     res = args.res
     depth = args.depth
@@ -818,5 +807,4 @@ if __name__ == "__main__":
     folder.mkdir(parents=True, exist_ok=True)
     fname = folder / "pmesh3D_ipm"
 
-    opt = "" if args.no_optimize else "Netgen"
-    generate_PMSM_mesh(fname, False, res, args.L, depth, lc_max_ratio=args.lc_max_ratio, dist_max_ratio=args.dist_max_ratio, optimize=opt)
+    generate_PMSM_mesh(fname, False, res, args.L, depth, lc_max_ratio=args.lc_max_ratio, dist_max_ratio=args.dist_max_ratio, optimize="")

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
-from mesh_3D import model_parameters, surface_map  # type: ignore
+from mesh_3D import mesh_parameters, model_parameters, surface_map  # type: ignore
 
 ROTOR = (5,)
 COILS = (7, 8, 9, 10, 11, 12)
@@ -139,12 +139,37 @@ def setup_boundary_conditions_submesh(mesh_conductor, V_space, cell_tags_conduct
     u0 = fem.Function(V_space)
     u0.x.array[:] = 0.0
 
-    def dofs_for_marker(marker):
-        cells = cell_tags_conductor.find(marker)
-        if cells.size == 0:
-            return np.array([], dtype=np.int32)
-        dofs_list = [V_space.dofmap.cell_dofs(int(c)) for c in cells]
-        return np.unique(np.concatenate(dofs_list))
+    def _angle_diff(a, b):
+        d = (a - b + np.pi) % (2 * np.pi) - np.pi
+        return np.abs(d)
+
+    def terminal_dofs_for_marker(marker):
+        """Bottom terminal-face DOFs only, not the whole coil/rod volume.
+
+        The external loop/rod uses the same Cu marker as its parent coil.
+        Applying Dirichlet BCs on every DOF of that marker clamps the entire
+        rod to one potential and kills the intended current flow.  Instead we
+        apply V only on the bottom terminal face of the vertical coil extension.
+        """
+        z_bottom = float(mesh_conductor.geometry.x[:, 2].min())
+        tol_z = 1.0e-8
+        tol_r = 1.0e-6
+        r_gap = mesh_parameters["r3"] + mesh_parameters["air_gap"]
+        r4 = mesh_parameters["r4"]
+        slot_half = np.pi / 8.0 + 1.0e-6
+        slot_angle = (marker - COILS[0]) * (np.pi / 3.0)
+
+        def on_terminal(x):
+            r = np.sqrt(x[0] ** 2 + x[1] ** 2)
+            theta = np.mod(np.arctan2(x[1], x[0]), 2 * np.pi)
+            return (
+                (np.abs(x[2] - z_bottom) <= tol_z)
+                & (r >= (r_gap - tol_r))
+                & (r <= (r4 + tol_r))
+                & (_angle_diff(theta, slot_angle) <= slot_half)
+            )
+
+        return fem.locate_dofs_geometrical(V_space, on_terminal)
 
     bcs = []
     v_drive_funcs = []
@@ -156,8 +181,8 @@ def setup_boundary_conditions_submesh(mesh_conductor, V_space, cell_tags_conduct
         V_pos.x.array[:] = 0.0
         V_neg.x.array[:] = 0.0
 
-        dofs_pos = dofs_for_marker(phase["pos"])
-        dofs_neg = dofs_for_marker(phase["neg"])
+        dofs_pos = terminal_dofs_for_marker(phase["pos"])
+        dofs_neg = terminal_dofs_for_marker(phase["neg"])
 
         if dofs_pos.size > 0:
             bcs.append(fem.dirichletbc(V_pos, dofs_pos))
