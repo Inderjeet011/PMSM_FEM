@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
 from mesh_3D import mesh_parameters, model_parameters, surface_map  # type: ignore
 
 ROTOR = (5,)
-COILS = (7, 8)
+# Six copper coils (volume tags 7–12)
+COILS = (7, 8, 9, 10, 11, 12)
 MAGNETS = (13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
 COIL_DRIVE = 7
 COIL_GROUND = 8
@@ -144,15 +145,24 @@ def setup_boundary_conditions_submesh(
 ):
     """Return (bc_V_list, v_drive_funcs).
 
-    Updated behaviour (for coil-rod experiments):
+    3‑phase voltage‑driven coils, with each copper rod acting as its own
+    bar conductor:
 
-    - Treat EACH coil (7 and 8) as an isolated copper rod.
-    - On the LOWER half of that rod: V = +V_amp
-    - On the UPPER half of that rod: V = 0
+    - There are six coils: markers (7, 8, 9, 10, 11, 12).
+    - We group them into three electrical phases:
+        Phase A: 7 and 10   (β_A = 0)
+        Phase B: 8 and 11   (β_B = 2π/3)
+        Phase C: 9 and 12   (β_C = 4π/3)
+    - For each coil in a phase:
+        * LOWER half of the rod: V = V_amp * sin(ω_e t + β_phase)
+        * UPPER half of the rod: V = 0   (neutral)
     - Rotor/magnets get a single DOF pinned to 0 for gauge fixing.
 
-    This removes the previous single-phase +/- V drive across the two coils.
-    v_drive_funcs is returned empty; caller does not update voltages in time.
+    The function returns:
+        bcs           : list of DirichletBC objects
+        v_drive_funcs : list of dicts, one per phase:
+                        {"func": fem.Function, "beta": float}
+    The caller (main_submesh) updates each phase["func"] in time.
     """
     u0 = fem.Function(V_space)
     u0.x.array[:] = 0.0
@@ -212,26 +222,37 @@ def setup_boundary_conditions_submesh(
         return np.unique(np.fromiter(dof_set, dtype=np.int32))
 
     bcs = []
-    v_drive_funcs = []  # no time-varying drives in this mode
+    v_drive_funcs = []
     driven_markers = set()
 
-    # Apply V = V_amp on LOWER half, V = 0 on UPPER half of each coil.
-    V_amp = float(getattr(config, "V_amp", 100.0))
-    for marker in COILS:
-        V_lower = fem.Function(V_space, name=f"V_lower_{marker}")
-        V_upper = fem.Function(V_space, name=f"V_upper_{marker}")
-        V_lower.x.array[:] = V_amp
-        V_upper.x.array[:] = 0.0
+    # Phase grouping: 3 phases, 2 coils per phase.
+    two_pi_over_3 = 2.0 * np.pi / 3.0
+    phase_definitions = [
+        {"coils": (7, 10), "beta": 0.0},
+        {"coils": (8, 11), "beta": two_pi_over_3},
+        {"coils": (9, 12), "beta": 2.0 * two_pi_over_3},
+    ]
 
-        dofs_lower = half_dofs_for_marker(marker, "lower")
-        dofs_upper = half_dofs_for_marker(marker, "upper")
+    # Neutral potential (0 V) used on upper halves.
+    V_neutral = fem.Function(V_space)
+    V_neutral.x.array[:] = 0.0
 
-        if dofs_lower.size > 0:
-            bcs.append(fem.dirichletbc(V_lower, dofs_lower))
-        if dofs_upper.size > 0:
-            bcs.append(fem.dirichletbc(V_upper, dofs_upper))
+    for phase in phase_definitions:
+        V_phase = fem.Function(V_space, name=f"V_phase_{phase['coils'][0]}_{phase['coils'][1]}")
+        V_phase.x.array[:] = 0.0
 
-        driven_markers.add(marker)
+        for marker in phase["coils"]:
+            dofs_lower = half_dofs_for_marker(marker, "lower")
+            dofs_upper = half_dofs_for_marker(marker, "upper")
+
+            if dofs_lower.size > 0:
+                bcs.append(fem.dirichletbc(V_phase, dofs_lower))
+            if dofs_upper.size > 0:
+                bcs.append(fem.dirichletbc(V_neutral, dofs_upper))
+
+            driven_markers.add(marker)
+
+        v_drive_funcs.append({"func": V_phase, "beta": phase["beta"]})
 
     # Gauge-fix any conductor region not covered by a phase voltage BC
     for m in conductor_markers:

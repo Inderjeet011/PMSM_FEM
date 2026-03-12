@@ -34,15 +34,15 @@ def make_config():
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),
-        # Set magnet remanence to zero to disable PM excitation
-        magnet_remanence=0.0,
+        # Restore permanent magnet excitation
+        magnet_remanence=1.2,
         omega_e=omega_e,
         omega_m=omega_m,
         mesh_path=root / "meshes" / "3d" / "pmesh3D_ipm.xdmf",
         results_path=root / "results" / "3d_submesh" / "av_solver_submesh.xdmf",
         write_results=True,
         outer_max_it=500,
-        outer_atol=9e1,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
+        outer_atol=9e3,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
         ksp_A_max_it=15,
         ksp_A_restart=35,
         ksp_A_rtol=2e-5,

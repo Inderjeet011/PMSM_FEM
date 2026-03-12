@@ -131,7 +131,8 @@ def main():
 
         # Also prepare a motor-only submesh writer for B, using the parent mesh.
         # Motor := everything except air / airgap (tags 1,2,3).
-        motor_tags = [4, 5, 6, 7, 8] + list(range(13, 23))
+        # Include all six coils (7–12) plus rotor/stator and PMs.
+        motor_tags = [4, 5, 6] + list(range(7, 13)) + list(range(13, 23))
         tdim = mesh_parent.topology.dim
         motor_cells = []
         for tag in motor_tags:
@@ -173,13 +174,14 @@ def main():
         if rank0:
             print(f"\nStep {step+1}/{config.num_steps}: t={t*1e3:.3f} ms")
 
-        # Update single-phase voltage BCs: V_pos = +V_amp·sin(ω_e·t + β), V_neg = -V_amp·sin(ω_e·t + β)
+        # 3‑phase voltage drive on six coils:
+        #   For each phase p in {A,B,C}:
+        #       V_p(t) = V_amp * sin(omega_e * t + beta_p)
+        #   Applied on LOWER halves of the two coils in that phase.
         for phase in v_drive_funcs:
             v_val = float(config.V_amp) * np.sin(config.omega_e * t + phase["beta"])
-            phase["pos"].x.array[:] = v_val
-            phase["pos"].x.scatter_forward()
-            phase["neg"].x.array[:] = -v_val
-            phase["neg"].x.scatter_forward()
+            phase["func"].x.array[:] = v_val
+            phase["func"].x.scatter_forward()
 
         A_sol, V_sol, residual_norm, rhs_norm = solve_one_step_submesh(
             mesh_parent, A_space, V_space,

@@ -10,7 +10,7 @@ import dolfinx
 
 _all_ = ["model_parameters", "mesh_parameters", "surface_map"]
 
-COIL_HALF_ANGLE = np.pi / 6.0
+COIL_HALF_ANGLE = np.pi / 12.0
 
 # ---------------------------------------------------------------------------
 # Model and mesh parameters
@@ -21,6 +21,7 @@ model_parameters = {
     "freq": 60,  # Hz
     "J": 3.1e6 * np.sqrt(2),  # [A/m^2]
     "mu_r": {
+        # Restore original, physical-ish relative permeabilities
         "Cu": 1,
         "Stator": 30,
         "Rotor": 30,
@@ -30,8 +31,9 @@ model_parameters = {
         "PM": 1.04457,
     },
     "sigma": {
+        # Restore original conductivities
         "Rotor": 1.6e6,
-        "Al": 0,  # aluminium treated as non-conducting (no eddy currents)
+        "Al": 0,       # aluminium treated as non-conducting (no eddy currents)
         "Stator": 0,
         "Cu": 5.96e7,  # copper conductivity [S/m]; coils treated as conductors
         "Air": 0,
@@ -59,7 +61,8 @@ _domain_map_three: Dict[str, tuple[int, ...]] = {
     "Al": (4,),
     "Rotor": (5,),
     "Stator": (6,),
-    "Cu": (7, 8, 9, 10),
+    # Six separate copper coils (tags 7–12)
+    "Cu": (7, 8, 9, 10, 11, 12),
     "PM": (13, 14, 15, 16, 17, 18, 19, 20, 21, 22),
 }
 
@@ -77,7 +80,8 @@ mesh_parameters: Dict[str, float] = {
     "r2": 0.04,
     "r3": 0.042,  # rotor outer
     "r4": 0.062,  # stator inner
-    "r5": 0.075,  # stator outer
+    # Slightly slimmer stator: reduce outer radius from 0.075 -> 0.070 (8 mm thickness)
+    "r5": 0.070,  # stator outer
     "r6": 0.036,  # PM inner radius
     "r7": 0.038,  # PM outer radius
     # NOTE: We model the true air-gap as the thin annulus [r3, r3 + air_gap]
@@ -219,7 +223,8 @@ def generate_PMSM_mesh(
     r_mid_gap = r3 + 0.5 * air_gap  # Mid-radius for splitting the true air-gap
 
     # Slot and PM angles (needed for retagging)
-    slot_angles = np.asarray([0.0, np.pi], dtype=np.float64)
+    # Six coils, evenly spaced every 60 degrees.
+    slot_angles = np.asarray([k * (2.0 * np.pi / 6.0) for k in range(6)], dtype=np.float64)
     pm_count = 10
     pm_spacing = 2.0 * np.pi / pm_count
     pm_angles = np.asarray([i * pm_spacing for i in range(pm_count)], dtype=np.float64)
@@ -244,9 +249,11 @@ def generate_PMSM_mesh(
     shift_z = motor_center_z - depth / 2.0
     motor_z_start = shift_z
     motor_z_end = shift_z + depth
-    # Extrude copper further above and below the motor stack
-    # (original setting).
-    extension_height = 0.5 * depth
+    # Increase copper rod height: previous total length was
+    # depth + 2 * (0.5*depth) = 2*depth.
+    # Set extension_height = depth → total length = depth + 2*depth = 3*depth
+    # (i.e. 1.5× the previous rod length).
+    extension_height = 1.0 * depth
     cap_height = min(0.35 * extension_height, 0.5 * coil_radial_width)
     extension_z_bottom = motor_z_start - extension_height
     extension_z_top = motor_z_end + extension_height
