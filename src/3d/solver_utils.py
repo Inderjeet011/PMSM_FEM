@@ -122,14 +122,14 @@ def rotate_magnetization(cell_tags, M_vec, config, t):
 
 
 def update_currents(cell_tags, J_z, config, t):
-    omega = config.omega_e
-    J_peak = config.coil_current_peak
+    """
+    Voltage-driven coils: no imposed volumetric source current.
+
+    The coil currents are now driven purely by the imposed potential
+    difference on the copper rods (Dirichlet BCs on V). To avoid
+    double‑driving, we keep J_z identically zero in the coils.
+    """
     J_z.x.array[:] = 0.0
-    for marker, meta in CURRENT_MAP.items():
-        cells = cell_tags.find(marker)
-        if cells.size == 0:
-            continue
-        J_z.x.array[cells] = J_peak * meta["alpha"] * np.sin(omega * t + meta["beta"])
 
 
 def assemble_rhs(a_blocks, L_blocks, block_bcs, A_space, V_space):

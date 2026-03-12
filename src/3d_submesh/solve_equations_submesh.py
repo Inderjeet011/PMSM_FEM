@@ -4,9 +4,34 @@ A lives on parent mesh, V lives on conductor submesh.
 
 from dolfinx import fem  # type: ignore
 from dolfinx.fem import petsc  # type: ignore
+from dolfinx.cpp.fem.petsc import discrete_gradient  # type: ignore
 from petsc4py import PETSc  # type: ignore
 import ufl  # type: ignore
 import numpy as np  # type: ignore
+
+_keepalive = []
+
+
+def _build_interior_nodes_for_ams(mesh, cell_tags, conductor_markers, degree=1):
+    """Build AMS interior-node marker: 0 on conductors, 1 elsewhere."""
+    W = fem.functionspace(mesh, ("Lagrange", degree))
+    interior_nodes_array = fem.Function(W)
+    interior_nodes_array.x.array[:] = 1.0
+    interior_nodes_array.x.scatter_forward()
+
+    dofmap = W.dofmap
+    num_dofs_per_cell = dofmap.dof_layout.num_dofs
+    cell_dofs = dofmap.list.reshape(-1, num_dofs_per_cell)
+
+    conductor_cells = np.concatenate([cell_tags.find(tag) for tag in conductor_markers])
+    conductor_cells = np.unique(conductor_cells)
+    if conductor_cells.size > 0:
+        tagged_cell_dofs = cell_dofs[conductor_cells].flatten()
+        unique_dofs = np.unique(tagged_cell_dofs)
+        interior_nodes_array.x.array[unique_dofs] = 0.0
+        interior_nodes_array.x.scatter_forward()
+
+    return interior_nodes_array
 
 
 def build_forms_submesh(mesh_parent, A_space, V_space,
@@ -35,7 +60,7 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
         nu * ufl.inner(curlA, curlv) * dx_parent
         + (sigma * inv_dt) * ufl.inner(A, v) * dx_rs
         + (sigma * inv_dt) * ufl.inner(A, v) * dx_c
-        #+ (sigma * inv_dt) * ufl.inner(A, v) * dx_pm
+        + (sigma * inv_dt) * ufl.inner(A, v) * dx_pm
         - sigma * ufl.inner(ufl.cross(u_rot, curlA), v) * dx_rpm
     )
 
@@ -48,6 +73,12 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
         + sigma * ufl.inner(ufl.cross(u_rot, curlA), ufl.grad(q)) * dx_rotor_iron
     )
     a11 = sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_cond_parent
+
+    # AMS SPD preconditioner matrix.
+    a00_spd = (
+        config.dt * nu * ufl.inner(curlA, curlv) * dx_parent
+        + sigma * ufl.inner(A, v) * dx_cond_parent
+    )
 
     L0 = (
         (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_rs
@@ -64,11 +95,12 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
     )
     L_blocks = (fem.form(L0), fem.form(L1, entity_maps=em))
     a_block_form = fem.form([[a00, a01], [a10, a11]], entity_maps=em)
-    return a_blocks, L_blocks, a_block_form
+    a00_spd_form = fem.form(a00_spd)
+    return a_blocks, L_blocks, a_block_form, a00_spd_form
 
 
 def assemble_system_matrix_submesh(mesh_parent, a_blocks, block_bcs,
-                                    A_space_parent, V_space_submesh, a_block_form):
+                                    A_space_parent, V_space_submesh, a_block_form, a00_spd_form):
     comm = mesh_parent.comm
     n_A_dofs = A_space_parent.dofmap.index_map.size_global
     n_V_dofs = V_space_submesh.dofmap.index_map.size_global
@@ -90,10 +122,15 @@ def assemble_system_matrix_submesh(mesh_parent, a_blocks, block_bcs,
     mat_nest = PETSc.Mat().createNest(mats, comm=comm)
     mat_nest.assemble()
 
-    return mats, mat_nest
+    A00_spd = petsc.assemble_matrix(a00_spd_form, bcs=None)
+    A00_spd.assemble()
+    A00_spd.setOption(PETSc.Mat.Option.SPD, True)
+
+    return mats, mat_nest, A00_spd
 
 
-def configure_solver_submesh(mesh_parent, mat_nest, mat_blocks, A_space, V_space, config):
+def configure_solver_submesh(mesh_parent, mat_nest, mat_blocks, A_space, V_space, A00_spd, config,
+                             cell_tags=None, conductor_markers=None):
     comm = mesh_parent.comm
     A00_full = mat_blocks[0][0]
 
@@ -126,26 +163,51 @@ def configure_solver_submesh(mesh_parent, mat_nest, mat_blocks, A_space, V_space
     ksp_A.setTolerances(
         max_it=int(config.ksp_A_max_it),
     )
-    ksp_A.setOperators(A00_full, A00_full)
-
-    pc_A = ksp_A.getPC()
-    pc_A.setType("hypre")
-    pc_A.setHYPREType("boomeramg")
-    opts = PETSc.Options()
-    opts[f"{ksp_A.prefix}pc_hypre_boomeramg_max_iter"] = 10
-    opts[f"{ksp_A.prefix}pc_hypre_boomeramg_tol"] = 0.0
-    opts[f"{ksp_A.prefix}pc_hypre_boomeramg_coarsen_type"] = "HMIS"
-    ksp_A.setFromOptions()
+    # Choose A-block preconditioner from config.A_pc
+    A_pc_type = getattr(config, "A_pc", "boomeramg").lower()
+    if A_pc_type in ("boomeramg", "ams"):
+        # Hypre-based PC; use A00_full as system and preconditioner matrix.
+        ksp_A.setOperators(A00_full, A00_full)
+        pc_A = ksp_A.getPC()
+        pc_A.setType("hypre")
+        pc_A.setHYPREType(A_pc_type)
+        opts = PETSc.Options()
+        prefix_A = ksp_A.getOptionsPrefix() or ""
+        if A_pc_type == "boomeramg":
+            opts[f"{prefix_A}pc_hypre_boomeramg_max_iter"] = 10
+            opts[f"{prefix_A}pc_hypre_boomeramg_tol"] = 0.0
+            opts[f"{prefix_A}pc_hypre_boomeramg_coarsen_type"] = "HMIS"
+        else:
+            # Minimal AMS setup here (for quick experiments); full AMS wiring
+            # remains in the 3d solver and coil_loop tests.
+            pc_A.setHYPREType("ams")
+        ksp_A.setFromOptions()
+    elif A_pc_type == "gamg":
+        # PETSc GAMG on the A-block.
+        ksp_A.setOperators(A00_full, A00_full)
+        pc_A = ksp_A.getPC()
+        pc_A.setType("gamg")
+        ksp_A.setFromOptions()
+    elif A_pc_type == "ilu":
+        # Simple ILU (or block-Jacobi+ILU) on the A-block.
+        ksp_A.setOperators(A00_full, A00_full)
+        pc_A = ksp_A.getPC()
+        pc_A.setType("bjacobi")
+        ksp_A.setFromOptions()
+    else:
+        # Fallback: no special PC.
+        ksp_A.setOperators(A00_full, A00_full)
+        ksp_A.setFromOptions()
 
     ksp_V.setType("preonly")
     pc_V = ksp_V.getPC()
     pc_V.setType("hypre")
     pc_V.setHYPREType("boomeramg")
     opts = PETSc.Options()
-    opts[f"{ksp_V.prefix}pc_hypre_boomeramg_max_iter"] = 10
-    opts[f"{ksp_V.prefix}pc_hypre_boomeramg_tol"] = 0.0
-    opts[f"{ksp_V.prefix}pc_hypre_boomeramg_coarsen_type"] = "HMIS"
+    prefix_V = ksp_V.getOptionsPrefix() or ""
+    opts[f"{prefix_V}pc_hypre_boomeramg_max_iter"] = 10
+    opts[f"{prefix_V}pc_hypre_boomeramg_tol"] = 0.0
+    opts[f"{prefix_V}pc_hypre_boomeramg_coarsen_type"] = "HMIS"
     ksp_V.setFromOptions()
-
     ksp.setFromOptions()
     return ksp

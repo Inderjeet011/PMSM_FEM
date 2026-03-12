@@ -9,6 +9,8 @@ Run:
 
 import basix.ufl
 from dolfinx import fem, io
+from dolfinx.io import VTXWriter
+from dolfinx.mesh import create_submesh
 from mpi4py import MPI
 import ufl
 
@@ -66,9 +68,67 @@ def main():
     B_magnitude_space = fem.functionspace(mesh, basix.ufl.element("Lagrange", mesh.basix_cell(), config.degree_V))
     A_prev = fem.Function(A_space, name="A_prev")
 
-    # Boundary conditions (block_bcs is what the solver needs)
-    _, _, block_bcs = setup_boundary_conditions(mesh, ft, A_space, V_space)
-    block_bcs[1].append(make_ground_bc_V(V_space, ct, conducting()))
+    # ------------------------------------------------------------------
+    # Boundary conditions
+    # ------------------------------------------------------------------
+    # Use existing helper only for A (outer air-box); construct V BCs
+    # directly on the coils so we know exactly where the terminals are.
+    bc_A, _, _ = setup_boundary_conditions(mesh, ft, A_space, V_space)
+
+    from load_mesh import COILS
+    import numpy as np
+
+    tdim = mesh.topology.dim
+    mesh.topology.create_connectivity(tdim, 0)
+    cell2vert = mesh.topology.connectivity(tdim, 0)
+    coords = mesh.geometry.x
+
+    def _lower_coil_cells(marker: int) -> np.ndarray:
+        cells = ct.find(marker)
+        if cells.size == 0:
+            return np.array([], dtype=np.int32)
+        verts = np.unique(np.concatenate([cell2vert.links(int(c)) for c in cells]))
+        z = coords[verts, 2]
+        z_min, z_max = float(z.min()), float(z.max())
+        tol_z = 0.05 * max(z_max - z_min, 1e-6)
+        bottom_verts = set(int(v) for v in verts[z <= z_min + tol_z])
+        lower_cells = []
+        for c in cells:
+            if any(int(v) in bottom_verts for v in cell2vert.links(int(c))):
+                lower_cells.append(int(c))
+        return np.array(lower_cells, dtype=np.int32)
+
+    coil7_lower_cells = _lower_coil_cells(COILS[0])
+    coil8_lower_cells = _lower_coil_cells(COILS[1])
+
+    # Map those cells to V dofs
+    def _cells_to_dofs(cells: np.ndarray) -> np.ndarray:
+        if cells.size == 0:
+            return np.array([], dtype=np.int32)
+        dof_lists = [V_space.dofmap.cell_dofs(int(c)) for c in cells]
+        return np.unique(np.concatenate(dof_lists)) if dof_lists else np.array([], dtype=np.int32)
+
+    dofs7 = _cells_to_dofs(coil7_lower_cells)
+    dofs8 = _cells_to_dofs(coil8_lower_cells)
+
+    # Dirichlet BCs: V = 10 V on coil 7 lower, V = 0 on coil 8 lower
+    bc_V_list = []
+    if dofs7.size > 0:
+        v_plus = fem.Function(V_space)
+        v_plus.x.array[:] = 10.0
+        bc_V_list.append(fem.dirichletbc(v_plus, dofs7))
+    if dofs8.size > 0:
+        v_zero = fem.Function(V_space)
+        v_zero.x.array[:] = 0.0
+        bc_V_list.append(fem.dirichletbc(v_zero, dofs8))
+
+    # Fall back to old behaviour if we somehow failed to detect lower coil cells
+    if not bc_V_list:
+        _, _, old_block_bcs = setup_boundary_conditions(mesh, ft, A_space, V_space)
+        bc_V_list = old_block_bcs[1]
+
+    # Block-structured BCs for the solver
+    block_bcs = [[bc_A], bc_V_list]
 
     # Sources (coil currents + permanent magnets)
     J_z, M_vec = setup_sources(mesh)
@@ -104,11 +164,44 @@ def main():
     # Optional output
     writer = None
     A_lag = None
+    B_motor_writer = None
     if config.write_results:
         config.results_path.parent.mkdir(parents=True, exist_ok=True)
         writer = io.XDMFFile(MPI.COMM_WORLD, str(config.results_path), "w")
         writer.write_mesh(mesh)
         A_lag = fem.Function(fem.functionspace(mesh, ("Lagrange", 1, (3,))), name="A")
+
+        # Prepare a VTX writer for B field restricted to the motor submesh.
+        # Motor := everything except air / airgap.
+        motor_tags = [4, 5, 6, 7, 8] + list(range(13, 23))
+        tdim = mesh.topology.dim
+        motor_cells = []
+        for tag in motor_tags:
+            cells = ct.find(tag)
+            if cells.size > 0:
+                motor_cells.append(cells)
+        if motor_cells:
+            import numpy as np
+
+            target_cells = np.unique(np.concatenate(motor_cells)).astype(np.int32)
+            submesh, subdomain_motor_to_domain = create_submesh(mesh, tdim, target_cells)[:2]
+            smsh_cell_imap = submesh.topology.index_map(tdim)
+            smsh_cells = np.arange(smsh_cell_imap.size_local + smsh_cell_imap.num_ghosts, dtype=np.int32)
+            parent_cells = subdomain_motor_to_domain.sub_topology_to_topology(smsh_cells, inverse=False)
+
+            deg = int(config.degree_A)
+            Submesh_vec_vis = fem.functionspace(
+                submesh,
+                ("Discontinuous Lagrange", deg, (submesh.geometry.dim,)),
+            )
+            B_motor = fem.Function(Submesh_vec_vis, name="B_motor")
+            B_motor_writer = {
+                "submesh": submesh,
+                "parent_cells": parent_cells,
+                "smsh_cells": smsh_cells,
+                "function": B_motor,
+                "writer": VTXWriter(mesh.comm, "B_field_motor.bp", B_motor),
+            }
 
     # Time loop
     t = 0.0
@@ -138,6 +231,24 @@ def main():
         B_sol, B_magnitude_sol, max_B, _min_B, _norm_B, B_dg = compute_B_field(
             mesh, A_sol, B_space, B_magnitude_space
         )
+
+        # If requested, also write B restricted to the motor submesh.
+        if B_motor_writer is not None:
+            # Build a DG representation of B on the parent mesh, then restrict.
+            deg = int(config.degree_A)
+            vector_vis = fem.functionspace(
+                mesh, ("Discontinuous Lagrange", deg, (mesh.geometry.dim,))
+            )
+            curlA = ufl.curl(A_sol)
+            B_expr = fem.Expression(curlA, vector_vis.element.interpolation_points)
+            B_vis = fem.Function(vector_vis)
+            B_vis.interpolate(B_expr)
+
+            bw = B_motor_writer
+            bw["function"].interpolate(
+                B_vis, cells0=bw["parent_cells"], cells1=bw["smsh_cells"]
+            )
+            bw["writer"].write(t)
 
         # Compute B-field statistics in airgap (use B_sol for better accuracy)
         B_airgap_stats = compute_B_in_airgap(mesh, B_dg, ct, B_sol=B_sol)
@@ -186,6 +297,8 @@ def main():
 
     if writer is not None:
         writer.close()
+    if B_motor_writer is not None:
+        B_motor_writer["writer"].close()
 
 
 if __name__ == "__main__":

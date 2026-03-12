@@ -11,21 +11,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
 from mesh_3D import mesh_parameters, model_parameters, surface_map  # type: ignore
 
 ROTOR = (5,)
-COILS = (7, 8, 9, 10, 11, 12)
+COILS = (7, 8)
 MAGNETS = (13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
 COIL_DRIVE = 7
 COIL_GROUND = 8
 
-# 3-phase voltage drive map.
-# Each entry is one phase: positive terminal coil, negative terminal coil, phase offset beta [rad].
-# alpha=+1 on positive terminal, alpha=-1 on negative terminal (matches CURRENT_MAP signs).
-# Phase A: coils 7(+) / 10(-), beta=0
-# Phase B: coils 9(+) / 12(-), beta=4π/3
-# Phase C: coils 11(+) / 8(-),  beta=2π/3
+# Single-phase voltage drive map.
 VOLTAGE_MAP = [
-    {"pos": 7,  "neg": 10, "beta": 0.0},
-    {"pos": 9,  "neg": 12, "beta": 4 * np.pi / 3},
-    {"pos": 11, "neg": 8,  "beta": 2 * np.pi / 3},
+    {"pos": 7, "neg": 8, "beta": 0.0},
 ]
 
 
@@ -45,6 +38,14 @@ def load_mesh_and_extract_submesh(mesh_path):
         mesh_parent.topology.create_entities(mesh_parent.topology.dim - 1)
         cell_tags_parent = xdmf.read_meshtags(mesh_parent, name="cell_tags")
         facet_tags_parent = xdmf.read_meshtags(mesh_parent, name="facet_tags")
+
+        # Try to read the DG0 field that marks lower straight coil halves.
+        coil_lower_parent = None
+        try:
+            DG0_parent = fem.functionspace(mesh_parent, ("DG", 0))
+            coil_lower_parent = xdmf.read_function(DG0_parent, name="CoilLowerHalves")
+        except Exception:
+            coil_lower_parent = None
 
     conductor_markers = conducting()
     conductor_cells = np.array([], dtype=np.int32)
@@ -67,9 +68,21 @@ def load_mesh_and_extract_submesh(mesh_path):
     submesh_tags = np.empty(n_submesh_cells, dtype=np.int32)
     cell_to_tag_parent = {int(i): int(v) for i, v in zip(cell_tags_parent.indices, cell_tags_parent.values)}
     entity_dict = entity_map_to_dict(entity_map, n_submesh_cells, mesh_parent.comm)
+
+    # Optional: lower-half labels on the conductor submesh (from CoilLowerHalves DG0 field).
+    coil_half_submesh = None
+    if coil_lower_parent is not None:
+        coil_half_submesh = np.zeros(n_submesh_cells, dtype=np.int32)
+        parent_vals = coil_lower_parent.x.array
+    else:
+        parent_vals = None
+
     for i in range(n_submesh_cells):
         parent_cell = entity_dict.get(i, -1)
         submesh_tags[i] = cell_to_tag_parent.get(parent_cell, conductor_markers[0])
+        if coil_half_submesh is not None and parent_vals is not None and 0 <= parent_cell < parent_vals.size:
+            coil_half_submesh[i] = int(parent_vals[parent_cell])
+
     cell_tags_conductor = meshtags(mesh_conductor, tdim, submesh_cell_indices, submesh_tags)
 
     return (
@@ -79,6 +92,7 @@ def load_mesh_and_extract_submesh(mesh_path):
         cell_tags_conductor,
         facet_tags_parent,
         entity_map,
+        coil_half_submesh,
     )
 
 
@@ -120,78 +134,104 @@ def setup_boundary_conditions_parent(mesh_parent, facet_tags_parent, A_space):
     return fem.dirichletbc(u0, dofs)
 
 
-def setup_boundary_conditions_submesh(mesh_conductor, V_space, cell_tags_conductor, conductor_markers, config):
+def setup_boundary_conditions_submesh(
+    mesh_conductor,
+    V_space,
+    cell_tags_conductor,
+    conductor_markers,
+    config,
+    coil_half_submesh=None,  # kept for API compatibility, not used now
+):
     """Return (bc_V_list, v_drive_funcs).
 
-    Implements 3-phase voltage drive using VOLTAGE_MAP.  For each phase, two
-    fem.Functions are created: V_pos (applied to the positive-terminal coil)
-    and V_neg (applied to the negative-terminal coil).  The caller updates
-    these functions every time step before solving.
+    Updated behaviour (for coil-rod experiments):
 
-    Conductor regions not driven by any phase (rotor, magnets) have one DOF
-    pinned to 0 to fix the gauge.
+    - Treat EACH coil (7 and 8) as an isolated copper rod.
+    - On the LOWER half of that rod: V = +V_amp
+    - On the UPPER half of that rod: V = 0
+    - Rotor/magnets get a single DOF pinned to 0 for gauge fixing.
 
-    Returns:
-        bcs           : list of DirichletBC objects
-        v_drive_funcs : list of dicts, one per phase:
-                        {"pos": fem.Function, "neg": fem.Function, "beta": float}
+    This removes the previous single-phase +/- V drive across the two coils.
+    v_drive_funcs is returned empty; caller does not update voltages in time.
     """
     u0 = fem.Function(V_space)
     u0.x.array[:] = 0.0
 
-    def _angle_diff(a, b):
-        d = (a - b + np.pi) % (2 * np.pi) - np.pi
-        return np.abs(d)
-
-    def terminal_dofs_for_marker(marker):
-        """Bottom terminal-face DOFs only, not the whole coil/rod volume.
-
-        The external loop/rod uses the same Cu marker as its parent coil.
-        Applying Dirichlet BCs on every DOF of that marker clamps the entire
-        rod to one potential and kills the intended current flow.  Instead we
-        apply V only on the bottom terminal face of the vertical coil extension.
+    def half_dofs_for_marker(marker: int, which: str) -> np.ndarray:
         """
-        z_bottom = float(mesh_conductor.geometry.x[:, 2].min())
-        tol_z = 1.0e-8
-        tol_r = 1.0e-6
-        r_gap = mesh_parameters["r3"] + mesh_parameters["air_gap"]
-        r4 = mesh_parameters["r4"]
-        slot_half = np.pi / 8.0 + 1.0e-6
-        slot_angle = (marker - COILS[0]) * (np.pi / 3.0)
+        Return DOFs in the LOWER or UPPER half of the straight coil leg
+        for this marker, using only the conductor submesh geometry and
+        cell tags.
 
-        def on_terminal(x):
-            r = np.sqrt(x[0] ** 2 + x[1] ** 2)
-            theta = np.mod(np.arctan2(x[1], x[0]), 2 * np.pi)
-            return (
-                (np.abs(x[2] - z_bottom) <= tol_z)
-                & (r >= (r_gap - tol_r))
-                & (r <= (r4 + tol_r))
-                & (_angle_diff(theta, slot_angle) <= slot_half)
-            )
+        Strategy:
+          1. Find all submesh cells with this coil marker (7 or 8).
+          2. Compute each cell's center z-coordinate.
+          3. Define z_mid = 0.5 * (z_min + z_max) for that coil.
+          4. For 'lower': cells with center z <= z_mid (+tol).
+             For 'upper': cells with center z >= z_mid (-tol).
+          5. Collect all V-space DOFs on those cells.
+        """
+        tdim = mesh_conductor.topology.dim
+        cells = cell_tags_conductor.find(marker)
+        if cells.size == 0:
+            return np.array([], dtype=np.int32)
 
-        return fem.locate_dofs_geometrical(V_space, on_terminal)
+        # Cell centers for these coil cells
+        mesh_conductor.topology.create_connectivity(tdim, 0)
+        c2v = mesh_conductor.topology.connectivity(tdim, 0)
+        coords = mesh_conductor.geometry.x
+
+        z_centers = []
+        for c in cells:
+            verts = c2v.links(int(c))
+            if verts.size == 0:
+                continue
+            z_centers.append(float(coords[verts, 2].mean()))
+        if not z_centers:
+            return np.array([], dtype=np.int32)
+
+        z_min = min(z_centers)
+        z_max = max(z_centers)
+        z_mid = 0.5 * (z_min + z_max)
+        tol_z = 1e-8 * max(abs(z_max - z_min), 1.0)
+
+        # Collect DOFs for cells in lower half (center z <= z_mid + tol)
+        dm = V_space.dofmap
+        dof_set = set()
+        for c, zc in zip(cells, z_centers):
+            if which == "lower":
+                cond = (zc <= z_mid + tol_z)
+            else:
+                cond = (zc >= z_mid - tol_z)
+            if cond:
+                for d in dm.cell_dofs(int(c)):
+                    dof_set.add(int(d))
+
+        if not dof_set:
+            return np.array([], dtype=np.int32)
+        return np.unique(np.fromiter(dof_set, dtype=np.int32))
 
     bcs = []
-    v_drive_funcs = []
+    v_drive_funcs = []  # no time-varying drives in this mode
     driven_markers = set()
 
-    for phase in VOLTAGE_MAP:
-        V_pos = fem.Function(V_space, name=f"V_pos_{phase['pos']}")
-        V_neg = fem.Function(V_space, name=f"V_neg_{phase['neg']}")
-        V_pos.x.array[:] = 0.0
-        V_neg.x.array[:] = 0.0
+    # Apply V = V_amp on LOWER half, V = 0 on UPPER half of each coil.
+    V_amp = float(getattr(config, "V_amp", 100.0))
+    for marker in COILS:
+        V_lower = fem.Function(V_space, name=f"V_lower_{marker}")
+        V_upper = fem.Function(V_space, name=f"V_upper_{marker}")
+        V_lower.x.array[:] = V_amp
+        V_upper.x.array[:] = 0.0
 
-        dofs_pos = terminal_dofs_for_marker(phase["pos"])
-        dofs_neg = terminal_dofs_for_marker(phase["neg"])
+        dofs_lower = half_dofs_for_marker(marker, "lower")
+        dofs_upper = half_dofs_for_marker(marker, "upper")
 
-        if dofs_pos.size > 0:
-            bcs.append(fem.dirichletbc(V_pos, dofs_pos))
-        if dofs_neg.size > 0:
-            bcs.append(fem.dirichletbc(V_neg, dofs_neg))
+        if dofs_lower.size > 0:
+            bcs.append(fem.dirichletbc(V_lower, dofs_lower))
+        if dofs_upper.size > 0:
+            bcs.append(fem.dirichletbc(V_upper, dofs_upper))
 
-        driven_markers.add(phase["pos"])
-        driven_markers.add(phase["neg"])
-        v_drive_funcs.append({"pos": V_pos, "neg": V_neg, "beta": phase["beta"]})
+        driven_markers.add(marker)
 
     # Gauge-fix any conductor region not covered by a phase voltage BC
     for m in conductor_markers:

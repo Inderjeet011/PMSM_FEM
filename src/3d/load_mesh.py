@@ -12,7 +12,7 @@ AIR_GAP = (2, 3)
 ALUMINIUM = (4,)
 ROTOR = (5,)
 STATOR = (6,)
-COILS = (7, 8, 9, 10, 11, 12)
+COILS = (7, 8)
 MAGNETS = (13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
 
 def conducting():
@@ -56,14 +56,12 @@ def omega_rpm():
 # Current mapping
 CURRENT_MAP = {
     7: {"alpha": 1.0, "beta": 0.0},
-    8: {"alpha": -1.0, "beta": 2 * np.pi / 3},
-    9: {"alpha": 1.0, "beta": 4 * np.pi / 3},
-    10: {"alpha": -1.0, "beta": 0.0},
-    11: {"alpha": 1.0, "beta": 2 * np.pi / 3},
-    12: {"alpha": -1.0, "beta": 4 * np.pi / 3},
+    8: {"alpha": -1.0, "beta": 0.0},
 }
 
 EXTERIOR_FACET_TAG = surface_map["Exterior"]
+COIL7_LOWER_FACET_TAG = surface_map.get("Coil7Lower", None)
+COIL8_LOWER_FACET_TAG = surface_map.get("Coil8Lower", None)
 
 
 def load_mesh(mesh_path):
@@ -139,7 +137,7 @@ def setup_materials(mesh, cell_tags, config):
 
 
 def setup_boundary_conditions(mesh, facet_tags, A_space, V_space):
-    """Strong Dirichlet BCs (A=0, V=0) on the exterior boundary."""
+    """Strong Dirichlet BCs: A=0 on exterior, V-driven terminals on coil ends."""
     tdim = mesh.topology.dim
     mesh.topology.create_connectivity(tdim - 1, tdim)
 
@@ -149,12 +147,37 @@ def setup_boundary_conditions(mesh, facet_tags, A_space, V_space):
         else locate_entities_boundary(mesh, tdim - 1, lambda x: np.full(x.shape[1], True))
     )
 
-    def zero_bc(space):
+    def zero_bc(space, facets):
         u0 = fem.Function(space)
         u0.x.array[:] = 0.0
-        dofs = fem.locate_dofs_topological(space, tdim - 1, exterior_facets)
+        dofs = fem.locate_dofs_topological(space, tdim - 1, facets)
         return fem.dirichletbc(u0, dofs)
 
-    bc_A = zero_bc(A_space)
-    bc_V = zero_bc(V_space)
-    return bc_A, bc_V, [[bc_A], [bc_V]]
+    # A = 0 on outer air-box boundary (as before)
+    bc_A = zero_bc(A_space, exterior_facets)
+
+    # Voltage-driven terminals on lower ends of the two active coils, if tags exist.
+    bc_V_list = []
+    V_terminal = 10.0
+
+    if facet_tags is not None and COIL7_LOWER_FACET_TAG is not None:
+        coil7_facets = facet_tags.find(COIL7_LOWER_FACET_TAG)
+        if coil7_facets.size > 0:
+            v_plus = fem.Function(V_space)
+            v_plus.x.array[:] = V_terminal
+            dofs_plus = fem.locate_dofs_topological(V_space, tdim - 1, coil7_facets)
+            bc_V_list.append(fem.dirichletbc(v_plus, dofs_plus))
+
+    if facet_tags is not None and COIL8_LOWER_FACET_TAG is not None:
+        coil8_facets = facet_tags.find(COIL8_LOWER_FACET_TAG)
+        if coil8_facets.size > 0:
+            v_zero = fem.Function(V_space)
+            v_zero.x.array[:] = 0.0
+            dofs_zero = fem.locate_dofs_topological(V_space, tdim - 1, coil8_facets)
+            bc_V_list.append(fem.dirichletbc(v_zero, dofs_zero))
+
+    # Fallback: if no coil terminal tags were found, keep old behaviour (V=0 on exterior)
+    if not bc_V_list:
+        bc_V_list.append(zero_bc(V_space, exterior_facets))
+
+    return bc_A, bc_V_list, [[bc_A], bc_V_list]

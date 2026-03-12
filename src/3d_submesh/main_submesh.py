@@ -9,6 +9,8 @@ import basix.ufl
 import numpy as np
 import ufl
 from dolfinx import fem, io
+from dolfinx.io import VTXWriter
+from dolfinx.mesh import create_submesh
 from mpi4py import MPI
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
@@ -40,8 +42,15 @@ def main():
     t_start = time.perf_counter()
     config = make_config()
 
-    (mesh_parent, mesh_conductor, cell_tags_parent, cell_tags_conductor,
-     facet_tags_parent, entity_map) = load_mesh_and_extract_submesh(config.mesh_path)
+    (
+        mesh_parent,
+        mesh_conductor,
+        cell_tags_parent,
+        cell_tags_conductor,
+        facet_tags_parent,
+        entity_map,
+        coil_half_submesh,
+    ) = load_mesh_and_extract_submesh(config.mesh_path)
     rank0 = mesh_parent.comm.rank == 0
     if rank0:
         print("\n=== Setup ===")
@@ -77,31 +86,38 @@ def main():
         basix.ufl.element("Lagrange", mesh_conductor.basix_cell(), config.degree_V)
     )
     bc_V_list, v_drive_funcs = setup_boundary_conditions_submesh(
-        mesh_conductor, V_space, cell_tags_conductor, conducting(), config
+        mesh_conductor,
+        V_space,
+        cell_tags_conductor,
+        conducting(),
+        config,
+        coil_half_submesh=coil_half_submesh,
     )
     block_bcs = [[bc_A], bc_V_list]
 
     J_z, M_vec = setup_sources(mesh_parent)
     initialise_magnetisation(mesh_parent, cell_tags_parent, M_vec, config)
 
-    a_blocks, L_blocks, a_block_form = build_forms_submesh(
+    a_blocks, L_blocks, a_block_form, a00_spd_form = build_forms_submesh(
         mesh_parent, A_space, V_space,
         sigma, nu, J_z, M_vec, A_prev,
         dx_parent, dx_rs, dx_rpm, dx_c, dx_pm,
         config, entity_map, dx_cond_parent,
     )
 
-    mats, mat_nest = assemble_system_matrix_submesh(
+    mats, mat_nest, A00_spd = assemble_system_matrix_submesh(
         mesh_parent, a_blocks, block_bcs,
-        A_space, V_space, a_block_form,
+        A_space, V_space, a_block_form, a00_spd_form,
     )
 
     ksp = configure_solver_submesh(
-        mesh_parent, mat_nest, mats, A_space, V_space, config,
+        mesh_parent, mat_nest, mats, A_space, V_space, A00_spd, config,
+        cell_tags=cell_tags_parent, conductor_markers=conducting(),
     )
 
     writer = None
     A_lag = None
+    B_motor_writer = None
     if config.write_results:
         config.results_path.parent.mkdir(parents=True, exist_ok=True)
         if rank0:
@@ -113,6 +129,42 @@ def main():
         writer.write_mesh(mesh_parent)
         A_lag = fem.Function(fem.functionspace(mesh_parent, ("Lagrange", 1, (3,))), name="A")
 
+        # Also prepare a motor-only submesh writer for B, using the parent mesh.
+        # Motor := everything except air / airgap (tags 1,2,3).
+        motor_tags = [4, 5, 6, 7, 8] + list(range(13, 23))
+        tdim = mesh_parent.topology.dim
+        motor_cells = []
+        for tag in motor_tags:
+            cells = cell_tags_parent.find(tag)
+            if cells.size > 0:
+                motor_cells.append(cells)
+        if motor_cells:
+            target_cells = np.unique(np.concatenate(motor_cells)).astype(np.int32)
+            submesh, subdomain_motor_to_domain = create_submesh(
+                mesh_parent, tdim, target_cells
+            )[:2]
+            smsh_cell_imap = submesh.topology.index_map(tdim)
+            smsh_cells = np.arange(
+                smsh_cell_imap.size_local + smsh_cell_imap.num_ghosts, dtype=np.int32
+            )
+            parent_cells = subdomain_motor_to_domain.sub_topology_to_topology(
+                smsh_cells, inverse=False
+            )
+
+            deg = int(config.degree_A)
+            Submesh_vec_vis = fem.functionspace(
+                submesh,
+                ("Discontinuous Lagrange", deg, (submesh.geometry.dim,)),
+            )
+            B_motor = fem.Function(Submesh_vec_vis, name="B_motor")
+            B_motor_writer = {
+                "submesh": submesh,
+                "parent_cells": parent_cells,
+                "smsh_cells": smsh_cells,
+                "function": B_motor,
+                "writer": VTXWriter(mesh_parent.comm, "B_field_motor_submesh.bp", B_motor),
+            }
+
     if rank0:
         print("\n=== Solving ===")
     t = 0.0
@@ -121,7 +173,7 @@ def main():
         if rank0:
             print(f"\nStep {step+1}/{config.num_steps}: t={t*1e3:.3f} ms")
 
-        # Update 3-phase voltage BCs: V_pos = +V_amp·sin(ω_e·t + β), V_neg = -V_amp·sin(ω_e·t + β)
+        # Update single-phase voltage BCs: V_pos = +V_amp·sin(ω_e·t + β), V_neg = -V_amp·sin(ω_e·t + β)
         for phase in v_drive_funcs:
             v_val = float(config.V_amp) * np.sin(config.omega_e * t + phase["beta"])
             phase["pos"].x.array[:] = v_val
@@ -140,6 +192,24 @@ def main():
             mesh_parent, A_sol, B_space, B_magnitude_space
         )
 
+        # If requested, also write B restricted to the motor submesh (parent mesh).
+        if B_motor_writer is not None:
+            deg = int(config.degree_A)
+            vector_vis = fem.functionspace(
+                mesh_parent,
+                ("Discontinuous Lagrange", deg, (mesh_parent.geometry.dim,)),
+            )
+            curlA = ufl.curl(A_sol)
+            B_expr = fem.Expression(curlA, vector_vis.element.interpolation_points)
+            B_vis = fem.Function(vector_vis)
+            B_vis.interpolate(B_expr)
+
+            bw = B_motor_writer
+            bw["function"].interpolate(
+                B_vis, cells0=bw["parent_cells"], cells1=bw["smsh_cells"]
+            )
+            bw["writer"].write(t)
+
         if rank0:
             print(f"  Residual: {residual_norm:.6e}   ||b||: {rhs_norm:.6e}   Max |B|: {max_B:.4e} T")
 
@@ -153,6 +223,8 @@ def main():
 
     if writer is not None:
         writer.close()
+    if B_motor_writer is not None:
+        B_motor_writer["writer"].close()
 
     if rank0:
         print(f"\n=== Done ===  (time: {time.perf_counter() - t_start:.2f} s)")
