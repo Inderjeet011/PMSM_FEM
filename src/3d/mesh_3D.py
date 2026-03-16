@@ -240,7 +240,10 @@ def generate_PMSM_mesh(
 
     # Motor z-range (needed for retagging)
     xy_buffer_factor = 6.0  # ~6x stator radius
-    z_buffer_factor = 3.0   # ~3x motor depth above and below
+    # Shrink air-box height so its top/bottom align with the extruded coil ends:
+    # with z_buffer_factor = 1.0 and extension_height = depth,
+    # air_box_z_min = extension_z_bottom and air_box_z_max = extension_z_top.
+    z_buffer_factor = 1.0   # ~1x motor depth above and below (coils touch air-box in z)
     air_box_size_xy = 2.0 * xy_buffer_factor * r5
     air_box_size_z = depth * (1.0 + 2.0 * z_buffer_factor)
     air_box_z_min = 0.0
