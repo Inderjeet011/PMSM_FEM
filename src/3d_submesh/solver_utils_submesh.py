@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
 from load_mesh import MAGNETS
 sys.path.insert(0, str(Path(__file__).parent))
 from load_mesh_submesh import COIL_DRIVE
+from entity_map_utils import get_entity_map
 
 
 def make_config():
@@ -21,7 +22,7 @@ def make_config():
 
     freq = float(model_parameters["freq"])
     pole_pairs = 5
-    steps_per_period = 10
+    steps_per_period = 10  # fewer steps → larger dt → smaller inv_dt, helps convergence with coupling 1.0
     dt = (1.0 / freq) / steps_per_period
     omega_e = 2.0 * np.pi * freq
     rotation_direction = -1.0
@@ -30,7 +31,7 @@ def make_config():
     root = Path(__file__).parents[2]
     return SimpleNamespace(
         dt=dt,
-        num_steps=1,  # ~1 electrical period; rotor rotates ~72° for visible animation
+        num_steps=20,  # ~1 electrical period; rotor rotates ~72° for visible animation
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),
@@ -42,13 +43,13 @@ def make_config():
         results_path=root / "results" / "3d_submesh" / "av_solver_submesh.xdmf",
         write_results=True,
         outer_max_it=500,
-        outer_atol=9e3,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
+        outer_atol=9e-5,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
         ksp_A_max_it=15,
         ksp_A_restart=35,
         ksp_A_rtol=2e-5,
-        A_pc="boomeramg",  # options: "boomeramg", "gamg", "ilu"
+        A_pc="boomeramg",  # options: "boomeramg", "gamg"
         # Restore applied coil voltage for field visualization
-        V_amp=100.0,  # [V] peak voltage applied to drive coil: V(t) = V_amp * sin(omega_e * t)
+        V_amp=10,  # [V] peak voltage applied to drive coil: V(t) = V_amp * sin(omega_e * t)
     )
 
 
@@ -146,6 +147,78 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space):
 
     max_B = float(B_dg_mag.max()) if B_dg_mag.size else 0.0
     return B_sol, B_mag, B_dg, max_B
+
+
+def compute_J_field_conductor(
+    mesh_parent,
+    mesh_conductor,
+    entity_map,
+    A_sol,
+    A_prev,
+    V_sol,
+    sigma_parent,
+    dt,
+    degree=1,
+):
+    """Compute current density J = sigma*E on conductor submesh, with E = -grad(V) - dA/dt."""
+    tdim = mesh_parent.topology.dim
+    n_conductor_cells = mesh_conductor.topology.index_map(tdim).size_local + mesh_conductor.topology.index_map(tdim).num_ghosts
+    parent_cells = get_entity_map(entity_map, inverse=False)
+    conductor_cells = np.arange(n_conductor_cells, dtype=np.int32)
+
+    # DG0 vector spaces
+    DG0_vec_parent = fem.functionspace(mesh_parent, ("DG", 0, (mesh_parent.geometry.dim,)))
+    DG0_vec_conductor = fem.functionspace(mesh_conductor, ("DG", 0, (mesh_conductor.geometry.dim,)))
+    DG0_conductor = fem.functionspace(mesh_conductor, ("DG", 0))
+
+    # A and A_prev on parent as DG0 vector (for cell-wise copy to conductor)
+    A_vis = fem.Function(DG0_vec_parent, name="A_vis")
+    A_prev_vis = fem.Function(DG0_vec_parent, name="A_prev_vis")
+    A_vis.interpolate(fem.Expression(A_sol, DG0_vec_parent.element.interpolation_points))
+    A_prev_vis.interpolate(fem.Expression(A_prev, DG0_vec_parent.element.interpolation_points))
+    A_vis.x.scatter_forward()
+    A_prev_vis.x.scatter_forward()
+
+    A_conductor = fem.Function(DG0_vec_conductor, name="A_cond")
+    A_prev_conductor = fem.Function(DG0_vec_conductor, name="A_prev_cond")
+    A_conductor.interpolate(A_vis, cells0=parent_cells, cells1=conductor_cells)
+    A_prev_conductor.interpolate(A_prev_vis, cells0=parent_cells, cells1=conductor_cells)
+    A_conductor.x.scatter_forward()
+    A_prev_conductor.x.scatter_forward()
+
+    # dA/dt on conductor
+    inv_dt = 1.0 / max(dt, 1e-30)
+    dA_dt = fem.Function(DG0_vec_conductor, name="dA_dt")
+    dA_dt.x.array[:] = (A_conductor.x.array - A_prev_conductor.x.array) * inv_dt
+    dA_dt.x.scatter_forward()
+
+    # -grad(V) on conductor
+    grad_V = fem.Function(DG0_vec_conductor, name="grad_V")
+    grad_V_expr = ufl.grad(V_sol)
+    grad_V.interpolate(fem.Expression(grad_V_expr, DG0_vec_conductor.element.interpolation_points))
+    grad_V.x.scatter_forward()
+
+    # E = -grad(V) - dA/dt
+    E_conductor = fem.Function(DG0_vec_conductor, name="E")
+    E_conductor.x.array[:] = -grad_V.x.array - dA_dt.x.array
+    E_conductor.x.scatter_forward()
+
+    # sigma on conductor from parent (cell-wise copy via entity map)
+    sigma_conductor = fem.Function(DG0_conductor, name="sigma_cond")
+    for c in range(min(n_conductor_cells, parent_cells.size)):
+        pc = int(parent_cells[c])
+        if 0 <= pc < sigma_parent.x.array.size:
+            sigma_conductor.x.array[c] = sigma_parent.x.array[pc]
+    sigma_conductor.x.scatter_forward()
+
+    # J = sigma * E
+    J_conductor = fem.Function(DG0_vec_conductor, name="J")
+    sig = sigma_conductor.x.array
+    E_arr = E_conductor.x.array.reshape((-1, 3))
+    J_conductor.x.array[:] = (sig[:, np.newaxis] * E_arr).ravel()
+    J_conductor.x.scatter_forward()
+
+    return J_conductor
 
 
 def assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space):

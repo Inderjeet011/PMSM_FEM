@@ -46,7 +46,7 @@ def make_config():
         results_path=root / "results" / "3d" / "av_solver.xdmf",
         write_results=True,
         # PETSc iteration limits: bump these if you see non-convergence
-        outer_max_it=100,
+        outer_max_it=20,
         ksp_A_max_it=5,
         # Regularization on the actual A00 block (adds epsilon * (A,v) over all domains)
         # Start small; increase if you see stagnation.

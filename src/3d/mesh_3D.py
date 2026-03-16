@@ -21,8 +21,8 @@ model_parameters = {
     "freq": 60,  # Hz
     "J": 3.1e6 * np.sqrt(2),  # [A/m^2]
     "mu_r": {
-        # Restore original, physical-ish relative permeabilities
-        "Cu": 1,
+        # Relative permeabilities
+        "Cu": 1,   # copper ~ non-magnetic
         "Stator": 30,
         "Rotor": 30,
         "Al": 1,
@@ -665,7 +665,7 @@ def generate_PMSM_mesh(
         if cu_point_tags:
             gmsh.model.mesh.setSize([(0, p) for p in cu_point_tags], float(res))
 
-        # Distance‑based background field: fine near motor, coarser far away.
+        # Distance-based coarsening: Lc from motor center (PointsList); fine near motor, coarser far away.
         res_base = float(res)
         lc_min = res_base
         lc_max = float(lc_max_ratio) * res_base
@@ -679,16 +679,10 @@ def generate_PMSM_mesh(
             pass
 
         gmsh.model.mesh.field.add("Distance", 1)
-        # Refine along center line and copper slot edges
-        copper_edges: list[int] = []
-        for s in copper_surfaces:
-            try:
-                for e_dim, e_tag in gmsh.model.getBoundary([(2, s)], oriented=False):
-                    if e_dim == 1:
-                        copper_edges.append(e_tag)
-            except Exception:
-                continue
-        gmsh.model.mesh.field.setNumbers(1, "EdgesList", [cline] + copper_edges)
+        # Distance-based coarsening: size by 3D distance from motor center
+        motor_center_pt = gmsh.model.occ.addPoint(0.0, 0.0, motor_center_z)
+        gmsh.model.occ.synchronize()
+        gmsh.model.mesh.field.setNumbers(1, "PointsList", [motor_center_pt])
 
         gmsh.model.mesh.field.add("Threshold", 2)
         gmsh.model.mesh.field.setNumber(2, "IField", 1)
