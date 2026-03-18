@@ -211,7 +211,7 @@ def main():
             J_z, M_vec, A_prev, t,
         )
 
-        B_sol, B_mag, B_dg, max_B = compute_B_field(
+        B_sol, B_mag, B_dg, max_B, avg_B = compute_B_field(
             mesh_parent, A_sol, B_space, B_magnitude_space
         )
 
@@ -255,7 +255,10 @@ def main():
             J_bp_writer.write(t)
 
         if rank0:
-            print(f"  Residual: {residual_norm:.6e}   ||b||: {rhs_norm:.6e}   Max |B|: {max_B:.4e} T")
+            print(
+                f"  Residual: {residual_norm:.6e}   ||b||: {rhs_norm:.6e}   "
+                f"Max |B|: {max_B:.4e} T   Avg |B|: {avg_B:.4e} T"
+            )
 
         if writer is not None:
             A_lag.interpolate(A_sol)

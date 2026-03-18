@@ -153,9 +153,9 @@ def setup_boundary_conditions_submesh(
         Phase A: 7 and 10   (β_A = 0)
         Phase B: 8 and 11   (β_B = 2π/3)
         Phase C: 9 and 12   (β_C = 4π/3)
-    - For each coil in a phase:
-        * LOWER half of the rod: V = V_amp * sin(ω_e t + β_phase)
-        * UPPER half of the rod: V = 0   (neutral)
+    - For each coil in a phase (bar-conductor terminals):
+        * One axial end face (z ≈ z_min): V = V_amp * sin(ω_e t + β_phase)
+        * The opposite axial end face (z ≈ z_max): V = 0   (neutral)
     - Rotor/magnets get a single DOF pinned to 0 for gauge fixing.
 
     The function returns:
@@ -167,59 +167,59 @@ def setup_boundary_conditions_submesh(
     u0 = fem.Function(V_space)
     u0.x.array[:] = 0.0
 
-    def half_dofs_for_marker(marker: int, which: str) -> np.ndarray:
+    def terminal_facets_for_coil(marker: int):
         """
-        Return DOFs in the LOWER or UPPER half of the straight coil leg
-        for this marker, using only the conductor submesh geometry and
-        cell tags.
+        Find the two axial end-face facet sets for a given coil marker.
 
-        Strategy:
-          1. Find all submesh cells with this coil marker (7 or 8).
-          2. Compute each cell's center z-coordinate.
-          3. Define z_mid = 0.5 * (z_min + z_max) for that coil.
-          4. For 'lower': cells with center z <= z_mid (+tol).
-             For 'upper': cells with center z >= z_mid (-tol).
-          5. Collect all V-space DOFs on those cells.
+        We restrict to *boundary facets* of the coil region and pick facets
+        near the minimum and maximum facet-midpoint z. This avoids clamping
+        an entire half-volume and produces a smooth end-to-end potential
+        gradient like a copper-rod test.
         """
         tdim = mesh_conductor.topology.dim
+        fdim = tdim - 1
         cells = cell_tags_conductor.find(marker)
         if cells.size == 0:
-            return np.array([], dtype=np.int32)
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
 
-        # Cell centers for these coil cells
-        mesh_conductor.topology.create_connectivity(tdim, 0)
-        c2v = mesh_conductor.topology.connectivity(tdim, 0)
+        # Ensure needed connectivity.
+        mesh_conductor.topology.create_connectivity(tdim, fdim)
+        mesh_conductor.topology.create_connectivity(fdim, tdim)
+        mesh_conductor.topology.create_connectivity(fdim, 0)
+
+        c2f = mesh_conductor.topology.connectivity(tdim, fdim)
+        f2c = mesh_conductor.topology.connectivity(fdim, tdim)
+        f2v = mesh_conductor.topology.connectivity(fdim, 0)
         coords = mesh_conductor.geometry.x
 
-        z_centers = []
+        # Boundary facets that belong to this coil region
+        boundary_facets = []
         for c in cells:
-            verts = c2v.links(int(c))
+            for f in c2f.links(int(c)):
+                # A boundary facet has only one adjacent cell.
+                if len(f2c.links(int(f))) == 1:
+                    boundary_facets.append(int(f))
+        if not boundary_facets:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+        boundary_facets = np.unique(np.asarray(boundary_facets, dtype=np.int32))
+
+        # Facet midpoint z
+        z_mid = np.empty(boundary_facets.size, dtype=np.float64)
+        for i, f in enumerate(boundary_facets):
+            verts = f2v.links(int(f))
             if verts.size == 0:
-                continue
-            z_centers.append(float(coords[verts, 2].mean()))
-        if not z_centers:
-            return np.array([], dtype=np.int32)
-
-        z_min = min(z_centers)
-        z_max = max(z_centers)
-        z_mid = 0.5 * (z_min + z_max)
-        tol_z = 1e-8 * max(abs(z_max - z_min), 1.0)
-
-        # Collect DOFs for cells in lower half (center z <= z_mid + tol)
-        dm = V_space.dofmap
-        dof_set = set()
-        for c, zc in zip(cells, z_centers):
-            if which == "lower":
-                cond = (zc <= z_mid + tol_z)
+                z_mid[i] = 0.0
             else:
-                cond = (zc >= z_mid - tol_z)
-            if cond:
-                for d in dm.cell_dofs(int(c)):
-                    dof_set.add(int(d))
+                z_mid[i] = float(coords[verts, 2].mean())
 
-        if not dof_set:
-            return np.array([], dtype=np.int32)
-        return np.unique(np.fromiter(dof_set, dtype=np.int32))
+        zmin = float(z_mid.min())
+        zmax = float(z_mid.max())
+        zspan = max(abs(zmax - zmin), 1.0)
+        tol_z = 1e-6 * zspan
+
+        facets_min = boundary_facets[z_mid <= (zmin + tol_z)]
+        facets_max = boundary_facets[z_mid >= (zmax - tol_z)]
+        return facets_min.astype(np.int32), facets_max.astype(np.int32)
 
     bcs = []
     v_drive_funcs = []
@@ -242,13 +242,15 @@ def setup_boundary_conditions_submesh(
         V_phase.x.array[:] = 0.0
 
         for marker in phase["coils"]:
-            dofs_lower = half_dofs_for_marker(marker, "lower")
-            dofs_upper = half_dofs_for_marker(marker, "upper")
-
-            if dofs_lower.size > 0:
-                bcs.append(fem.dirichletbc(V_phase, dofs_lower))
-            if dofs_upper.size > 0:
-                bcs.append(fem.dirichletbc(V_neutral, dofs_upper))
+            facets_drive, facets_neutral = terminal_facets_for_coil(marker)
+            if facets_drive.size > 0:
+                dofs_drive = fem.locate_dofs_topological(V_space, mesh_conductor.topology.dim - 1, facets_drive)
+                if dofs_drive.size > 0:
+                    bcs.append(fem.dirichletbc(V_phase, dofs_drive))
+            if facets_neutral.size > 0:
+                dofs_neutral = fem.locate_dofs_topological(V_space, mesh_conductor.topology.dim - 1, facets_neutral)
+                if dofs_neutral.size > 0:
+                    bcs.append(fem.dirichletbc(V_neutral, dofs_neutral))
 
             driven_markers.add(marker)
 

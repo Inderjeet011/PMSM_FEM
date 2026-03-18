@@ -240,10 +240,13 @@ def generate_PMSM_mesh(
 
     # Motor z-range (needed for retagging)
     xy_buffer_factor = 6.0  # ~6x stator radius
-    # Shrink air-box height so its top/bottom align with the extruded coil ends:
-    # with z_buffer_factor = 1.0 and extension_height = depth,
-    # air_box_z_min = extension_z_bottom and air_box_z_max = extension_z_top.
-    z_buffer_factor = 1.0   # ~1x motor depth above and below (coils touch air-box in z)
+    # Restore taller air-box and choose coil extension so rods just touch the air-box:
+    # with air_box_z_min = 0, air_box_size_z = depth * (1 + 2*z_buffer_factor),
+    # motor_z_start = depth * z_buffer_factor, motor_z_end = depth * (z_buffer_factor + 1).
+    # Setting extension_height = depth * z_buffer_factor then gives
+    #   extension_z_bottom = air_box_z_min
+    #   extension_z_top    = air_box_z_max
+    z_buffer_factor = 3.0   # keep tall air box in z
     air_box_size_xy = 2.0 * xy_buffer_factor * r5
     air_box_size_z = depth * (1.0 + 2.0 * z_buffer_factor)
     air_box_z_min = 0.0
@@ -252,11 +255,9 @@ def generate_PMSM_mesh(
     shift_z = motor_center_z - depth / 2.0
     motor_z_start = shift_z
     motor_z_end = shift_z + depth
-    # Increase copper rod height: previous total length was
-    # depth + 2 * (0.5*depth) = 2*depth.
-    # Set extension_height = depth → total length = depth + 2*depth = 3*depth
-    # (i.e. 1.5× the previous rod length).
-    extension_height = 1.0 * depth
+    # Choose extension so coil ends just touch the air-box in z:
+    # extension_height = depth * z_buffer_factor → rods reach exactly from air_box_z_min to air_box_z_max.
+    extension_height = z_buffer_factor * depth
     cap_height = min(0.35 * extension_height, 0.5 * coil_radial_width)
     extension_z_bottom = motor_z_start - extension_height
     extension_z_top = motor_z_end + extension_height

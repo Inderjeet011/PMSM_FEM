@@ -43,7 +43,7 @@ def make_config():
         results_path=root / "results" / "3d_submesh" / "av_solver_submesh.xdmf",
         write_results=True,
         outer_max_it=500,
-        outer_atol=9e-5,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
+        outer_atol=9e-3,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
         ksp_A_max_it=15,
         ksp_A_restart=35,
         ksp_A_rtol=2e-5,
@@ -123,7 +123,7 @@ def update_currents(J_z, mesh_parent, cell_tags_parent, config, t):
 
 
 def compute_B_field(mesh, A_sol, B_space, B_magnitude_space):
-    """Compute B field from A (on parent mesh)."""
+    """Compute B field from A (on parent mesh) and basic statistics."""
     curlA = ufl.curl(A_sol)
     DG_vec = fem.functionspace(mesh, ("DG", 0, (3,)))
     B_dg = fem.Function(DG_vec, name="B_dg")
@@ -146,7 +146,8 @@ def compute_B_field(mesh, A_sol, B_space, B_magnitude_space):
     B_mag.x.scatter_forward()
 
     max_B = float(B_dg_mag.max()) if B_dg_mag.size else 0.0
-    return B_sol, B_mag, B_dg, max_B
+    avg_B = float(B_dg_mag.mean()) if B_dg_mag.size else 0.0
+    return B_sol, B_mag, B_dg, max_B, avg_B
 
 
 def compute_J_field_conductor(
