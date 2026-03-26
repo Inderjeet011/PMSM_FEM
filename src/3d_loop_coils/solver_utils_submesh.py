@@ -28,7 +28,7 @@ def make_config():
     rotation_direction = -1.0
     omega_m = rotation_direction * (omega_e / max(pole_pairs, 1))
 
-    submesh_dir = Path(__file__).parent.resolve()
+    loop_dir = Path(__file__).parent.resolve()
     return SimpleNamespace(
         dt=dt,
         num_steps=1,  # short transient for visualization and current decomposition
@@ -39,8 +39,8 @@ def make_config():
         magnet_remanence=1.2,
         omega_e=omega_e,
         omega_m=omega_m,
-        mesh_path=submesh_dir / "pmesh3D_ipm.xdmf",
-        results_path=submesh_dir / "av_solver_submesh.xdmf",
+        mesh_path=loop_dir / "pmesh3D_ipm.xdmf",
+        results_path=loop_dir / "av_solver_submesh.xdmf",
         write_results=True,
         outer_max_it=500,
         outer_atol=9e-1,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
@@ -48,8 +48,11 @@ def make_config():
         ksp_A_restart=35,
         ksp_A_rtol=2e-5,
         A_pc="boomeramg",  # options: "boomeramg", "gamg"
+        use_cut_face_terminals=True,
+        cut_plane_axis="z",
+        terminal_pad_fraction=1,
         # Restore applied coil voltage for field visualization
-        V_amp=10,  # [V] peak voltage applied to drive coil terminals
+        V_amp=500,  # [V] peak voltage applied to drive coil terminals
     )
 
 
@@ -159,9 +162,18 @@ def compute_J_field_conductor(
     V_sol,
     sigma_parent,
     dt,
+    cell_tags_conductor=None,
+    active_markers=None,
+    component="total",
     degree=1,
 ):
-    """Compute current density J = sigma*E on conductor submesh, with E = -grad(V) - dA/dt."""
+    """Compute current density components on conductor submesh.
+
+    component:
+      - "total": sigma * (-grad(V) - dA/dt)
+      - "gradV": sigma * (-grad(V))
+      - "dA_dt": sigma * (-dA/dt)
+    """
     tdim = mesh_parent.topology.dim
     n_conductor_cells = mesh_conductor.topology.index_map(tdim).size_local + mesh_conductor.topology.index_map(tdim).num_ghosts
     parent_cells = get_entity_map(entity_map, inverse=False)
@@ -199,11 +211,6 @@ def compute_J_field_conductor(
     grad_V.interpolate(fem.Expression(grad_V_expr, DG0_vec_conductor.element.interpolation_points))
     grad_V.x.scatter_forward()
 
-    # E = -grad(V) - dA/dt
-    E_conductor = fem.Function(DG0_vec_conductor, name="E")
-    E_conductor.x.array[:] = -grad_V.x.array - dA_dt.x.array
-    E_conductor.x.scatter_forward()
-
     # sigma on conductor from parent (cell-wise copy via entity map)
     sigma_conductor = fem.Function(DG0_conductor, name="sigma_cond")
     for c in range(min(n_conductor_cells, parent_cells.size)):
@@ -212,11 +219,36 @@ def compute_J_field_conductor(
             sigma_conductor.x.array[c] = sigma_parent.x.array[pc]
     sigma_conductor.x.scatter_forward()
 
+    # Select the requested electric-field contribution.
+    E_arr = np.zeros((n_conductor_cells, mesh_conductor.geometry.dim), dtype=np.float64)
+    grad_V_arr = grad_V.x.array.reshape((-1, mesh_conductor.geometry.dim))
+    dA_dt_arr = dA_dt.x.array.reshape((-1, mesh_conductor.geometry.dim))
+    if component == "total":
+        E_arr[:, :] = -grad_V_arr - dA_dt_arr
+    elif component == "gradV":
+        E_arr[:, :] = -grad_V_arr
+    elif component == "dA_dt":
+        E_arr[:, :] = -dA_dt_arr
+    else:
+        raise ValueError(f"Unknown J component '{component}'")
+
     # J = sigma * E
     J_conductor = fem.Function(DG0_vec_conductor, name="J")
     sig = sigma_conductor.x.array
-    E_arr = E_conductor.x.array.reshape((-1, 3))
     J_conductor.x.array[:] = (sig[:, np.newaxis] * E_arr).ravel()
+
+    if cell_tags_conductor is not None and active_markers is not None:
+        keep_cells = np.array([], dtype=np.int32)
+        for marker in active_markers:
+            cells = cell_tags_conductor.find(int(marker))
+            if cells.size > 0:
+                keep_cells = np.concatenate([keep_cells, cells.astype(np.int32)])
+        keep_cells = np.unique(keep_cells)
+        keep_mask = np.zeros(n_conductor_cells, dtype=bool)
+        keep_mask[keep_cells] = True
+        J_arr = J_conductor.x.array.reshape((-1, mesh_conductor.geometry.dim))
+        J_arr[~keep_mask, :] = 0.0
+
     J_conductor.x.scatter_forward()
 
     return J_conductor

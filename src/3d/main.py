@@ -7,6 +7,8 @@ Run:
   python main.py
 """
 
+from pathlib import Path
+
 import basix.ufl
 from dolfinx import fem, io
 from dolfinx.io import VTXWriter
@@ -200,7 +202,7 @@ def main():
                 "parent_cells": parent_cells,
                 "smsh_cells": smsh_cells,
                 "function": B_motor,
-                "writer": VTXWriter(mesh.comm, "B_field_motor.bp", B_motor),
+                "writer": VTXWriter(mesh.comm, str(Path(__file__).parent.resolve() / "B_field_motor.bp"), B_motor),
             }
 
     # Time loop

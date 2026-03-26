@@ -30,7 +30,7 @@ def make_config():
     rotation_direction = -1.0
     omega_m = rotation_direction * (omega_e / max(pole_pairs, 1))
 
-    root = Path(__file__).parents[2]
+    work_dir = Path(__file__).parent.resolve()
     return SimpleNamespace(
         dt=dt,
         # Run a few electrical periods by default (helps reach periodic behavior).
@@ -42,8 +42,8 @@ def make_config():
         magnet_remanence=1.2,
         omega_e=omega_e,
         omega_m=omega_m,
-        mesh_path=root / "meshes" / "3d" / "pmesh3D_ipm.xdmf",
-        results_path=root / "results" / "3d" / "av_solver.xdmf",
+        mesh_path=work_dir / "pmesh3D_ipm.xdmf",
+        results_path=work_dir / "av_solver.xdmf",
         write_results=True,
         # PETSc iteration limits: bump these if you see non-convergence
         outer_max_it=20,
