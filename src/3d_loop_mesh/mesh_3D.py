@@ -62,7 +62,7 @@ surface_map: Dict[str, Union[int, str]] = {
 
 # Use the full motor, but expose coil-leg terminals by cutting only below the
 # motor stack after extending the coils beyond the stack in +/-z.
-SLICE_HALF_MOTOR = False
+SLICE_HALF_MOTOR = True
 SLICE_HALF_MODE = "axial"
 
 # Volume markers (3D physical groups)
@@ -89,7 +89,7 @@ _currents_three: Dict[int, Dict[str, float]] = {
 mesh_parameters: Dict[str, float] = {
     "r1": 0.017,  # shaft
     "r2": 0.04,
-    "r3": 0.042,  # rotor outer
+    "r3": 0.047,  # rotor outer (closer to coils)
     "r4": 0.062,  # stator inner
     # Slightly slimmer stator: reduce outer radius from 0.075 -> 0.070 (8 mm thickness)
     "r5": 0.070,  # stator outer
@@ -424,7 +424,7 @@ def generate_PMSM_mesh(
         # inside the slot-air annulus and span the motor stack in z.
         coil_ring_radius = 0.5 * (r_gap + r4)
         coil_section_radius = 0.0065
-        coil_straight_width = 0.010
+        coil_straight_width = 0.013
         # Fill more of the slot-air annulus while preserving clearance to both
         # rotor and stator.
         coil_radial_thickness = 0.01
@@ -568,8 +568,11 @@ def generate_PMSM_mesh(
         volumes, _ = gmsh.model.occ.fragment([(3, air_box)], motor_volumes)
         gmsh.model.occ.synchronize()
 
-        if (not SLICE_HALF_MOTOR) and (SLICE_HALF_MODE == "axial"):
-            z_cut = float(motor_z_start - coil_lower_cut_offset)
+        if SLICE_HALF_MODE == "axial":
+            if SLICE_HALF_MOTOR:
+                z_cut = float(shift_z + 0.5 * depth)
+            else:
+                z_cut = float(motor_z_start - coil_lower_cut_offset)
             low_cut_box = gmsh.model.occ.addBox(
                 air_box_x_min,
                 air_box_y_min,
@@ -595,6 +598,10 @@ def generate_PMSM_mesh(
             volumes = [(d, t) for d, t in gmsh.model.getEntities(3) if d == 3]
         else:
             z_cut = None
+
+        if SLICE_HALF_MOTOR and (SLICE_HALF_MODE == "axial") and (z_cut is not None):
+            z_probe = float(z_cut + 0.35 * max(motor_z_end - z_cut, 1e-9))
+            coil_probes = [(float(x), float(y), z_probe) for (x, y, _z) in coil_probes]
         
         # Debug: print total volumes
         num_volumes = sum(1 for dim, tag in volumes if dim == 3)

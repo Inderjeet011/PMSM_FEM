@@ -151,7 +151,7 @@ def setup_boundary_conditions_submesh(
     config,
     coil_half_submesh=None,  # kept for API compatibility, not used now
 ):
-    """Return voltage BCs applied only on tagged coil terminal facets."""
+    """Return voltage BCs using one representative DOF per exposed leg."""
     u0 = fem.Function(V_space)
     u0.x.array[:] = 0.0
 
@@ -314,6 +314,23 @@ def setup_boundary_conditions_submesh(
         facets_max = boundary_facets[z_mid >= (zmax - tol_z)]
         return facets_min.astype(np.int32), facets_max.astype(np.int32)
 
+    def _representative_leg_dof(marker: int, leg_facets: np.ndarray) -> np.ndarray:
+        if leg_facets.size == 0:
+            return np.array([], dtype=np.int32)
+        tdim = mesh_conductor.topology.dim
+        fdim = tdim - 1
+        mesh_conductor.topology.create_connectivity(fdim, tdim)
+        f2c = mesh_conductor.topology.connectivity(fdim, tdim)
+        coil_cells = set(int(c) for c in cell_tags_conductor.find(marker))
+        for f in leg_facets:
+            for c in f2c.links(int(f)):
+                ci = int(c)
+                if ci in coil_cells:
+                    dofs = V_space.dofmap.cell_dofs(ci)
+                    if dofs.size > 0:
+                        return np.array([int(dofs[0])], dtype=np.int32)
+        return np.array([], dtype=np.int32)
+
     from dolfinx.mesh import meshtags  # type: ignore
 
     tdim = mesh_conductor.topology.dim
@@ -379,14 +396,12 @@ def setup_boundary_conditions_submesh(
             drive_tag, neutral_tag = TERMINAL_FACET_TAGS[marker]
             facets_drive = terminal_mt.find(drive_tag)
             facets_neutral = terminal_mt.find(neutral_tag)
-            if facets_drive.size > 0:
-                dofs_drive = fem.locate_dofs_topological(V_space, mesh_conductor.topology.dim - 1, facets_drive)
-                if dofs_drive.size > 0:
-                    bcs.append(fem.dirichletbc(V_phase, dofs_drive))
-            if facets_neutral.size > 0:
-                dofs_neutral = fem.locate_dofs_topological(V_space, mesh_conductor.topology.dim - 1, facets_neutral)
-                if dofs_neutral.size > 0:
-                    bcs.append(fem.dirichletbc(V_neutral, dofs_neutral))
+            dofs_drive = _representative_leg_dof(marker, facets_drive)
+            dofs_neutral = _representative_leg_dof(marker, facets_neutral)
+            if dofs_drive.size > 0:
+                bcs.append(fem.dirichletbc(V_phase, dofs_drive))
+            if dofs_neutral.size > 0:
+                bcs.append(fem.dirichletbc(V_neutral, dofs_neutral))
 
             driven_markers.add(marker)
 

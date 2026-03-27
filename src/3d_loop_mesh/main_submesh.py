@@ -18,7 +18,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
 from load_mesh import omega_rs, omega_rpm, omega_c, omega_pm
 
 from load_mesh_submesh import (
-    COILS,
     conducting,
     load_mesh_and_extract_submesh,
     setup_boundary_conditions_parent,
@@ -273,8 +272,6 @@ def main():
                 V_sol,
                 sigma,
                 config.dt,
-                cell_tags_conductor=cell_tags_conductor,
-                active_markers=COILS,
                 component="total",
                 degree=config.degree_A,
             )
@@ -287,8 +284,6 @@ def main():
                 V_sol,
                 sigma,
                 config.dt,
-                cell_tags_conductor=cell_tags_conductor,
-                active_markers=COILS,
                 component="gradV",
                 degree=config.degree_A,
             )
@@ -301,8 +296,6 @@ def main():
                 V_sol,
                 sigma,
                 config.dt,
-                cell_tags_conductor=cell_tags_conductor,
-                active_markers=COILS,
                 component="dA_dt",
                 degree=config.degree_A,
             )
