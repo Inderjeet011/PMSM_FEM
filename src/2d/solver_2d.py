@@ -37,12 +37,12 @@ from pathlib import Path
 class SimulationConfig:
     """Simulation configuration parameters"""
     def __init__(self, 
-                 pole_pairs=2,
+                 pole_pairs=5,
                  frequency=50,
                  J_peak=7.07e6,
                  B_rem=1.4,
                  T_end=0.010,
-                 num_steps=10,
+                 num_steps=20,
                  dt=None,
                  polynomial_degree=1,
                  omega_m=None,
@@ -50,7 +50,7 @@ class SimulationConfig:
                  write_every_timestep=True):
         # Motor geometry
         self.pole_pairs = pole_pairs
-        self.n_poles = 8  # 2 * pole_pairs * 2 (N-S alternating)
+        self.n_poles = 2 * pole_pairs
         
         # Electrical parameters
         self.frequency = frequency  # Hz (set 0 for static PM validation)
@@ -960,6 +960,6 @@ class MaxwellSolver2D:
 # ============================================================================
 
 if __name__ == "__main__":
-    default_mesh = (Path(__file__).resolve().parents[2] / "meshes" / "2d" / "motor.msh")
+    default_mesh = Path(__file__).resolve().parent / "motor.msh"
     solver = MaxwellSolver2D(mesh_file=str(default_mesh))
     solver.run()

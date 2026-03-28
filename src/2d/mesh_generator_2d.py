@@ -31,25 +31,25 @@ class MotorGeometry:
     """Geometric parameters for PM motor"""
     # Radial dimensions (in meters)
     r_shaft = 0.001          # Shaft radius: 1 mm
-    r_pm_in = 0.030          # PM inner radius: 30 mm
-    r_pm_out = 0.036         # PM outer radius: 36 mm (embedded PM thickness = 6 mm)
+    r_pm_in = 0.034          # PM inner radius: thin magnets near rotor surface
+    r_pm_out = 0.036         # PM outer radius
     r_rotor = 0.038          # Rotor outer steel radius: 38 mm
     r_airgap_mid = 0.0385    # Air gap middle: 38.5 mm (split point)
     r_airgap_out = 0.039     # Air gap outer: 39 mm (1 mm total gap)
     r_stator_in = r_airgap_out
-    r_coil_out = 0.050       # Coil depth: 50 mm
+    r_coil_in = 0.0395       # Coils start just outside the air gap
     r_stator_out = 0.057     # Stator outer: 57 mm
     r_outer_air = 0.090      # Outer air boundary: 90 mm
     
     # Magnet configuration
-    pole_pairs = 4
-    n_magnets = 2 * pole_pairs  # 8 magnets
-    magnet_coverage = 0.8        # 80% coverage per pole
+    pole_pairs = 5
+    n_magnets = 2 * pole_pairs  # 10 magnets
+    magnet_coverage = 0.72       # Wider PM arcs to reduce inter-magnet gaps
     
     # Coil configuration
     n_coils = 6
-    coil_angles_deg = [i * 60 for i in range(n_coils)]  # 0°, 60°, 120°, 180°, 240°, 300°
-    coil_half_angle_deg = 7.5  # ±7.5° = 15° slot width
+    coil_angles_deg = [30 + i * 60 for i in range(n_coils)]  # 30°, 90°, ... matches reference
+    coil_half_angle_deg = 15.0  # ±15° = 30° coil sectors
     
     # Mesh resolution
     mesh_resolution = 0.002  # 2.0 mm base resolution
@@ -103,6 +103,7 @@ class PMMotorMeshGenerator:
         print(f"   Air gap:       {self.geom.r_rotor*1000:.1f} - {self.geom.r_airgap_out*1000:.1f} mm")
         print(f"     (split at {self.geom.r_airgap_mid*1000:.1f} mm)")
         print(f"   Stator:        {self.geom.r_stator_in*1000:.1f} - {self.geom.r_stator_out*1000:.1f} mm")
+        print(f"   Coil sectors:  {self.geom.r_coil_in*1000:.1f} - {self.geom.r_stator_out*1000:.1f} mm")
         print(f"   Magnets:       {self.geom.n_magnets} (N-S alternating)")
         print(f"   Coils:         {self.geom.n_coils} slots")
         print(f"   Mesh res:      {self.geom.mesh_resolution*1000:.2f} mm")
@@ -122,7 +123,6 @@ class PMMotorMeshGenerator:
         circles = {
             'outer_air': gmsh.model.occ.addCircle(0, 0, 0, g.r_outer_air),
             'stator': gmsh.model.occ.addCircle(0, 0, 0, g.r_stator_out),
-            'coil': gmsh.model.occ.addCircle(0, 0, 0, g.r_coil_out),
             'airgap_out': gmsh.model.occ.addCircle(0, 0, 0, g.r_airgap_out),
             'airgap_mid': gmsh.model.occ.addCircle(0, 0, 0, g.r_airgap_mid),
             'pm_out': gmsh.model.occ.addCircle(0, 0, 0, g.r_pm_out),
@@ -137,8 +137,7 @@ class PMMotorMeshGenerator:
         # Create ring surfaces
         rings = {
             'outer_air': gmsh.model.occ.addPlaneSurface([loops['outer_air'], loops['stator']]),
-            'stator': gmsh.model.occ.addPlaneSurface([loops['stator'], loops['coil']]),
-            'coil_region': gmsh.model.occ.addPlaneSurface([loops['coil'], loops['airgap_out']]),
+            'stator': gmsh.model.occ.addPlaneSurface([loops['stator'], loops['airgap_out']]),
             'airgap_outer': gmsh.model.occ.addPlaneSurface([loops['airgap_out'], loops['airgap_mid']]),
             'airgap_inner': gmsh.model.occ.addPlaneSurface([loops['airgap_mid'], loops['rotor']]),
             'rotor': gmsh.model.occ.addPlaneSurface([loops['rotor'], loops['shaft']]),
@@ -207,20 +206,20 @@ class PMMotorMeshGenerator:
             
             # Create sector with 4 corner points
             p1 = gmsh.model.occ.addPoint(
-                self.geom.r_stator_in * math.cos(theta_start),
-                self.geom.r_stator_in * math.sin(theta_start), 0
+                self.geom.r_coil_in * math.cos(theta_start),
+                self.geom.r_coil_in * math.sin(theta_start), 0
             )
             p2 = gmsh.model.occ.addPoint(
-                self.geom.r_coil_out * math.cos(theta_start),
-                self.geom.r_coil_out * math.sin(theta_start), 0
+                self.geom.r_stator_out * math.cos(theta_start),
+                self.geom.r_stator_out * math.sin(theta_start), 0
             )
             p3 = gmsh.model.occ.addPoint(
-                self.geom.r_coil_out * math.cos(theta_end),
-                self.geom.r_coil_out * math.sin(theta_end), 0
+                self.geom.r_stator_out * math.cos(theta_end),
+                self.geom.r_stator_out * math.sin(theta_end), 0
             )
             p4 = gmsh.model.occ.addPoint(
-                self.geom.r_stator_in * math.cos(theta_end),
-                self.geom.r_stator_in * math.sin(theta_end), 0
+                self.geom.r_coil_in * math.cos(theta_end),
+                self.geom.r_coil_in * math.sin(theta_end), 0
             )
             
             # Create edges
@@ -246,7 +245,6 @@ class PMMotorMeshGenerator:
             pm_surfaces +
             [(2, rings['airgap_inner'])] +
             [(2, rings['airgap_outer'])] +
-            [(2, rings['coil_region'])] +
             coil_surfaces +
             [(2, rings['stator'])] +
             [(2, rings['outer_air'])]
@@ -270,8 +268,8 @@ class PMMotorMeshGenerator:
         area_pm_single = math.pi * (g.r_pm_out**2 - g.r_pm_in**2) * g.magnet_coverage / g.n_magnets
         area_airgap_inner = math.pi * (g.r_airgap_mid**2 - g.r_rotor**2)
         area_airgap_outer = math.pi * (g.r_airgap_out**2 - g.r_airgap_mid**2)
-        area_stator = math.pi * (g.r_stator_out**2 - g.r_coil_out**2)
-        area_coil_single = math.pi * (g.r_coil_out**2 - g.r_stator_in**2) * (2*g.coil_half_angle_deg) / 360
+        area_coil_single = math.pi * (g.r_stator_out**2 - g.r_coil_in**2) * (2*g.coil_half_angle_deg) / 360
+        area_stator = math.pi * (g.r_stator_out**2 - g.r_stator_in**2) - g.n_coils * area_coil_single
         
         # Build area-to-domain map (order matters - check specific areas first)
         area_map = {
@@ -319,7 +317,7 @@ class PMMotorMeshGenerator:
 
             # First classify sector-like domains (coils and PMs) by radial+angular location.
             # This avoids confusion with similarly-sized air-gap fragments.
-            if g.r_stator_in <= r_com <= g.r_coil_out:
+            if g.r_coil_in <= r_com <= g.r_stator_out:
                 diffs = np.abs(coil_angle_centers - theta_com)
                 diffs = np.minimum(diffs, 2 * math.pi - diffs)
                 closest_idx = np.argmin(diffs)
