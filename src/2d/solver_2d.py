@@ -42,7 +42,7 @@ class SimulationConfig:
                  J_peak=7.07e6,
                  B_rem=1.4,
                  T_end=0.010,
-                 num_steps=20,
+                 num_steps=100,
                  dt=None,
                  polynomial_degree=1,
                  omega_m=None,

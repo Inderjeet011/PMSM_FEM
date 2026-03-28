@@ -1,117 +1,120 @@
-## PMSM FEM Simulation (2D + 3D)
+# PMSM_FEM
 
-Permanent Magnet Synchronous Motor (PMSM) electromagnetic simulation using **FEniCSx / DOLFINx**.
+Finite-element PMSM models built with `FEniCSx` / `DOLFINx`. The repository contains a legacy 2D model plus several active 3D transient A-V eddy-current workflows for different coil geometries.
 
-This repo’s “current focus” is a **3D transient A–V eddy-current solver** with:
-- rotating permanent magnets (magnetization is rotated each timestep)
-- 3‑phase coil current drive
-- PETSc block preconditioning tuned for H(curl)
+## What Is In The Repo
 
-### Quickstart (3D solver)
+- `src/2d`: legacy 2D PMSM mesh generator and solver
+- `src/3d`: main 3D transient A-V solver with bulk 3-phase current-driven coils
+- `src/3d_loop_mesh`: 3D loop-coil variant with local BP/VTX outputs
+- `src/3d_rod_mesh`: 3D rod-coil variant with extended copper regions
 
-#### 1) Create an environment (FEniCSx)
+All 3D variants use:
 
-How you install `dolfinx` depends on your platform. Two common options:
+- `A` in an `H(curl)` Nedelec space
+- `V` on a conductor submesh
+- rotating permanent-magnet excitation
+- PETSc `fieldsplit` block solves with Hypre preconditioning
 
-- **Conda (recommended)**: install from conda-forge (package name is usually `fenics-dolfinx`)
-- **Docker**: use an official/known-good DOLFINx image and run this repo inside it
+## Requirements
 
-At minimum you’ll need: `dolfinx`, `petsc4py`, `mpi4py`, `numpy`, and (for mesh generation) `gmsh`.
+You need a working FEniCSx environment with at least:
 
-#### 2) Generate (or use) the 3D mesh
+- `dolfinx`
+- `petsc4py`
+- `mpi4py`
+- `numpy`
+- `gmsh`
 
-This repo already ships a mesh in `meshes/3d/`:
-- `meshes/3d/pmesh3D_ipm.xdmf` (+ `pmesh3D_ipm.h5`)
+Typical options are a conda-forge environment or a DOLFINx Docker image.
 
-To regenerate it with Gmsh:
+## Common Workflow
 
-```bash
-python src/3d/mesh_3D.py --res 0.01 --depth 0.057
-```
+### 1. Generate A Mesh
 
-This writes `meshes/3d/pmesh3D_ipm.xdmf` (and `.h5`).
+Each 3D workflow has its own mesh generator and writes mesh files into the same folder as the script.
 
-#### 3) Run the solver
-
-```bash
-cd src/3d
-python main.py
-```
-
-MPI is supported and often faster/more robust for larger meshes:
+Examples:
 
 ```bash
 cd src/3d
-mpirun -np 4 python main.py
+python mesh_3D.py --res 0.005 --depth 0.057
 ```
-
-### Output files (ParaView)
-
-By default, results are written to:
-- `results/3d/av_solver.xdmf` (and `results/3d/av_solver.h5`)
-
-Fields written include:
-- **`A`**: vector potential (interpolated into a Lagrange vector space for visualization)
-- **`V`**: scalar potential
-- **`B_dg`**: **DG0 (cell-wise constant) \(B=\nabla\times A\)**; this is the “physics first” B-field
-- **`B` / `B_Magnitude`**: projected/smoothed B fields for visualization
-- **`B_vis` / `B_vis_mag`**: visualization helpers
-
-Open `results/3d/av_solver.xdmf` in ParaView. For the most faithful B-field, use **`B_dg` (Cell Data)**.
-
-### Motor-only output (default)
-
-The solver is configured to keep outputs small and ParaView-friendly:
-- it runs on the full mesh, then **replaces** `results/3d/av_solver.xdmf/.h5` with a **motor-only** dataset (outer airbox removed)
-
-This behavior is controlled by `SimulationConfig3D.output_motor_only` in `src/3d/load_mesh.py`.
-
-### Utilities
-
-#### Extract motor-only from an existing results file
-
-If you already have an XDMF/H5 pair and want to remove the airbox:
 
 ```bash
-python src/3d/extract_motor_only.py --input results/3d/av_solver.xdmf --output results/3d/av_solver_motor_only.xdmf
+cd src/3d_loop_mesh
+python mesh_3D.py
 ```
 
-### Project structure
+```bash
+cd src/3d_rod_mesh
+python mesh_3D.py
+```
+
+This produces files such as:
+
+- `pmesh3D_ipm.msh`
+- `pmesh3D_ipm.xdmf`
+- `pmesh3D_ipm.h5`
+
+### 2. Run A Solver
+
+Run the solver from the corresponding folder:
+
+```bash
+cd src/3d
+python main_submesh.py
+```
+
+```bash
+cd src/3d_loop_mesh
+python main_submesh.py
+```
+
+```bash
+cd src/3d_rod_mesh
+python main_submesh.py
+```
+
+MPI execution is also supported:
+
+```bash
+mpirun -np 4 python main_submesh.py
+```
+
+## Outputs
+
+Each 3D folder writes results locally beside the solver scripts.
+
+Common outputs include:
+
+- `av_solver_submesh.xdmf`
+- `av_solver_submesh.h5`
+- `V_field_submesh.bp`
+- `J_field_submesh.bp`
+- `B_field_motor_submesh.bp`
+
+The exact BP outputs depend on the workflow variant. Open the `xdmf` file in ParaView for the standard dataset, or the `.bp` folders for VTX/ADIOS output.
+
+## Notes On The Active 3D Model
+
+- The main `src/3d` workflow currently uses bulk 3-phase current-driven coil regions.
+- Opposite coil sides are mapped to the same phase with opposite current sign.
+- The `A`-block preconditioner in the active `src/3d` solver is Hypre `boomeramg` with `HMIS` coarsening.
+- The main `src/3d` mesh now extrudes coil regions slightly beyond the motor stack in both `+z` and `-z`.
+
+## Repo Layout
 
 ```text
-FEniCS/
-├── meshes/
-│   ├── 2d/                      # 2D meshes (legacy)
-│   └── 3d/                      # 3D PMSM meshes (XDMF/H5, plus .msh)
-├── results/                     # Output files (auto-generated)
+PMSM_FEM/
+├── README.md
 └── src/
-    ├── 2d/                      # Legacy 2D solver and mesh tools
-    └── 3d/                      # 3D A–V eddy-current solver (current focus)
+    ├── 2d/
+    ├── 3d/
+    ├── 3d_loop_mesh/
+    └── 3d_rod_mesh/
 ```
 
-### 3D A–V eddy-current formulation (implementation notes)
+## Status
 
-- **Spaces**:
-  - `A` in Nédélec H(curl) (`N1curl`, degree 1)
-  - `V` in Lagrange H¹ (degree 1)
-- **Block system**: 2×2 PETSc `MatNest` with blocks `A00, A01, A10, A11`:
-  - `A00`: `nu * curl(A)·curl(v) + (mu0 * sigma / dt) A·v` + motional term + weak BC penalty on the exterior
-  - `A01`: `mu0 * sigma v·∇V` restricted to conductor region
-  - `A10`: `(mu0 * sigma / dt) A·∇q` in conductors
-  - `A11`: `mu0 * sigma ∇V·∇q` in conductors + small stabilization on zero‑σ regions
-- **Time stepping**: backward Euler; `1/dt` appears on σ-coupled terms (not on curl–curl or sources)
-- **Permanent magnets & currents**:
-  - magnetization `M` initialized as `Br / mu0` in magnet regions and rotated with rotor angle
-  - PM forcing uses `-∫ μ0 M·curl(v) dx_magnets`
-  - coil source uses `∫ J_z v_z dx` (`J` in A/m²)
-- **Boundary conditions**:
-  - `A`: weakly enforced `A → 0` on the exterior via a penalty term (no strong Dirichlet BCs)
-  - `V`: strong Dirichlet BC on exterior + one MPI-safe grounded DOF to remove the constant null mode
-
-### Solver and preconditioning (3D)
-
-The solver uses PETSc block preconditioning (`PCFIELDSPLIT`) and Hypre methods (AMS/BoomerAMG) to handle H(curl) efficiently. See `src/3d/solve_equations.py` for the exact configuration and tuning knobs.
-
-### 2D legacy solver
-
-The original 2D PMSM scripts (`src/2d`) are still present but not actively maintained.
+This repository is under active development. Several 3D workflows coexist while geometry, excitation, and output handling are being compared and refined.

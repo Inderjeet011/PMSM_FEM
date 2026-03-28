@@ -13,12 +13,15 @@ from dolfinx.io import VTXWriter
 from dolfinx.mesh import create_submesh
 from mpi4py import MPI
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
-from load_mesh import omega_rs, omega_rpm, omega_c, omega_pm
+sys.path.insert(0, str(Path(__file__).parent))
 
 from load_mesh_submesh import (
     conducting,
     load_mesh_and_extract_submesh,
+    omega_c,
+    omega_pm,
+    omega_rpm,
+    omega_rs,
     setup_boundary_conditions_parent,
     setup_boundary_conditions_submesh,
     setup_materials,

@@ -10,10 +10,8 @@ from petsc4py import PETSc
 import ufl
 
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
-from load_mesh import MAGNETS
 sys.path.insert(0, str(Path(__file__).parent))
-from load_mesh_submesh import COIL_DRIVE
+from load_mesh_submesh import COIL_DRIVE, MAGNETS
 from entity_map_utils import get_entity_map
 
 

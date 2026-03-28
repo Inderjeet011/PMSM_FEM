@@ -1,4 +1,4 @@
-# Generate a single-phase PMSM model, with a given minimal resolution, encapsulated in a LxL box.
+# Generate the three phase PMSM model, with a given minimal resolution, encapsulated in a LxL box.
 
 import argparse
 from pathlib import Path
@@ -8,9 +8,7 @@ from mpi4py import MPI
 import gmsh
 import dolfinx
 
-_all_ = ["model_parameters", "mesh_parameters", "surface_map"]
-
-COIL_HALF_ANGLE = np.pi / 12.0
+__all__ = ["model_parameters", "mesh_parameters", "surface_map"]
 
 # ---------------------------------------------------------------------------
 # Model and mesh parameters
@@ -21,8 +19,7 @@ model_parameters = {
     "freq": 60,  # Hz
     "J": 3.1e6 * np.sqrt(2),  # [A/m^2]
     "mu_r": {
-        # Relative permeabilities
-        "Cu": 1,   # copper ~ non-magnetic
+        "Cu": 1,
         "Stator": 30,
         "Rotor": 30,
         "Al": 1,
@@ -31,11 +28,10 @@ model_parameters = {
         "PM": 1.04457,
     },
     "sigma": {
-        # Restore original conductivities
         "Rotor": 1.6e6,
-        "Al": 0,       # aluminium treated as non-conducting (no eddy currents)
+        "Al": 3.72e7,
         "Stator": 0,
-        "Cu": 5.96e7,  # copper conductivity [S/m]; coils treated as conductors
+        "Cu": 0,
         "Air": 0,
         "AirGap": 0,
         "PM": 6.25e5,
@@ -61,17 +57,18 @@ _domain_map_three: Dict[str, tuple[int, ...]] = {
     "Al": (4,),
     "Rotor": (5,),
     "Stator": (6,),
-    # Six separate copper coils (tags 7–12)
     "Cu": (7, 8, 9, 10, 11, 12),
     "PM": (13, 14, 15, 16, 17, 18, 19, 20, 21, 22),
 }
 
-# Currents mapping to the four coil markers
+# Currents mapping to Cu markers (you already had this)
 _currents_three: Dict[int, Dict[str, float]] = {
     7: {"alpha": 1, "beta": 0},
-    8: {"alpha": -1, "beta": 0},
-    9: {"alpha": 0, "beta": 1},
-    10: {"alpha": 0, "beta": -1},
+    8: {"alpha": -1, "beta": 2 * np.pi / 3},
+    9: {"alpha": 1, "beta": 4 * np.pi / 3},
+    10: {"alpha": -1, "beta": 0},
+    11: {"alpha": 1, "beta": 2 * np.pi / 3},
+    12: {"alpha": -1, "beta": 4 * np.pi / 3},
 }
 
 # Radii (kept from your script)
@@ -80,8 +77,7 @@ mesh_parameters: Dict[str, float] = {
     "r2": 0.04,
     "r3": 0.042,  # rotor outer
     "r4": 0.062,  # stator inner
-    # Slightly slimmer stator: reduce outer radius from 0.075 -> 0.070 (8 mm thickness)
-    "r5": 0.070,  # stator outer
+    "r5": 0.075,  # stator outer
     "r6": 0.036,  # PM inner radius
     "r7": 0.038,  # PM outer radius
     # NOTE: We model the true air-gap as the thin annulus [r3, r3 + air_gap]
@@ -104,8 +100,8 @@ def _add_copper_segment(angle: float, center: int) -> int:
     r_gap = r3 + mesh_parameters["air_gap"]
     r4 = mesh_parameters["r4"]
 
-    # Use two visibly larger opposite coils for the single-phase test.
-    dphi = COIL_HALF_ANGLE
+    # Angular half-width of the slot = 22.5 deg (π/8) – same as original
+    dphi = np.pi / 8
 
     # Create explicit points for inner and outer arcs
     # Inner radius is now r_gap (not r3) to preserve slot thickness
@@ -160,27 +156,6 @@ def _add_permanent_magnets(angle: float, center: int) -> int:
     return pm_segment
 
 
-def _add_annular_sector(theta_start: float, theta_end: float, r_inner: float, r_outer: float, center: int) -> int:
-    """
-    Add a 2D annular sector surface bounded by two radii and two circular arcs.
-    Angles are given in radians in the standard polar convention.
-    """
-    p_i0 = gmsh.model.occ.addPoint(r_inner * np.cos(theta_start), r_inner * np.sin(theta_start), 0.0)
-    p_i1 = gmsh.model.occ.addPoint(r_inner * np.cos(theta_end), r_inner * np.sin(theta_end), 0.0)
-    p_o0 = gmsh.model.occ.addPoint(r_outer * np.cos(theta_start), r_outer * np.sin(theta_start), 0.0)
-    p_o1 = gmsh.model.occ.addPoint(r_outer * np.cos(theta_end), r_outer * np.sin(theta_end), 0.0)
-
-    arc_inner = gmsh.model.occ.addCircleArc(p_i0, center, p_i1)
-    arc_outer = gmsh.model.occ.addCircleArc(p_o0, center, p_o1)
-    side_start = gmsh.model.occ.addLine(p_i0, p_o0)
-    side_end = gmsh.model.occ.addLine(p_i1, p_o1)
-
-    loop = gmsh.model.occ.addCurveLoop([arc_inner, side_end, -arc_outer, -side_start])
-    sector = gmsh.model.occ.addPlaneSurface([loop])
-    gmsh.model.occ.synchronize()
-    return sector
-
-
 def _angle_diff(a: float, b: float) -> float:
     """Smallest absolute difference between two angles in [0, 2π)."""
     d = (a - b + np.pi) % (2 * np.pi) - np.pi
@@ -223,30 +198,16 @@ def generate_PMSM_mesh(
     r_mid_gap = r3 + 0.5 * air_gap  # Mid-radius for splitting the true air-gap
 
     # Slot and PM angles (needed for retagging)
-    # Six coils, evenly spaced every 60 degrees.
-    slot_angles = np.asarray([k * (2.0 * np.pi / 6.0) for k in range(6)], dtype=np.float64)
+    spacing = (np.pi / 4.0) + (np.pi / 4.0) / 3.0  # = π/3 => 60 deg
+    slot_angles = np.asarray([i * spacing for i in range(6)], dtype=np.float64)
     pm_count = 10
     pm_spacing = 2.0 * np.pi / pm_count
     pm_angles = np.asarray([i * pm_spacing for i in range(pm_count)], dtype=np.float64)
-    slot_half = COIL_HALF_ANGLE
-    coil_radial_width = r4 - r_gap
-    arch_centerline_radius = 0.5 * (r_gap + r4)
-    arch_thickness_scale = 0.58
-    arch_width_scale = 0.92
-    arch_profile_rx = arch_thickness_scale * max(
-        r4 - arch_centerline_radius, arch_centerline_radius - r_gap * np.cos(slot_half)
-    )
-    arch_profile_ry = arch_width_scale * (r4 * np.sin(slot_half))
 
     # Motor z-range (needed for retagging)
     xy_buffer_factor = 6.0  # ~6x stator radius
-    # Restore taller air-box and choose coil extension so rods just touch the air-box:
-    # with air_box_z_min = 0, air_box_size_z = depth * (1 + 2*z_buffer_factor),
-    # motor_z_start = depth * z_buffer_factor, motor_z_end = depth * (z_buffer_factor + 1).
-    # Setting extension_height = depth * z_buffer_factor then gives
-    #   extension_z_bottom = air_box_z_min
-    #   extension_z_top    = air_box_z_max
-    z_buffer_factor = 3.0   # keep tall air box in z
+    z_buffer_factor = 3.0   # ~3x motor depth above and below
+    coil_extension_height = 0.08 * depth  # smaller symmetric coil overhang
     air_box_size_xy = 2.0 * xy_buffer_factor * r5
     air_box_size_z = depth * (1.0 + 2.0 * z_buffer_factor)
     air_box_z_min = 0.0
@@ -255,12 +216,8 @@ def generate_PMSM_mesh(
     shift_z = motor_center_z - depth / 2.0
     motor_z_start = shift_z
     motor_z_end = shift_z + depth
-    # Choose extension so coil ends just touch the air-box in z:
-    # extension_height = depth * z_buffer_factor → rods reach exactly from air_box_z_min to air_box_z_max.
-    extension_height = z_buffer_factor * depth
-    cap_height = min(0.35 * extension_height, 0.5 * coil_radial_width)
-    extension_z_bottom = motor_z_start - extension_height
-    extension_z_top = motor_z_end + extension_height
+    coil_z_start = motor_z_start - coil_extension_height
+    coil_z_end = motor_z_end + coil_extension_height
 
     # Tolerance for classification (needed for retagging)
     tol = 1e-3 * r5
@@ -285,6 +242,7 @@ def generate_PMSM_mesh(
               f"y=[{air_box_y_min:.4f}, {air_box_y_max:.4f}], "
               f"z=[{air_box_z_min:.4f}, {air_box_z_max:.4f}]")
         print(f"Motor z-range after translation: [{motor_z_start:.4f}, {motor_z_end:.4f}]")
+        print(f"Coil z-range after translation:  [{coil_z_start:.4f}, {coil_z_end:.4f}]")
         print(f"Motor center z: {motor_center_z:.4f}")
 
         # ------------------------------------------------------------
@@ -296,7 +254,7 @@ def generate_PMSM_mesh(
 
         # Center line for mesh refinement (later translated)
         cf = center_point  # Reuse center point
-        cb = gmsh.model.occ.addPoint(0.0, 0.0, depth)
+        cb = gmsh.model.occ.addPoint(0.0, 0.0, depth + 2.0 * coil_extension_height)
         cline = gmsh.model.occ.addLine(cf, cb)
 
         # Base circles
@@ -333,11 +291,12 @@ def generate_PMSM_mesh(
         gmsh.model.occ.synchronize()
 
         # ------------------------------------------------------------
-        # Copper slots: 2 large opposite coils
+        # Copper slots: 6 slots, three-phase winding
         # ------------------------------------------------------------
         copper_surfaces = []
         for ang in slot_angles:
             copper_surfaces.append(_add_copper_segment(ang, center_point))
+
         # ------------------------------------------------------------
         # Permanent magnets: interior PM (IPM) in [r6, r7]
         # ------------------------------------------------------------
@@ -348,9 +307,8 @@ def generate_PMSM_mesh(
 
         gmsh.model.occ.synchronize()
 
-        # Make the 2D regions disjoint before extrusion.
-        # - Remove PM pockets from the rotor annulus
-        # - Remove copper slots from the slot-air annulus
+        # Make 2D regions disjoint before extrusion so copper can be
+        # extruded separately without overlapping the slot-air region.
         rotor_cut, _ = gmsh.model.occ.cut(
             [(2, rotor_surf)],
             [(2, s) for s in pm_surfaces],
@@ -363,6 +321,7 @@ def generate_PMSM_mesh(
             removeObject=True,
             removeTool=False,
         )
+
         gmsh.model.occ.synchronize()
 
         rotor_surfaces = [e for e in rotor_cut if e[0] == 2]
@@ -372,8 +331,6 @@ def generate_PMSM_mesh(
         if not slot_air_surfaces:
             slot_air_surfaces = [(2, slot_air_surf)]
 
-        # Collect all 2D surfaces to extrude.
-        # Use one-step long copper extrusion instead of face-extruding later.
         domains_2d_non_cu = []
         domains_2d_cu = []
         # Shaft (Al)
@@ -406,7 +363,9 @@ def generate_PMSM_mesh(
         if domains_2d_non_cu:
             extruded_non_cu = gmsh.model.occ.extrude(domains_2d_non_cu, 0.0, 0.0, depth)
         if domains_2d_cu:
-            extruded_cu = gmsh.model.occ.extrude(domains_2d_cu, 0.0, 0.0, depth + 2.0 * extension_height)
+            extruded_cu = gmsh.model.occ.extrude(
+                domains_2d_cu, 0.0, 0.0, depth + 2.0 * coil_extension_height
+            )
         gmsh.model.occ.synchronize()
 
         extruded = list(extruded_non_cu) + list(extruded_cu)
@@ -416,21 +375,17 @@ def generate_PMSM_mesh(
         if not motor_volumes:
             raise RuntimeError("No 3D volumes created during extrusion.")
 
-        # Translate motor volumes and refinement line to center z.
-        # Copper gets shifted down by extension_height so it extends equally
-        # in +z and -z around the original motor body.
+        # Translate motor volumes and refinement line to center z
         non_cu_volumes = [e for e in extruded_non_cu if e[0] == 3]
         cu_volumes = [e for e in extruded_cu if e[0] == 3]
         if non_cu_volumes:
             gmsh.model.occ.translate(non_cu_volumes, 0.0, 0.0, shift_z)
         if cu_volumes:
-            gmsh.model.occ.translate(cu_volumes, 0.0, 0.0, shift_z - extension_height)
-        gmsh.model.occ.translate([(1, cline)], 0.0, 0.0, shift_z)
+            gmsh.model.occ.translate(cu_volumes, 0.0, 0.0, shift_z - coil_extension_height)
+        gmsh.model.occ.translate([(1, cline)], 0.0, 0.0, shift_z - coil_extension_height)
         gmsh.model.occ.synchronize()
 
-        # No caps or external loops: keep copper as two extended coil rods (extruded_cu volumes).
         motor_volumes = list(non_cu_volumes) + list(cu_volumes)
-        gmsh.model.occ.synchronize()
 
         # ------------------------------------------------------------
         # Step 4: Create outer air box and fragment
@@ -462,14 +417,10 @@ def generate_PMSM_mesh(
             if theta < 0:
                 theta += 2.0 * np.pi
 
-            # Copper: only within the coil z-extent around the motor stack.
-            # Restrict Cu to the band
-            #   z in [motor_z_start - extension_height, motor_z_end + extension_height]
-            # so that far-away air in the outer box is not misclassified as copper.
+            # Check Cu slots first, including the small symmetric overhang.
+            slot_half = np.pi / 8.0
             if (
-                motor_z_start - extension_height - tol
-                <= z
-                <= motor_z_end + extension_height + tol
+                coil_z_start - tol <= z <= coil_z_end + tol
                 and r_gap - tol <= r <= r4 + tol
             ):
                 for i, ang in enumerate(slot_angles):
@@ -477,7 +428,7 @@ def generate_PMSM_mesh(
                         cu_marker = domain_map["Cu"][i % len(domain_map["Cu"])]
                         return "Cu", cu_marker
 
-            # Outside the original motor stack, anything that is not Cu is air.
+            # Outer air box / region outside the main stack
             if z < motor_z_start - tol or z > motor_z_end + tol:
                 return "Air", domain_map["Air"][0]
             if r > r5 + tol:
@@ -580,6 +531,7 @@ def generate_PMSM_mesh(
             print(f"\n   Radial boundaries: r1={r1:.4f}, r2={r2:.4f}, r3={r3:.4f}, r4={r4:.4f}, r5={r5:.4f}")
             print(f"   PM region: r6={r6:.4f}, r7={r7:.4f}")
             print(f"   Motor z-range: [{motor_z_start:.4f}, {motor_z_end:.4f}]")
+            print(f"   Coil z-range:  [{coil_z_start:.4f}, {coil_z_end:.4f}]")
         
         # Add physical groups with all volumes sharing the same marker
         for marker, volume_tags in volumes_by_marker.items():
@@ -639,58 +591,20 @@ def generate_PMSM_mesh(
             gmsh.model.addPhysicalGroup(2, exterior_faces, surface_map["Exterior"])
 
         # ------------------------------------------------------------
-        # Step 7: Mesh generation – distance‑based grading
+        # Step 7: Mesh generation (finer near motor, coarser away)
         # ------------------------------------------------------------
-        # Collect copper boundary points so rods don’t become too coarse.
-        cu_point_tags: set[int] = set()
-        for vol in cu_volumes:
-            try:
-                surf_entities = gmsh.model.getBoundary([vol], oriented=False)
-            except Exception:
-                continue
-            for s_dim, s_tag in surf_entities:
-                if s_dim != 2:
-                    continue
-                try:
-                    curve_entities = gmsh.model.getBoundary([(s_dim, s_tag)], oriented=False)
-                except Exception:
-                    continue
-                for c_dim, c_tag in curve_entities:
-                    if c_dim != 1:
-                        continue
-                    try:
-                        point_entities = gmsh.model.getBoundary([(c_dim, c_tag)], oriented=False)
-                    except Exception:
-                        continue
-                    for p_dim, p_tag in point_entities:
-                        if p_dim == 0:
-                            cu_point_tags.add(p_tag)
-
-        if cu_point_tags:
-            gmsh.model.mesh.setSize([(0, p) for p in cu_point_tags], float(res))
-
-        # Distance-based coarsening: Lc from motor center (PointsList); fine near motor, coarser far away.
         res_base = float(res)
-        lc_min = res_base
         lc_max = float(lc_max_ratio) * res_base
         dist_max = float(dist_max_ratio) * r5
-
-        # Clear any existing fields
-        try:
-            for _fid in gmsh.model.mesh.field.getTags():
-                gmsh.model.mesh.field.remove(_fid)
-        except Exception:
-            pass
+        if rank == root:
+            print(f"\n📐 Mesh grading: LcMin={res_base:.4e} (near motor r<{r5:.4f}), LcMax={lc_max:.4e} (far r>{dist_max:.4f})")
 
         gmsh.model.mesh.field.add("Distance", 1)
-        # Distance-based coarsening: size by 3D distance from motor center
-        motor_center_pt = gmsh.model.occ.addPoint(0.0, 0.0, motor_center_z)
-        gmsh.model.occ.synchronize()
-        gmsh.model.mesh.field.setNumbers(1, "PointsList", [motor_center_pt])
+        gmsh.model.mesh.field.setNumbers(1, "EdgesList", [cline])
 
         gmsh.model.mesh.field.add("Threshold", 2)
         gmsh.model.mesh.field.setNumber(2, "IField", 1)
-        gmsh.model.mesh.field.setNumber(2, "LcMin", lc_min)
+        gmsh.model.mesh.field.setNumber(2, "LcMin", res_base)
         gmsh.model.mesh.field.setNumber(2, "LcMax", lc_max)
         gmsh.model.mesh.field.setNumber(2, "DistMin", r5)
         gmsh.model.mesh.field.setNumber(2, "DistMax", dist_max)
@@ -699,15 +613,13 @@ def generate_PMSM_mesh(
         gmsh.model.mesh.field.setNumbers(3, "FieldsList", [2])
         gmsh.model.mesh.field.setAsBackgroundMesh(3)
 
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", lc_min)
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", lc_max)
         gmsh.option.setNumber("General.Terminal", 1)
         gmsh.model.mesh.generate(gdim)
+        if optimize and optimize.lower() not in ("none", "off", ""):
+            if rank == root:
+                print(f"\n🔧 Running mesh optimization ({optimize})...")
+            gmsh.model.mesh.optimize(optimize)
 
-        # Write MSH in a DOLFINx‑friendly format
-        gmsh.option.setNumber("Mesh.MshFileVersion", 4.1)
-        gmsh.option.setNumber("Mesh.Binary", 1)
-        gmsh.option.setNumber("Mesh.SaveAll", 1)
         msh_file = str(filename.with_suffix(".msh"))
         gmsh.write(msh_file)
         gmsh.finalize()
@@ -723,11 +635,8 @@ def generate_PMSM_mesh(
     from dolfinx.io import gmsh as gmshio, XDMFFile
     import dolfinx.mesh as dmesh
 
-    # Use a safe communicator for reading: for serial runs, use COMM_SELF
-    # to avoid any MPI rank issues inside gmshio.read_from_msh.
-    comm_read = comm if comm.size > 1 else MPI.COMM_SELF
     result = gmshio.read_from_msh(
-        str(filename.with_suffix(".msh")), comm_read, 0, gdim=3
+        str(filename.with_suffix(".msh")), comm, 0, gdim=3
     )
     mesh = result[0]
     ct = result[1] if len(result) > 1 else None
@@ -749,29 +658,21 @@ def generate_PMSM_mesh(
     
     # Classification function for cells
     def classify_cell(r, theta, z):
-        x = r * np.cos(theta)
-        y = r * np.sin(theta)
-
-        # Copper: only within the coil z-extent around the motor stack.
-        # Restrict Cu to the band
-        #   z in [motor_z_start - extension_height, motor_z_end + extension_height]
-        # so that far-away air in the outer box is not misclassified as copper.
+        # Outer air box
+        # Check Cu slots first, including the small symmetric overhang.
+        slot_half = np.pi / 8.0
         if (
-            motor_z_start - extension_height - tol
-            <= z
-            <= motor_z_end + extension_height + tol
+            coil_z_start - tol <= z <= coil_z_end + tol
             and r_gap - tol <= r <= r4 + tol
         ):
             for i, ang in enumerate(slot_angles):
                 if _angle_diff(theta, ang) <= slot_half:
                     return domain_map["Cu"][i % len(domain_map["Cu"])]
 
-        # Outside the original motor stack, anything that is not Cu is air.
         if z < motor_z_start - tol or z > motor_z_end + tol:
             return domain_map["Air"][0]
         if r > r5 + tol:
             return domain_map["Air"][0]
-        
         
         # Check PM pockets (must be before rotor check)
         pm_half = np.pi / 12.0
@@ -918,7 +819,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--res",
-        default=0.006,
+        default=0.005,
         type=np.float64,
         dest="res",
         help="Base mesh resolution near motor (2mm=0.002). Finer near motor, coarser with distance.",
@@ -951,12 +852,20 @@ if __name__ == "__main__":
         dest="dist_max_ratio",
         help="DistMax/r5 ratio: distance beyond which mesh is coarsest (e.g. 8 = coarse beyond 8*r5)",
     )
+    parser.add_argument(
+        "--no-optimize",
+        action="store_true",
+        dest="no_optimize",
+        help="Skip Netgen mesh optimization (much faster, but lower quality elements)",
+    )
+
     args = parser.parse_args()
     res = args.res
     depth = args.depth
 
-    folder = Path(__file__).parent.resolve()
+    folder = Path(__file__).resolve().parent
     folder.mkdir(parents=True, exist_ok=True)
     fname = folder / "pmesh3D_ipm"
 
-    generate_PMSM_mesh(fname, False, res, args.L, depth, lc_max_ratio=args.lc_max_ratio, dist_max_ratio=args.dist_max_ratio, optimize="")
+    opt = "" if args.no_optimize else "Netgen"
+    generate_PMSM_mesh(fname, False, res, args.L, depth, lc_max_ratio=args.lc_max_ratio, dist_max_ratio=args.dist_max_ratio, optimize=opt)

@@ -7,7 +7,7 @@ from mpi4py import MPI  # type: ignore
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
+sys.path.insert(0, str(Path(__file__).parent))
 from mesh_3D import mesh_parameters, model_parameters, surface_map  # type: ignore
 
 ROTOR = (5,)
@@ -33,6 +33,36 @@ VOLTAGE_MAP = [
 
 def conducting():
     return COILS + MAGNETS + ROTOR
+
+
+def omega_r():
+    """Rotor assembly."""
+    return ROTOR
+
+
+def omega_s():
+    """Stator."""
+    return ()
+
+
+def omega_pm():
+    """Permanent magnets."""
+    return MAGNETS
+
+
+def omega_c():
+    """Coils."""
+    return COILS
+
+
+def omega_rs():
+    """Rotor assembly and stator."""
+    return omega_r() + omega_s()
+
+
+def omega_rpm():
+    """Rotor assembly and permanent magnets."""
+    return omega_r() + omega_pm()
 
 
 EXTERIOR_FACET_TAG = surface_map["Exterior"]
