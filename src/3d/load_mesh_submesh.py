@@ -7,14 +7,24 @@ from mpi4py import MPI  # type: ignore
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "3d"))
+sys.path.insert(0, str(Path(__file__).parent))
 from mesh_3D import model_parameters, surface_map  # type: ignore
 
+AIR = (1,)
+AIR_GAP = (2, 3)
 ALUMINIUM = (4,)
 ROTOR = (5,)
 STATOR = (6,)
 COILS = (7, 8, 9, 10, 11, 12)
 MAGNETS = (13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
+CURRENT_MAP = {
+    7: {"alpha": 1, "beta": 0.0},
+    8: {"alpha": -1, "beta": 2.0 * np.pi / 3.0},
+    9: {"alpha": 1, "beta": 4.0 * np.pi / 3.0},
+    10: {"alpha": -1, "beta": 0.0},
+    11: {"alpha": 1, "beta": 2.0 * np.pi / 3.0},
+    12: {"alpha": -1, "beta": 4.0 * np.pi / 3.0},
+}
 
 
 def conducting():
@@ -22,33 +32,27 @@ def conducting():
 
 
 def omega_r():
-    """Rotor assembly (rotor + shaft/rod)."""
     return ROTOR + ALUMINIUM
 
 
 def omega_s():
-    """Stator."""
     return STATOR
 
 
 def omega_pm():
-    """Permanent magnets."""
     return MAGNETS
 
 
 def omega_c():
-    """Coils."""
     return COILS
 
 
 def omega_rs():
-    """Rotor assembly and stator."""
-    return omega_r() + omega_s()
+    return ROTOR + STATOR + ALUMINIUM
 
 
 def omega_rpm():
-    """Rotor assembly and permanent magnets."""
-    return omega_r() + omega_pm()
+    return ROTOR + MAGNETS
 
 
 EXTERIOR_FACET_TAG = surface_map["Exterior"]
@@ -77,18 +81,20 @@ def load_mesh_and_extract_submesh(mesh_path):
     mesh_conductor = result[0]
     entity_map = result[1]
 
-    from dolfinx.mesh import meshtags  # type: ignore
-    from entity_map_utils import entity_map_to_dict  # type: ignore
+    cell_tags_conductor = None
+    if cell_tags_parent is not None:
+        from dolfinx.mesh import meshtags  # type: ignore
+        from entity_map_utils import entity_map_to_dict  # type: ignore
 
-    n_submesh_cells = mesh_conductor.topology.index_map(tdim).size_local
-    submesh_cell_indices = np.arange(n_submesh_cells, dtype=np.int32)
-    submesh_tags = np.empty(n_submesh_cells, dtype=np.int32)
-    cell_to_tag_parent = {int(i): int(v) for i, v in zip(cell_tags_parent.indices, cell_tags_parent.values)}
-    entity_dict = entity_map_to_dict(entity_map, n_submesh_cells, mesh_parent.comm)
-    for i in range(n_submesh_cells):
-        parent_cell = entity_dict.get(i, -1)
-        submesh_tags[i] = cell_to_tag_parent.get(parent_cell, conductor_markers[0])
-    cell_tags_conductor = meshtags(mesh_conductor, tdim, submesh_cell_indices, submesh_tags)
+        n_submesh_cells = mesh_conductor.topology.index_map(tdim).size_local
+        submesh_cell_indices = np.arange(n_submesh_cells, dtype=np.int32)
+        submesh_tags = np.empty(n_submesh_cells, dtype=np.int32)
+        cell_to_tag_parent = {int(i): int(v) for i, v in zip(cell_tags_parent.indices, cell_tags_parent.values)}
+        entity_dict = entity_map_to_dict(entity_map, n_submesh_cells, mesh_parent.comm)
+        for i in range(n_submesh_cells):
+            parent_cell = entity_dict.get(i, -1)
+            submesh_tags[i] = cell_to_tag_parent.get(parent_cell, conductor_markers[0])
+        cell_tags_conductor = meshtags(mesh_conductor, tdim, submesh_cell_indices, submesh_tags)
 
     return (
         mesh_parent,
@@ -150,21 +156,15 @@ def setup_boundary_conditions_parent(mesh_parent, facet_tags_parent, A_space):
     return fem.dirichletbc(u0, dofs)
 
 
-def setup_boundary_conditions_submesh(mesh_conductor, V_space, cell_tags_conductor, conductor_markers, config):
-    """Pin one DOF per conductor region to remove nullspaces."""
+def setup_boundary_conditions_submesh(mesh_conductor, V_space, cell_tags_conductor, conductor_markers):
     u0 = fem.Function(V_space)
     u0.x.array[:] = 0.0
-
-    def dofs_for_marker(marker):
-        cells = cell_tags_conductor.find(marker)
-        if cells.size == 0:
-            return np.array([], dtype=np.int32)
-        dofs_list = [V_space.dofmap.cell_dofs(int(c)) for c in cells]
-        return np.unique(np.concatenate(dofs_list))
-
-    bcs = []
+    ground_dofs_list = []
     for m in conductor_markers:
-        dofs = dofs_for_marker(m)
-        if dofs.size > 0:
-            bcs.append(fem.dirichletbc(u0, np.array([int(dofs[0])], dtype=np.int32)))
-    return bcs
+        cells = cell_tags_conductor.find(m)
+        if cells.size > 0:
+            dofs = V_space.dofmap.cell_dofs(int(cells[0]))
+            if len(dofs) > 0:
+                ground_dofs_list.append(int(dofs[0]))
+    ground_dofs = np.unique(np.array(ground_dofs_list, dtype=np.int32))
+    return [fem.dirichletbc(u0, ground_dofs)]

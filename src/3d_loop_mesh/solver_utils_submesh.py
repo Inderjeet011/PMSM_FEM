@@ -29,7 +29,7 @@ def make_config():
     loop_dir = Path(__file__).parent.resolve()
     return SimpleNamespace(
         dt=dt,
-        num_steps=20,  # short transient for visualization and current decomposition
+        num_steps=50,  # short transient for visualization and current decomposition
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),
