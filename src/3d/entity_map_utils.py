@@ -22,8 +22,3 @@ def entity_map_to_dict(entity_map, n_submesh_cells, comm=None):
         parent_cell = int(parent_cells_array[submesh_cell])
         mapping[submesh_cell] = parent_cell
     return mapping
-
-
-def entity_map_to_array(entity_map, n_submesh_cells, comm=None):
-    """Convert EntityMap to a numpy array."""
-    return get_entity_map(entity_map, inverse=False)

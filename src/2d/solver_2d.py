@@ -16,13 +16,18 @@ Formulation:
 from dolfinx import fem, io, mesh as dmesh
 from dolfinx.fem.petsc import LinearProblem
 from dolfinx.mesh import locate_entities_boundary
-from dolfinx.io import gmshio
+try:
+    from dolfinx.io import gmshio
+except ImportError:
+    # DOLFINx >= 0.10 exposes Gmsh I/O via dolfinx.io.gmsh
+    from dolfinx.io import gmsh as gmshio
 from mpi4py import MPI
 import basix.ufl
 import ufl
 import numpy as np
 import time
 import math
+from pathlib import Path
 
 
 # ============================================================================
@@ -32,17 +37,20 @@ import math
 class SimulationConfig:
     """Simulation configuration parameters"""
     def __init__(self, 
-                 pole_pairs=2,
+                 pole_pairs=5,
                  frequency=50,
                  J_peak=7.07e6,
                  B_rem=1.4,
-                 dt=0.002,
-                 T_end=0.002,
+                 T_end=0.010,
+                 num_steps=100,
+                 dt=None,
                  polynomial_degree=1,
-                 omega_m=None):
+                 omega_m=None,
+                 output_num_timestamps=100,
+                 write_every_timestep=True):
         # Motor geometry
         self.pole_pairs = pole_pairs
-        self.n_poles = 8  # 2 * pole_pairs * 2 (N-S alternating)
+        self.n_poles = 2 * pole_pairs
         
         # Electrical parameters
         self.frequency = frequency  # Hz (set 0 for static PM validation)
@@ -52,8 +60,13 @@ class SimulationConfig:
         self.B_rem = B_rem  # Tesla (remanent flux density)
         
         # Time stepping
-        self.dt = dt  # timestep
-        self.T_end = T_end  # simulation duration
+        self.T_end = float(T_end)  # simulation duration
+        self.num_steps = None
+        self.dt = None
+        self._set_time_grid(num_steps=num_steps, dt=dt)
+        # Output controls
+        self.output_num_timestamps = int(output_num_timestamps)
+        self.write_every_timestep = bool(write_every_timestep)
         
         # Material properties
         self.mu0 = 4e-7 * np.pi
@@ -68,6 +81,29 @@ class SimulationConfig:
         self._pole_angle_step = None
         self._omega_m_override = omega_m  # Allow manual override
         self._update_derived()
+
+    def _set_time_grid(self, num_steps=None, dt=None):
+        """Create a consistent time grid from either num_steps or dt."""
+        if self.T_end <= 0.0:
+            raise ValueError("T_end must be positive.")
+
+        if num_steps is not None:
+            n = int(num_steps)
+            if n <= 0:
+                raise ValueError("num_steps must be positive.")
+            self.num_steps = n
+            self.dt = self.T_end / self.num_steps
+            return
+
+        if dt is not None:
+            dt = float(dt)
+            if dt <= 0.0:
+                raise ValueError("dt must be positive.")
+            self.num_steps = max(1, int(round(self.T_end / dt)))
+            self.dt = self.T_end / self.num_steps
+            return
+
+        raise ValueError("Provide either num_steps or dt.")
     
     def _update_derived(self):
         """Update derived parameters"""
@@ -110,7 +146,12 @@ class SimulationConfig:
         print(f"   B_rem:         {self.B_rem} T")
         print(f"   Polynomial:   P{self.polynomial_degree}")
         print(f"   Timestep:      {self.dt*1000:.2f} ms")
+        print(f"   Steps:         {self.num_steps}")
         print(f"   Duration:      {self.T_end*1000:.1f} ms ({self.T_end*self.frequency:.0f} periods)")
+        if self.write_every_timestep:
+            print(f"   Output:        every timestep")
+        else:
+            print(f"   Output:        {self.output_num_timestamps} timestamps")
 
 
 class DomainTags:
@@ -164,8 +205,16 @@ class MaxwellSolver2D:
     def load_mesh(self):
         """Load mesh from file"""
         print("\n📖 Loading mesh...")
+        mesh_path = Path(self.mesh_file).expanduser()
+        if not mesh_path.is_absolute():
+            mesh_path = (Path.cwd() / mesh_path).resolve()
+        if not mesh_path.exists():
+            raise FileNotFoundError(
+                f"Mesh file not found: {mesh_path}\n"
+                "Generate it first with: python mesh_generator_2d.py"
+            )
         self.mesh, self.ct, *rest = gmshio.read_from_msh(
-            self.mesh_file, MPI.COMM_WORLD, rank=0, gdim=2
+            str(mesh_path), MPI.COMM_WORLD, rank=0, gdim=2
         )
         self.ft = rest[0] if rest else None
         print(f"   ✅ {self.ct.values.size} cells loaded")
@@ -492,7 +541,7 @@ class MaxwellSolver2D:
         self.M_x.x.scatter_forward()
         self.M_y.x.scatter_forward()
     
-    def solve(self, output_file="../../results/2d/results_2d_mixed.xdmf", target_times_ms=None):
+    def solve(self, output_file=None, target_times_ms=None):
         """Main time-stepping solver
         
         Args:
@@ -511,16 +560,34 @@ class MaxwellSolver2D:
             print(f"   Duration: {T_end*1000:.1f} ms")
         else:
             target_times = None
-            num_steps = int(self.config.T_end / self.config.dt)
+            num_steps = self.config.num_steps
             T_end = self.config.T_end
             print(f"   Steps: {num_steps}")
             print(f"   Duration: {T_end*1000:.1f} ms")
         print()
         
-        # Output file - create results directory if it doesn't exist
-        import os
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        out = io.XDMFFile(self.mesh.comm, output_file, "w")
+        # Output file in same folder as this solver by default.
+        if output_file is None:
+            output_file = Path(__file__).resolve().parent / "results_2d_mixed.xdmf"
+        output_path = Path(output_file).expanduser()
+        if not output_path.is_absolute():
+            output_path = (Path.cwd() / output_path).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            out = io.XDMFFile(self.mesh.comm, str(output_path), "w")
+        except RuntimeError as exc:
+            # Common on shared/workstation runs: previous .h5 still locked by
+            # another process/viewer. Fall back to a unique output filename.
+            if "HDF5" not in str(exc) and "hdf5" not in str(exc):
+                raise
+            alt_path = output_path.with_name(
+                f"{output_path.stem}_{int(time.time())}{output_path.suffix}"
+            )
+            print(
+                f"   ⚠️ Output file locked, using alternate output: {alt_path.name}"
+            )
+            output_path = alt_path
+            out = io.XDMFFile(self.mesh.comm, str(output_path), "w")
         out.write_mesh(self.mesh)
         # Write cell tags if available (needed for post-processing like torque)
         if self.ct is not None:
@@ -529,20 +596,71 @@ class MaxwellSolver2D:
             except Exception:
                 pass
         
-        # Create function space for B field (vector field)
-        # B = curl(A) = (dAz/dy, -dAz/dx)
+        # Create writeable B fields on Lagrange spaces for XDMF output.
+        # (Direct DG vector writes can fail with dof-layout mismatch.)
         deg = self.config.polynomial_degree
-        V_B = fem.functionspace(self.mesh, ("DG", deg, (2,)))  # Vector DG space
+        V_B = fem.functionspace(self.mesh, ("Lagrange", deg, (2,)))
         self.B_field = fem.Function(V_B)
+        self.B_field.name = "B"
+        V_B_mag = fem.functionspace(self.mesh, ("Lagrange", deg))
+        self.B_mag = fem.Function(V_B_mag)
+        self.B_mag.name = "B_mag"
         
         # PETSc options for solver
         petsc_options = {
             "ksp_type": "gmres",
-            "ksp_rtol": 1e-8,
+            "ksp_rtol": 1e-12,
             "ksp_error_if_not_converged": True,
             "pc_type": "lu",
             "pc_factor_shift_type": "NONZERO",
         }
+
+        # Air-gap mask setup for per-step B metrics and peak-time reporting.
+        import math as _math
+
+        def _cell_r(c: int) -> float:
+            g = self.mesh.geometry.dofmap[c]
+            cx = float(np.mean(self.mesh.geometry.x[g, 0]))
+            cy = float(np.mean(self.mesh.geometry.x[g, 1]))
+            return _math.hypot(cx, cy)
+
+        pm_cells = np.concatenate([self.ct.find(self.tags.PM_N), self.ct.find(self.tags.PM_S)])
+        stator_cells = self.ct.find(self.tags.STATOR)
+        if pm_cells.size and stator_cells.size:
+            rin = max(_cell_r(int(c)) for c in pm_cells)
+            rout = min(_cell_r(int(c)) for c in stator_cells)
+        else:
+            rin, rout = 0.0, 1.0
+
+        xcoord = ufl.SpatialCoordinate(self.mesh)
+        r = ufl.sqrt(xcoord[0] ** 2 + xcoord[1] ** 2)
+        gap_mask = ufl.conditional(
+            ufl.lt(r, rout),
+            ufl.conditional(ufl.gt(r, rin), 1.0, 0.0),
+            0.0,
+        )
+        area_gap = fem.assemble_scalar(fem.form(gap_mask * ufl.dx(domain=self.mesh)))
+
+        peak_gap_brms = -1.0
+        peak_gap_time = 0.0
+
+        def _solve_with_residual_trace(prob: LinearProblem, stage_label: str):
+            """Solve and print per-iteration residual decrease."""
+            ksp = prob.solver
+            residuals = []
+
+            def _monitor(_ksp, its, rnorm):
+                r = float(rnorm)
+                residuals.append(r)
+                print(f"      [{stage_label}] iter {its:3d}: |r|={r:.6e}")
+
+            ksp.setMonitor(_monitor)
+            sol = prob.solve()
+            try:
+                ksp.cancelMonitor()
+            except Exception:
+                pass
+            return sol, ksp, residuals
         
         # Time loop
         start_time = time.time()
@@ -562,35 +680,32 @@ class MaxwellSolver2D:
                 petsc_options=petsc_options,
                 petsc_options_prefix="mixed"
             )
-            self.w_sol = prob.solve()
+            self.w_sol, ksp, _ = _solve_with_residual_trace(prob, "init t=0.00 ms")
+            ksp_its = int(ksp.getIterationNumber())
+            ksp_res = float(ksp.getResidualNorm())
+            ksp_reason = int(ksp.getConvergedReason())
             Az_sol, V_sol = self.w_sol.split()
             
             # Compute B field
             Bx_expr = ufl.grad(Az_sol)[1]
             By_expr = -ufl.grad(Az_sol)[0]
             B_expr = ufl.as_vector((Bx_expr, By_expr))
-            from dolfinx.fem import form
-            from dolfinx.fem.petsc import assemble_matrix, assemble_vector
-            from petsc4py import PETSc
-            v_B = ufl.TestFunction(V_B)
-            u_B = ufl.TrialFunction(V_B)
-            a_B = form(ufl.inner(u_B, v_B) * ufl.dx)
-            L_B = form(ufl.inner(B_expr, v_B) * ufl.dx)
-            A = assemble_matrix(a_B)
-            A.assemble()
-            b = assemble_vector(L_B)
-            b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-            ksp = PETSc.KSP().create()
-            ksp.setOperators(A)
-            ksp.setType("preonly")
-            ksp.getPC().setType("lu")
-            ksp.solve(b, self.B_field.x.petsc_vec)
+            Bvec_interp = fem.Expression(B_expr, V_B.element.interpolation_points)
+            self.B_field.interpolate(Bvec_interp)
             self.B_field.x.scatter_forward()
             
             # Save initial state if t=0 is in target times
             if 0.0 in target_times:
                 Az_sol.name = "Az"
                 out.write_function(Az_sol, 0.0)
+                Bmag_expr = fem.Expression(
+                    ufl.sqrt(Bx_expr * Bx_expr + By_expr * By_expr),
+                    V_B_mag.element.interpolation_points,
+                )
+                self.B_mag.interpolate(Bmag_expr)
+                self.B_mag.x.scatter_forward()
+                out.write_function(self.B_field, 0.0)
+                out.write_function(self.B_mag, 0.0)
                 norm_Az = np.linalg.norm(Az_sol.x.array)
                 print(f"   Step {step:3d}/{num_steps}  t={0.0*1e3:5.2f} ms  ||Az||={norm_Az:.2e}")
                 step += 1
@@ -621,7 +736,12 @@ class MaxwellSolver2D:
                         petsc_options=petsc_options,
                         petsc_options_prefix="mixed"
                     )
-                    self.w_sol = prob.solve()
+                    self.w_sol, ksp, _ = _solve_with_residual_trace(
+                        prob, f"t={t*1e3:.2f} ms"
+                    )
+                    ksp_its = int(ksp.getIterationNumber())
+                    ksp_res = float(ksp.getResidualNorm())
+                    ksp_reason = int(ksp.getConvergedReason())
                     
                     # Extract components
                     Az_sol, V_sol = self.w_sol.split()
@@ -630,22 +750,8 @@ class MaxwellSolver2D:
                     Bx_expr = ufl.grad(Az_sol)[1]
                     By_expr = -ufl.grad(Az_sol)[0]
                     B_expr = ufl.as_vector((Bx_expr, By_expr))
-                    from dolfinx.fem import form
-                    from dolfinx.fem.petsc import assemble_matrix, assemble_vector
-                    from petsc4py import PETSc
-                    v_B = ufl.TestFunction(V_B)
-                    u_B = ufl.TrialFunction(V_B)
-                    a_B = form(ufl.inner(u_B, v_B) * ufl.dx)
-                    L_B = form(ufl.inner(B_expr, v_B) * ufl.dx)
-                    A = assemble_matrix(a_B)
-                    A.assemble()
-                    b = assemble_vector(L_B)
-                    b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-                    ksp = PETSc.KSP().create()
-                    ksp.setOperators(A)
-                    ksp.setType("preonly")
-                    ksp.getPC().setType("lu")
-                    ksp.solve(b, self.B_field.x.petsc_vec)
+                    Bvec_interp = fem.Expression(B_expr, V_B.element.interpolation_points)
+                    self.B_field.interpolate(Bvec_interp)
                     self.B_field.x.scatter_forward()
                     
                     # Update previous solution
@@ -654,12 +760,41 @@ class MaxwellSolver2D:
                 # Save at target time
                 Az_sol.name = "Az"
                 out.write_function(Az_sol, t)
+                Bmag_expr = fem.Expression(
+                    ufl.sqrt(Bx_expr * Bx_expr + By_expr * By_expr),
+                    V_B_mag.element.interpolation_points,
+                )
+                self.B_mag.interpolate(Bmag_expr)
+                self.B_mag.x.scatter_forward()
+                out.write_function(self.B_field, t)
+                out.write_function(self.B_mag, t)
                 norm_Az = np.linalg.norm(Az_sol.x.array)
-                print(f"   Step {step:3d}/{num_steps}  t={t*1e3:5.2f} ms  ||Az||={norm_Az:.2e}")
+                # Per-step B_rms in air-gap, and track peak over all saved steps.
+                Bx = ufl.grad(Az_sol)[1]
+                By = -ufl.grad(Az_sol)[0]
+                b2 = Bx * Bx + By * By
+                val_gap = fem.assemble_scalar(fem.form(b2 * gap_mask * ufl.dx(domain=self.mesh)))
+                Brms_gap = float(np.sqrt(val_gap / max(area_gap, 1e-18)))
+                if Brms_gap > peak_gap_brms:
+                    peak_gap_brms = Brms_gap
+                    peak_gap_time = t
+
+                print(
+                    f"   Step {step:3d}/{num_steps}  t={t*1e3:5.2f} ms  "
+                    f"||Az||={norm_Az:.2e}  KSP it={ksp_its:3d}  "
+                    f"|r|={ksp_res:.3e}  reason={ksp_reason}  "
+                    f"B_rms(gap)={Brms_gap:.3e} T"
+                )
                 step += 1
         else:
             # Original uniform stepping
-            num_steps = int(self.config.T_end / self.config.dt)
+            num_steps = self.config.num_steps
+            if self.config.write_every_timestep:
+                write_steps = set(range(1, num_steps + 1))
+            else:
+                n_out = max(1, min(num_steps, int(self.config.output_num_timestamps)))
+                write_steps = set(np.linspace(1, num_steps, n_out, dtype=int).tolist())
+                write_steps.add(num_steps)
             for step in range(1, num_steps + 1):
                 t += self.config.dt
                 
@@ -678,7 +813,12 @@ class MaxwellSolver2D:
                     petsc_options=petsc_options,
                     petsc_options_prefix="mixed"
                 )
-                self.w_sol = prob.solve()
+                self.w_sol, ksp, _ = _solve_with_residual_trace(
+                    prob, f"t={t*1e3:.2f} ms"
+                )
+                ksp_its = int(ksp.getIterationNumber())
+                ksp_res = float(ksp.getResidualNorm())
+                ksp_reason = int(ksp.getConvergedReason())
                 
                 # Extract components
                 Az_sol, V_sol = self.w_sol.split()
@@ -688,42 +828,43 @@ class MaxwellSolver2D:
                 Bx_expr = ufl.grad(Az_sol)[1]
                 By_expr = -ufl.grad(Az_sol)[0]
                 B_expr = ufl.as_vector((Bx_expr, By_expr))
-                # Project B onto DG space manually
-                from dolfinx.fem import form
-                from dolfinx.fem.petsc import assemble_matrix, assemble_vector, apply_lifting, set_bc
-                from petsc4py import PETSc
-                v_B = ufl.TestFunction(V_B)
-                u_B = ufl.TrialFunction(V_B)
-                a_B = form(ufl.inner(u_B, v_B) * ufl.dx)
-                L_B = form(ufl.inner(B_expr, v_B) * ufl.dx)
-                # Assemble
-                A = assemble_matrix(a_B)
-                A.assemble()
-                b = assemble_vector(L_B)
-                b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-                # Solve
-                ksp = PETSc.KSP().create()
-                ksp.setOperators(A)
-                ksp.setType("preonly")
-                ksp.getPC().setType("lu")
-                ksp.solve(b, self.B_field.x.petsc_vec)
+                Bvec_interp = fem.Expression(B_expr, V_B.element.interpolation_points)
+                self.B_field.interpolate(Bvec_interp)
                 self.B_field.x.scatter_forward()
                 
                 # Update previous solution
                 self.w_prev.x.array[:] = self.w_sol.x.array[:]
                 
-                # Save output at multiple time steps (at least 4, evenly spaced)
-                save_interval = max(1, num_steps // 4)  # Save at 4 time points
-                if step % save_interval == 0 or step == num_steps:
-                    # Write A field (B can be computed from A during visualization)
+                # Save output based on configured timestamp policy.
+                if step in write_steps:
+                    # Write A and B fields directly for robust visualization.
                     Az_sol.name = "Az"
                     out.write_function(Az_sol, t)
-                    # Note: B field is computed but not saved to XDMF due to space mismatch
-                    # B can be computed from A during visualization: B = curl(A)
+                    Bmag_expr = fem.Expression(
+                        ufl.sqrt(Bx_expr * Bx_expr + By_expr * By_expr),
+                        V_B_mag.element.interpolation_points,
+                    )
+                    self.B_mag.interpolate(Bmag_expr)
+                    self.B_mag.x.scatter_forward()
+                    out.write_function(self.B_field, t)
+                    out.write_function(self.B_mag, t)
                 
                 # Progress
                 norm_Az = np.linalg.norm(Az_sol.x.array)
-                print(f"   Step {step:3d}/{num_steps}  t={t*1e3:5.2f} ms  ||Az||={norm_Az:.2e}")
+                Bx = ufl.grad(Az_sol)[1]
+                By = -ufl.grad(Az_sol)[0]
+                b2 = Bx * Bx + By * By
+                val_gap = fem.assemble_scalar(fem.form(b2 * gap_mask * ufl.dx(domain=self.mesh)))
+                Brms_gap = float(np.sqrt(val_gap / max(area_gap, 1e-18)))
+                if Brms_gap > peak_gap_brms:
+                    peak_gap_brms = Brms_gap
+                    peak_gap_time = t
+                print(
+                    f"   Step {step:3d}/{num_steps}  t={t*1e3:5.2f} ms  "
+                    f"||Az||={norm_Az:.2e}  KSP it={ksp_its:3d}  "
+                    f"|r|={ksp_res:.3e}  reason={ksp_reason}  "
+                    f"B_rms(gap)={Brms_gap:.3e} T"
+                )
                 # Report final-step average magnetic flux density magnitude (B_rms)
                 if step == num_steps:
                     Bx = ufl.grad(Az_sol)[1]
@@ -790,7 +931,12 @@ class MaxwellSolver2D:
         
         elapsed = time.time() - start_time
         print(f"\n✅ Simulation complete in {elapsed:.1f}s")
-        print(f"   Output: {output_file}")
+        print(f"   Output: {output_path}")
+        if peak_gap_brms >= 0.0:
+            print(
+                f"   Peak air-gap B_rms: {peak_gap_brms:.3e} T "
+                f"at t={peak_gap_time*1e3:.2f} ms"
+            )
         
     def run(self):
         """Execute full simulation workflow"""
@@ -814,5 +960,6 @@ class MaxwellSolver2D:
 # ============================================================================
 
 if __name__ == "__main__":
-    solver = MaxwellSolver2D(mesh_file="../../meshes/2d/motor.msh")
+    default_mesh = Path(__file__).resolve().parent / "motor.msh"
+    solver = MaxwellSolver2D(mesh_file=str(default_mesh))
     solver.run()
