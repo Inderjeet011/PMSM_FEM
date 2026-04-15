@@ -180,7 +180,7 @@ class DomainTags:
 class MaxwellSolver2D:
     """2D Maxwell solver for PM motor using A-V mixed formulation"""
     
-    def __init__(self, mesh_file="pmsm_2d_mesh.msh", config=None):
+    def __init__(self, mesh_file="mesh.msh", config=None):
         self.config = config or SimulationConfig()
         self.tags = DomainTags()
         self.mesh_file = mesh_file
@@ -211,7 +211,7 @@ class MaxwellSolver2D:
         if not mesh_path.exists():
             raise FileNotFoundError(
                 f"Mesh file not found: {mesh_path}\n"
-                "Generate it first with: python pmsm_mesh_2d.py"
+                "Generate it first with: python mesh.py"
             )
         self.mesh, self.ct, *rest = gmshio.read_from_msh(
             str(mesh_path), MPI.COMM_WORLD, rank=0, gdim=2
@@ -568,7 +568,7 @@ class MaxwellSolver2D:
         
         # Output file in same folder as this solver by default.
         if output_file is None:
-            output_file = Path(__file__).resolve().parent / "pmsm_2d_maxwell_av.xdmf"
+            output_file = Path(__file__).resolve().parent / "result.xdmf"
         output_path = Path(output_file).expanduser()
         if not output_path.is_absolute():
             output_path = (Path.cwd() / output_path).resolve()
@@ -960,6 +960,6 @@ class MaxwellSolver2D:
 # ============================================================================
 
 if __name__ == "__main__":
-    default_mesh = Path(__file__).resolve().parent / "pmsm_2d_mesh.msh"
+    default_mesh = Path(__file__).resolve().parent / "mesh.msh"
     solver = MaxwellSolver2D(mesh_file=str(default_mesh))
     solver.run()
