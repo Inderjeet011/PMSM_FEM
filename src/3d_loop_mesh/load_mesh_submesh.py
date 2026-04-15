@@ -252,8 +252,8 @@ def setup_boundary_conditions_submesh(
         if component.size == 0:
             return component
 
-        pad_fraction = float(getattr(config, "terminal_pad_fraction", 0.5))
-        pad_fraction = min(max(pad_fraction, 0.15), 1.0)
+        pad_fraction = float(getattr(config, "terminal_pad_fraction", 0.40))
+        pad_fraction = min(max(pad_fraction, 0.10), 0.50)
 
         centroids = np.asarray(
             [_facet_centroid_xyz(int(f), f2v, coords) for f in component],
@@ -342,24 +342,14 @@ def setup_boundary_conditions_submesh(
 
         facets_min = boundary_facets[z_mid <= (zmin + tol_z)]
         facets_max = boundary_facets[z_mid >= (zmax - tol_z)]
-        return facets_min.astype(np.int32), facets_max.astype(np.int32)
+        drive_pad = _select_rectangular_terminal_pad(facets_min.astype(np.int32), f2v, coords)
+        neutral_pad = _select_rectangular_terminal_pad(facets_max.astype(np.int32), f2v, coords)
+        return drive_pad, neutral_pad
 
-    def _representative_leg_dof(marker: int, leg_facets: np.ndarray) -> np.ndarray:
+    def _terminal_patch_dofs(leg_facets: np.ndarray) -> np.ndarray:
         if leg_facets.size == 0:
             return np.array([], dtype=np.int32)
-        tdim = mesh_conductor.topology.dim
-        fdim = tdim - 1
-        mesh_conductor.topology.create_connectivity(fdim, tdim)
-        f2c = mesh_conductor.topology.connectivity(fdim, tdim)
-        coil_cells = set(int(c) for c in cell_tags_conductor.find(marker))
-        for f in leg_facets:
-            for c in f2c.links(int(f)):
-                ci = int(c)
-                if ci in coil_cells:
-                    dofs = V_space.dofmap.cell_dofs(ci)
-                    if dofs.size > 0:
-                        return np.array([int(dofs[0])], dtype=np.int32)
-        return np.array([], dtype=np.int32)
+        return fem.locate_dofs_topological(V_space, mesh_conductor.topology.dim - 1, leg_facets)
 
     from dolfinx.mesh import meshtags  # type: ignore
 
@@ -398,7 +388,7 @@ def setup_boundary_conditions_submesh(
         )
 
     if mesh_conductor.comm.rank == 0:
-        print("Tagged coil terminal facets (drive, neutral):")
+        print("Tagged coil terminal pad facets (drive, neutral):")
         for marker, n_drive, n_neutral in terminal_summary:
             print(f"  coil {marker}: {n_drive}, {n_neutral}")
 
@@ -426,8 +416,8 @@ def setup_boundary_conditions_submesh(
             drive_tag, neutral_tag = TERMINAL_FACET_TAGS[marker]
             facets_drive = terminal_mt.find(drive_tag)
             facets_neutral = terminal_mt.find(neutral_tag)
-            dofs_drive = _representative_leg_dof(marker, facets_drive)
-            dofs_neutral = _representative_leg_dof(marker, facets_neutral)
+            dofs_drive = _terminal_patch_dofs(facets_drive)
+            dofs_neutral = _terminal_patch_dofs(facets_neutral)
             if dofs_drive.size > 0:
                 bcs.append(fem.dirichletbc(V_phase, dofs_drive))
             if dofs_neutral.size > 0:

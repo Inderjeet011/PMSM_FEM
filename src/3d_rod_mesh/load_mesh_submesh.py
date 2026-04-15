@@ -245,7 +245,7 @@ def setup_boundary_conditions_submesh(
         zmin = float(z_mid.min())
         zmax = float(z_mid.max())
         zspan = max(abs(zmax - zmin), 1.0)
-        tol_z = 1e-6 * zspan
+        tol_z = 1e-9 * zspan
 
         facets_min = boundary_facets[z_mid <= (zmin + tol_z)]
         facets_max = boundary_facets[z_mid >= (zmax - tol_z)]

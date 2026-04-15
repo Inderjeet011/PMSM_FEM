@@ -10,7 +10,17 @@ import dolfinx
 
 _all_ = ["model_parameters", "mesh_parameters", "surface_map"]
 
+    # Copper coil geometry (rod model):
+# keep original coil width/angles to isolate air-gap effects
+_COIL_SHRINK = 1.0
 COIL_HALF_ANGLE = np.pi / 12.0
+
+# Rotor-to-coil clearance:
+# Set physical air-gap explicitly (used to position copper inner radius).
+_AIR_GAP_SHRINK = 1.0
+
+# Coil thickness shrink (keep original thickness)
+_COIL_THICK_SHRINK = 1.0
 
 # ---------------------------------------------------------------------------
 # Model and mesh parameters
@@ -86,8 +96,11 @@ mesh_parameters: Dict[str, float] = {
     "r7": 0.038,  # PM outer radius
     # NOTE: We model the true air-gap as the thin annulus [r3, r3 + air_gap]
     # The slot/air region [r3 + air_gap, r4] contains copper windings
-    "air_gap": 0.002,  # 2mm physical air-gap
+    "air_gap": 0.002,  # 2mm physical air-gap (rotor-to-coil clearance)
 }
+
+# Apply rotor-to-coil gap scaling (currently 1.0, kept for easy future tuning)
+mesh_parameters["air_gap"] *= _AIR_GAP_SHRINK
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +116,9 @@ def _add_copper_segment(angle: float, center: int) -> int:
     r3 = mesh_parameters["r3"]
     r_gap = r3 + mesh_parameters["air_gap"]
     r4 = mesh_parameters["r4"]
+    # Effective outer copper radius for rod copper:
+    # reduce radial copper thickness by _COIL_THICK_SHRINK while keeping the copper inner radius fixed at r_gap.
+    r4_cu = r_gap + _COIL_THICK_SHRINK * (r4 - r_gap)
 
     # Use two visibly larger opposite coils for the single-phase test.
     dphi = COIL_HALF_ANGLE
@@ -111,8 +127,8 @@ def _add_copper_segment(angle: float, center: int) -> int:
     # Inner radius is now r_gap (not r3) to preserve slot thickness
     p_i0 = gmsh.model.occ.addPoint(r_gap * np.cos(angle - dphi), r_gap * np.sin(angle - dphi), 0.0)
     p_i1 = gmsh.model.occ.addPoint(r_gap * np.cos(angle + dphi), r_gap * np.sin(angle + dphi), 0.0)
-    p_o0 = gmsh.model.occ.addPoint(r4 * np.cos(angle - dphi), r4 * np.sin(angle - dphi), 0.0)
-    p_o1 = gmsh.model.occ.addPoint(r4 * np.cos(angle + dphi), r4 * np.sin(angle + dphi), 0.0)
+    p_o0 = gmsh.model.occ.addPoint(r4_cu * np.cos(angle - dphi), r4_cu * np.sin(angle - dphi), 0.0)
+    p_o1 = gmsh.model.occ.addPoint(r4_cu * np.cos(angle + dphi), r4_cu * np.sin(angle + dphi), 0.0)
 
     # Create arcs using addCircleArc with shared center point
     arc_inner = gmsh.model.occ.addCircleArc(p_i0, center, p_i1)
@@ -229,7 +245,9 @@ def generate_PMSM_mesh(
     pm_spacing = 2.0 * np.pi / pm_count
     pm_angles = np.asarray([i * pm_spacing for i in range(pm_count)], dtype=np.float64)
     slot_half = COIL_HALF_ANGLE
-    coil_radial_width = r4 - r_gap
+    # Effective outer copper radius for rod copper (matches _add_copper_segment).
+    r4_cu = r_gap + _COIL_THICK_SHRINK * (r4 - r_gap)
+    coil_radial_width = r4_cu - r_gap
     arch_centerline_radius = 0.5 * (r_gap + r4)
     arch_thickness_scale = 0.58
     arch_width_scale = 0.92
@@ -470,7 +488,7 @@ def generate_PMSM_mesh(
                 motor_z_start - extension_height - tol
                 <= z
                 <= motor_z_end + extension_height + tol
-                and r_gap - tol <= r <= r4 + tol
+                and r_gap - tol <= r <= r4_cu + tol
             ):
                 for i, ang in enumerate(slot_angles):
                     if _angle_diff(theta, ang) <= slot_half:
@@ -760,7 +778,7 @@ def generate_PMSM_mesh(
             motor_z_start - extension_height - tol
             <= z
             <= motor_z_end + extension_height + tol
-            and r_gap - tol <= r <= r4 + tol
+            and r_gap - tol <= r <= r4_cu + tol
         ):
             for i, ang in enumerate(slot_angles):
                 if _angle_diff(theta, ang) <= slot_half:
@@ -852,9 +870,45 @@ def generate_PMSM_mesh(
                 rotor_radii = radii[rotor_mask]
                 rotor_max_local = float(rotor_radii.max())
                 rotor_max_global = comm.allreduce(rotor_max_local, op=MPI.MAX)
-                gap_measured = airgap_min_global - rotor_max_global
-                print(f"   Rotor max radius: {rotor_max_global:.6f} m")
-                print(f"   Measured air-gap: {gap_measured:.6f} m (target: {air_gap:.6f} m)")
+                # Center-based estimate (cell-center radii; can under/over-estimate vs true boundary thickness)
+                # Air-gap thickness should compare rotor outer radius to *outer* air-gap radius, so use airgap_max_global.
+                gap_measured_center = airgap_max_global - rotor_max_global
+                print(f"   Rotor max radius (centers): {rotor_max_global:.6f} m")
+                print(
+                    f"   Measured air-gap (centers): {gap_measured_center:.6f} m (target: {air_gap:.6f} m)"
+                )
+
+                # Vertex-based estimate (closer to the true geometric gap)
+                mesh.topology.create_connectivity(mesh.topology.dim, 0)
+                c2v = mesh.topology.connectivity(mesh.topology.dim, 0)
+                vertex_radii = np.linalg.norm(mesh.geometry.x[:, :2], axis=1)
+
+                rotor_cell_indices = np.where(rotor_mask)[0].astype(np.int32)
+                airgap_max_vertex_local = -np.inf
+                rotor_max_vertex_local = -np.inf
+
+                for ci in airgap_cell_indices:
+                    verts = c2v.links(int(ci))
+                    if len(verts) > 0:
+                        airgap_max_vertex_local = max(
+                            airgap_max_vertex_local,
+                            float(vertex_radii[np.array(verts, dtype=np.int32)].max()),
+                        )
+                for ci in rotor_cell_indices:
+                    verts = c2v.links(int(ci))
+                    if len(verts) > 0:
+                        rotor_max_vertex_local = max(
+                            rotor_max_vertex_local, float(vertex_radii[np.array(verts, dtype=np.int32)].max())
+                        )
+
+                airgap_max_vertex_global = comm.allreduce(airgap_max_vertex_local, op=MPI.MAX)
+                rotor_max_vertex_global = comm.allreduce(rotor_max_vertex_local, op=MPI.MAX)
+                gap_measured_vertices = airgap_max_vertex_global - rotor_max_vertex_global
+
+                print(f"   Rotor max radius (vertices): {rotor_max_vertex_global:.6f} m")
+                print(
+                    f"   Measured air-gap (vertices): {gap_measured_vertices:.6f} m (target: {air_gap:.6f} m)"
+                )
     else:
         if rank == root:
             unique_tags = np.unique(new_tags)

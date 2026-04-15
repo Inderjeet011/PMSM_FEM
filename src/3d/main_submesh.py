@@ -17,6 +17,7 @@ from dolfinx.mesh import create_submesh
 from mpi4py import MPI
 import ufl
 import numpy as np
+import time
 from pathlib import Path
 import shutil
 
@@ -50,6 +51,7 @@ from load_mesh_submesh import omega_rs, omega_rpm, omega_c, omega_pm
 
 
 def main():
+    t_start = time.perf_counter()
     config = make_config()
 
     print("\n=== Loading mesh ===")
@@ -278,7 +280,7 @@ def main():
         J_bp_writer.close()
 
     if mesh_parent.comm.rank == 0:
-        print("\n=== Done ===")
+        print(f"\n=== Done ===  (time: {time.perf_counter() - t_start:.2f} s)")
 
 
 if __name__ == "__main__":

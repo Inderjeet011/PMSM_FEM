@@ -29,7 +29,7 @@ def make_config():
     base_dir = Path(__file__).resolve().parent
     return SimpleNamespace(
         dt=dt,
-        num_steps=50,
+        num_steps=100,
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),
@@ -45,7 +45,7 @@ def make_config():
         outer_atol=3,
         ksp_A_max_it=8,
         ksp_A_restart=35,
-        ksp_A_rtol=2e-2,
+        ksp_A_rtol=1e-2,
         sigma_al_override=0.0,
         sigma_cu_override=5.96e7,
     )

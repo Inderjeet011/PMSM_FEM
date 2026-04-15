@@ -29,7 +29,7 @@ def make_config():
     loop_dir = Path(__file__).parent.resolve()
     return SimpleNamespace(
         dt=dt,
-        num_steps=50,  # short transient for visualization and current decomposition
+        num_steps=1,  # short transient for visualization and current decomposition
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),
@@ -40,8 +40,8 @@ def make_config():
         mesh_path=loop_dir / "pmesh3D_ipm.xdmf",
         results_path=loop_dir / "av_solver_submesh.xdmf",
         write_results=True,
-        outer_max_it=500,
-        outer_atol=9e-1,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
+        outer_max_it=20,
+        outer_atol=1e-1,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
         ksp_A_max_it=15,
         ksp_A_restart=35,
         ksp_A_rtol=2e-5,
@@ -50,7 +50,7 @@ def make_config():
         cut_plane_axis="z",
         terminal_pad_fraction=1,
         # Restore applied coil voltage for field visualization
-        V_amp=100,  # [V] peak voltage applied to drive coil terminals
+        V_amp=200,  # [V] peak voltage applied to drive coil terminals
     )
 
 
