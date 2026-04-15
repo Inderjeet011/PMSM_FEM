@@ -1,4 +1,10 @@
-"""Utilities for handling DOLFINx EntityMap objects."""
+"""
+Helpers for DOLFINx ``EntityMap`` between conductor submesh and parent mesh.
+
+Used when projecting submesh fields or copying parent-cell data (e.g. \\(\\sigma\\))
+to conductor cells. ``get_entity_map`` returns the submesh-to-parent cell index
+array; ``entity_map_to_dict`` builds a dense Python map for small loops.
+"""
 
 import numpy as np
 import numpy.typing as npt
@@ -14,7 +20,7 @@ def get_entity_map(entity_map: mesh.EntityMap, inverse: bool = False) -> npt.NDA
     return entity_map.sub_topology_to_topology(indices, inverse=inverse)
 
 
-def entity_map_to_dict(entity_map, n_submesh_cells, comm=None):
+def entity_map_to_dict(entity_map, n_submesh_cells):
     """Convert EntityMap to a dictionary mapping submesh cell -> parent cell."""
     mapping = {}
     parent_cells_array = get_entity_map(entity_map, inverse=False)

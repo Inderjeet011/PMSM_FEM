@@ -1,4 +1,11 @@
-"""Helper functions for 3D submesh-based solver."""
+"""
+Runtime helpers for ``3d_loop_coils``: config, sources, magnet rotation, time step.
+
+``make_config`` sets paths (``mesh.xdmf``, ``result.xdmf``), electrical frequency,
+and terminal voltage amplitude ``V_amp``. ``setup_sources`` allocates ``J_z`` /
+``M``; ``rotate_magnetization`` updates PM vectors; ``compute_B_field`` and
+``solve_one_step_submesh`` advance the transient solve (RHS assembly + nested KSP).
+"""
 
 import numpy as np
 from pathlib import Path
@@ -11,43 +18,46 @@ import ufl
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
-from load_mesh_submesh import CURRENT_MAP, MAGNETS
-from entity_map_utils import get_entity_map
+from entity_map import get_entity_map
+from load_mesh import MAGNETS
 
 
 def make_config():
-    from mesh_3D import model_parameters
+    from mesh import model_parameters
 
     freq = float(model_parameters["freq"])
     pole_pairs = 5
-    steps_per_period = 40
+    steps_per_period = 10  # fewer steps → larger dt → smaller inv_dt, helps convergence with coupling 1.0
     dt = (1.0 / freq) / steps_per_period
     omega_e = 2.0 * np.pi * freq
     rotation_direction = -1.0
     omega_m = rotation_direction * (omega_e / max(pole_pairs, 1))
 
-    base_dir = Path(__file__).resolve().parent
+    loop_dir = Path(__file__).parent.resolve()
     return SimpleNamespace(
         dt=dt,
-        num_steps=100,
+        num_steps=1,  # short transient for visualization and current decomposition
         degree_A=1,
         degree_V=1,
         mu0=float(model_parameters["mu_0"]),
-        coil_current_peak=float(model_parameters["J"]),
+        # Restore permanent magnet excitation
         magnet_remanence=1.2,
         omega_e=omega_e,
         omega_m=omega_m,
-        mesh_path=base_dir / "pmesh3D_ipm.xdmf",
-        results_path=base_dir / "av_solver_submesh.xdmf",
+        mesh_path=loop_dir / "mesh.xdmf",
+        results_path=loop_dir / "result.xdmf",
         write_results=True,
-        outer_max_it=30,
-        outer_rtol=0.0,
-        outer_atol=3,
-        ksp_A_max_it=8,
+        outer_max_it=50,
+        outer_atol=1e-5,  # outer KSP: stop when ||r|| <= outer_atol (no relative tol)
+        ksp_A_max_it=15,
         ksp_A_restart=35,
-        ksp_A_rtol=1e-2,
-        sigma_al_override=0.0,
-        sigma_cu_override=5.96e7,
+        ksp_A_rtol=2e-5,
+        A_pc="boomeramg",  # options: "boomeramg", "gamg"
+        use_cut_face_terminals=True,
+        cut_plane_axis="z",
+        terminal_pad_fraction=1,
+        # Restore applied coil voltage for field visualization
+        V_amp=200,  # [V] peak voltage applied to drive coil terminals
     )
 
 
@@ -104,19 +114,8 @@ def rotate_magnetization(cell_tags, M_vec, config, t):
     M_vec.x.scatter_forward()
 
 
-def update_currents(cell_tags, J_z, config, t):
-    omega = config.omega_e
-    J_peak = config.coil_current_peak
-    J_z.x.array[:] = 0.0
-    for marker, meta in CURRENT_MAP.items():
-        cells = cell_tags.find(marker)
-        if cells.size == 0:
-            continue
-        J_z.x.array[cells] = J_peak * meta["alpha"] * np.sin(omega * t + meta["beta"])
-
-
 def compute_B_field(mesh, A_sol, B_space, B_magnitude_space):
-    """Compute B field from A (on parent mesh)."""
+    """Compute B field from A (on parent mesh) and basic statistics."""
     curlA = ufl.curl(A_sol)
     DG_vec = fem.functionspace(mesh, ("DG", 0, (3,)))
     B_dg = fem.Function(DG_vec, name="B_dg")
@@ -155,38 +154,34 @@ def compute_J_field_conductor(
     cell_tags_conductor=None,
     active_markers=None,
     component="total",
-    degree=1,
 ):
-    """Compute current density on the conductor submesh."""
+    """Current density on conductor submesh: ``J = sigma * E`` with ``E`` from ``-grad(V)`` and ``-dA/dt``.
+
+    component:
+      - ``"total"``: sigma * (-grad(V) - dA/dt)
+      - ``"gradV"``: sigma * (-grad(V))
+      - ``"dA_dt"``: sigma * (-dA/dt)
+    """
     tdim = mesh_parent.topology.dim
-    n_conductor_cells = (
-        mesh_conductor.topology.index_map(tdim).size_local
-        + mesh_conductor.topology.index_map(tdim).num_ghosts
-    )
+    n_conductor_cells = mesh_conductor.topology.index_map(tdim).size_local + mesh_conductor.topology.index_map(tdim).num_ghosts
     parent_cells = get_entity_map(entity_map, inverse=False)
     conductor_cells = np.arange(n_conductor_cells, dtype=np.int32)
 
     DG0_vec_parent = fem.functionspace(mesh_parent, ("DG", 0, (mesh_parent.geometry.dim,)))
-    DG0_vec_conductor = fem.functionspace(
-        mesh_conductor, ("DG", 0, (mesh_conductor.geometry.dim,))
-    )
+    DG0_vec_conductor = fem.functionspace(mesh_conductor, ("DG", 0, (mesh_conductor.geometry.dim,)))
     DG0_conductor = fem.functionspace(mesh_conductor, ("DG", 0))
 
     A_vis = fem.Function(DG0_vec_parent, name="A_vis")
     A_prev_vis = fem.Function(DG0_vec_parent, name="A_prev_vis")
     A_vis.interpolate(fem.Expression(A_sol, DG0_vec_parent.element.interpolation_points))
-    A_prev_vis.interpolate(
-        fem.Expression(A_prev, DG0_vec_parent.element.interpolation_points)
-    )
+    A_prev_vis.interpolate(fem.Expression(A_prev, DG0_vec_parent.element.interpolation_points))
     A_vis.x.scatter_forward()
     A_prev_vis.x.scatter_forward()
 
     A_conductor = fem.Function(DG0_vec_conductor, name="A_cond")
     A_prev_conductor = fem.Function(DG0_vec_conductor, name="A_prev_cond")
     A_conductor.interpolate(A_vis, cells0=parent_cells, cells1=conductor_cells)
-    A_prev_conductor.interpolate(
-        A_prev_vis, cells0=parent_cells, cells1=conductor_cells
-    )
+    A_prev_conductor.interpolate(A_prev_vis, cells0=parent_cells, cells1=conductor_cells)
     A_conductor.x.scatter_forward()
     A_prev_conductor.x.scatter_forward()
 
@@ -196,9 +191,7 @@ def compute_J_field_conductor(
     dA_dt.x.scatter_forward()
 
     grad_V = fem.Function(DG0_vec_conductor, name="grad_V")
-    grad_V.interpolate(
-        fem.Expression(ufl.grad(V_sol), DG0_vec_conductor.element.interpolation_points)
-    )
+    grad_V.interpolate(fem.Expression(ufl.grad(V_sol), DG0_vec_conductor.element.interpolation_points))
     grad_V.x.scatter_forward()
 
     sigma_conductor = fem.Function(DG0_conductor, name="sigma_cond")
@@ -271,11 +264,11 @@ def solve_one_step_submesh(mesh_parent, A_space, V_space,
                            cell_tags_parent, config, ksp, mat_nest,
                            a_blocks, L_blocks, block_bcs,
                            J_z, M_vec, A_prev, t):
-    update_currents(cell_tags_parent, J_z, config, t)
     rotate_magnetization(cell_tags_parent, M_vec, config, t)
 
     comm = mesh_parent.comm
     rhs = assemble_rhs_submesh(a_blocks, L_blocks, block_bcs, A_space, V_space)
+
     sol = rhs.duplicate()
     sol.set(0.0)
 
@@ -291,7 +284,7 @@ def solve_one_step_submesh(mesh_parent, A_space, V_space,
         isA_list, isV_list = mat_nest.getNestISs()
         isA = isA_list[0]
         isV = isV_list[1]
-    except Exception:
+    except PETSc.Error:
         nA = A_space.dofmap.index_map.size_global
         nV = V_space.dofmap.index_map.size_global
         isA = PETSc.IS().createGeneral(np.arange(0, nA, dtype=np.int32), comm=comm)
@@ -317,10 +310,9 @@ def solve_one_step_submesh(mesh_parent, A_space, V_space,
 
     r_mono = b_mono.duplicate()
     A_mono.mult(x_mono, r_mono)
-    r_mono.aypx(-1.0, b_mono)  # r = b - A x
+    r_mono.aypx(-1.0, b_mono)
     rhs_norm = float(b_mono.norm(PETSc.NormType.NORM_2))
     residual_norm = float(r_mono.norm(PETSc.NormType.NORM_2))
-    relative_residual = residual_norm / rhs_norm if rhs_norm > 1e-30 else float("inf")
 
     A_sol = fem.Function(A_space, name="A")
     V_sol = fem.Function(V_space, name="V")
@@ -331,4 +323,4 @@ def solve_one_step_submesh(mesh_parent, A_space, V_space,
 
     A_prev.x.array[:] = A_sol.x.array[:]
     A_prev.x.scatter_forward()
-    return A_sol, V_sol, residual_norm, rhs_norm, relative_residual
+    return A_sol, V_sol, residual_norm, rhs_norm

@@ -1,120 +1,52 @@
 # PMSM_FEM
 
-Finite-element PMSM models built with `FEniCSx` / `DOLFINx`. The repository contains a legacy 2D model plus several active 3D transient A-V eddy-current workflows for different coil geometries.
+Transient **A–V** eddy-current models for PMSMs using **FEniCSx / DOLFINx**: one **2D** driver and three **3D** drivers (coil geometry / excitation differ).
 
-## What Is In The Repo
+## Layout
 
-- `src/2d`: legacy 2D PMSM mesh generator and solver
-- `src/3d`: main 3D transient A-V solver with bulk 3-phase current-driven coils
-- `src/3d_loop_mesh`: 3D loop-coil variant with local BP/VTX outputs
-- `src/3d_rod_mesh`: 3D rod-coil variant with extended copper regions
+| Path | What it is |
+|------|------------|
+| `src/2d/` | 2D A–V (`Az`, `V`): `solve.py` |
+| `src/3d_volume_coils/` | 3D: **bulk `J_z`** (three-phase) in coil volumes |
+| `src/3d_loop_coils/` | 3D: **six loops**, **terminal voltages** |
+| `src/3d_rod_coils/` | 3D: **rod-style** coils, same voltage drive as loop |
 
-All 3D variants use:
+**3D shared:** `A` in H(curl) on the full mesh; `V` on a conductor submesh; rotating PMs; PETSc nested solves. Post: `B` from curl `A`; `J` from `sigma * (-grad(V) - dA/dt)` (DG0) for VTX.
 
-- `A` in an `H(curl)` Nedelec space
-- `V` on a conductor submesh
-- rotating permanent-magnet excitation
-- PETSc `fieldsplit` block solves with Hypre preconditioning
+**Outputs** (when `write_results` in `utils.make_config()`): `result.xdmf` / `result.h5`, plus VTX folders **`V.bp`**, **`J.bp`**, **`B.bp`** (motor-only B). New runs usually wipe prior outputs in that folder.
 
 ## Requirements
 
-You need a working FEniCSx environment with at least:
-
-- `dolfinx`
-- `petsc4py`
-- `mpi4py`
-- `numpy`
-- `gmsh`
-
-Typical options are a conda-forge environment or a DOLFINx Docker image.
-
-## Common Workflow
-
-### 1. Generate A Mesh
-
-Each 3D workflow has its own mesh generator and writes mesh files into the same folder as the script.
-
-Examples:
+`dolfinx`, `petsc4py`, `mpi4py`, `numpy`, `gmsh` — see **`requirements.txt`**. Prefer a **conda-forge** DOLFINx env or the official **DOLFINx** image so PETSc/HDF5 match.
 
 ```bash
-cd src/3d
-python mesh_3D.py --res 0.005 --depth 0.057
+python -c "import dolfinx, gmsh; print('OK')"
+```
+
+## Run
+
+Generate mesh and solver **from the case directory** (paths are relative to each `main.py`).
+
+```bash
+cd src/3d_loop_coils
+python mesh.py --res 0.005 --depth 0.057   # python mesh.py --help
+python main.py
 ```
 
 ```bash
-cd src/3d_loop_mesh
-python mesh_3D.py
+cd src/2d && python solve.py
 ```
 
-```bash
-cd src/3d_rod_mesh
-python mesh_3D.py
-```
+**MPI:** `mpirun -np 4 python main.py` (same cwd as `mesh.xdmf`).
 
-This produces files such as:
+## Config & files
 
-- `pmesh3D_ipm.msh`
-- `pmesh3D_ipm.xdmf`
-- `pmesh3D_ipm.h5`
+- **Tuning:** `utils.py` → `make_config()` (`dt`, `num_steps`, `V_amp` / currents, `write_results`, KSP, paths).
+- **Materials / tags:** `mesh.py` → `model_parameters`; **`load_mesh.setup_materials`**. Typical 3D: air, airgap, rotor (tags 4–5 may both map to rotor on old/new meshes), stator, coils ~7–12, PMs ~13–22 — confirm in each `mesh.py`.
+- **Per 3D folder:** `mesh.py`, `load_mesh.py`, `entity_map.py`, `forms.py`, `utils.py`, `main.py`.
 
-### 2. Run A Solver
+## Git
 
-Run the solver from the corresponding folder:
+`.gitignore` drops `*.h5`, `*.xdmf`, `*.msh`, `**/*.bp/`. Regenerate meshes/results after clone.
 
-```bash
-cd src/3d
-python main_submesh.py
-```
-
-```bash
-cd src/3d_loop_mesh
-python main_submesh.py
-```
-
-```bash
-cd src/3d_rod_mesh
-python main_submesh.py
-```
-
-MPI execution is also supported:
-
-```bash
-mpirun -np 4 python main_submesh.py
-```
-
-## Outputs
-
-Each 3D folder writes results locally beside the solver scripts.
-
-Common outputs include:
-
-- `av_solver_submesh.xdmf`
-- `av_solver_submesh.h5`
-- `V_field_submesh.bp`
-- `J_field_submesh.bp`
-- `B_field_motor_submesh.bp`
-
-The exact BP outputs depend on the workflow variant. Open the `xdmf` file in ParaView for the standard dataset, or the `.bp` folders for VTX/ADIOS output.
-
-## Notes On The Active 3D Model
-
-- The main `src/3d` workflow currently uses bulk 3-phase current-driven coil regions.
-- Opposite coil sides are mapped to the same phase with opposite current sign.
-- The `A`-block preconditioner in the active `src/3d` solver is Hypre `boomeramg` with `HMIS` coarsening.
-- The main `src/3d` mesh now extrudes coil regions slightly beyond the motor stack in both `+z` and `-z`.
-
-## Repo Layout
-
-```text
-PMSM_FEM/
-├── README.md
-└── src/
-    ├── 2d/
-    ├── 3d/
-    ├── 3d_loop_mesh/
-    └── 3d_rod_mesh/
-```
-
-## Status
-
-This repository is under active development. Several 3D workflows coexist while geometry, excitation, and output handling are being compared and refined.
+**Status:** Active development; treat each folder’s `mesh.py` / `main.py` docstrings as canonical.

@@ -17,6 +17,9 @@ build/
 # Mesh files (can be large)
 *.msh
 
+# VTX / ADIOS2 output directories (e.g. B.bp/)
+**/*.bp/
+
 # Results directory - ignore all output files
 results/**/*.h5
 results/**/*.hdf5
@@ -53,6 +56,7 @@ venv/
 env/
 ENV/
 .venv/
+.cadenv/
 
 # IDE settings
 .vscode/

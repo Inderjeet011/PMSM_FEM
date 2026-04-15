@@ -1,5 +1,10 @@
-"""3D A-V solver with submesh: forms, assembly, and PETSc solver setup.
-A on parent mesh, V on conductor submesh.
+"""
+Weak forms, assembly, and PETSc solver for the **loop-coil** A–V formulation.
+
+Coupled curl–curl + conductor potentials with motional PM terms; RHS uses
+``J_z``/magnetization as in the shared formulation. Matrix assembly and nested
+KSP (fieldsplit + Hypre AMS / direct V block) match the volume workflow, with
+parameters from ``utils.make_config``.
 """
 
 from dolfinx import fem  # type: ignore
@@ -11,7 +16,7 @@ import numpy as np  # type: ignore
 
 def build_forms_submesh(mesh_parent, A_space, V_space,
                         sigma, nu, M_vec, A_prev,
-                        dx_parent, dx_rs, dx_rpm, dx_c, dx_pm,
+                        dx_parent, dx_r, dx_rpm, dx_c, dx_pm,
                         config, entity_map, dx_cond_parent):
     mu0 = config.mu0
 
@@ -32,14 +37,13 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
     # dx_c term stabilizes the coil region (coils excluded from V-submesh, so no V-block stabilization there)
     a00 = (
         nu * ufl.inner(curlA, curlv) * dx_parent
-        + (sigma * inv_dt) * ufl.inner(A, v) * dx_rs
+        + (sigma * inv_dt) * ufl.inner(A, v) * dx_r
         + (sigma * inv_dt) * ufl.inner(A, v) * dx_c
         + (sigma * inv_dt) * ufl.inner(A, v) * dx_pm
         - sigma * ufl.inner(ufl.cross(u_rot, curlA), v) * dx_rpm
     )
 
-    # A–V coupling. Rotation term restricted to rotor iron only (marker 5, σ≠0 and in submesh).
-    # Al (marker 4) is in omega_rpm but has σ=0 and is not in submesh → excluded via dx_rotor_iron.
+    # A–V coupling: motional term on rotor iron (tag 5; σ≠0 on submesh).
     dx_rotor_iron = dx_parent(5)
     a01 = sigma * ufl.inner(ufl.grad(S), v) * dx_cond_parent
     a10 = (
@@ -49,7 +53,7 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
     a11 = sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_cond_parent
 
     L0 = (
-        (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_rs
+        (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_r
         + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_c
         + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_pm
         + ufl.inner(nu * mu0 * M_vec, curlv) * dx_pm

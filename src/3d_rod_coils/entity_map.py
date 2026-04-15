@@ -1,4 +1,8 @@
-"""Utilities for handling DOLFINx EntityMap objects."""
+"""
+Helpers for DOLFINx ``EntityMap`` between conductor submesh and parent mesh.
+
+Shared with the other 3D coil packages for submesh tagging and field transfers.
+"""
 
 import numpy as np
 import numpy.typing as npt
@@ -14,7 +18,7 @@ def get_entity_map(entity_map: mesh.EntityMap, inverse: bool = False) -> npt.NDA
     return entity_map.sub_topology_to_topology(indices, inverse=inverse)
 
 
-def entity_map_to_dict(entity_map, n_submesh_cells, comm=None):
+def entity_map_to_dict(entity_map, n_submesh_cells):
     """Convert EntityMap to a dictionary mapping submesh cell -> parent cell."""
     mapping = {}
     parent_cells_array = get_entity_map(entity_map, inverse=False)

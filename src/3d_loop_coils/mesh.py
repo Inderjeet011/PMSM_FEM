@@ -1,4 +1,14 @@
-# Generate a single-phase PMSM model, with a given minimal resolution, encapsulated in a LxL box.
+"""
+3D Gmsh mesh for the **loop-coil** motor (six separate copper loops, IPM stack).
+
+Builds 2D/3D geometry with loop conductors, optional axial slicing of the stack,
+extrusion, air box, and physical tagging. Exports ``mesh.msh`` and
+``mesh.xdmf`` / ``mesh.h5`` for ``load_mesh`` and the solver. Constants
+``model_parameters``, ``mesh_parameters``, and ``surface_map`` describe materials
+and boundary labels (including cut-plane facets when slicing is enabled).
+
+CLI: ``python mesh.py`` (see ``--help``).
+"""
 
 import argparse
 from pathlib import Path
@@ -6,9 +16,8 @@ from typing import Dict, Union
 import numpy as np
 from mpi4py import MPI
 import gmsh
-import dolfinx
 
-_all_ = ["model_parameters", "mesh_parameters", "surface_map"]
+__all__ = ["model_parameters", "mesh_parameters", "surface_map"]
 
 COIL_HALF_ANGLE = np.pi / 12.0
 
@@ -25,29 +34,17 @@ model_parameters = {
         "Cu": 1,   # copper ~ non-magnetic
         "Stator": 30,
         "Rotor": 30,
-        "Al": 1,
         "Air": 1,
         "AirGap": 1,
         "PM": 1.04457,
     },
     "sigma": {
-        # Restore original conductivities
         "Rotor": 1.6e6,
-        "Al": 0,       # aluminium treated as non-conducting (no eddy currents)
         "Stator": 0,
         "Cu": 5.96e7,  # copper conductivity [S/m]; coils treated as conductors
         "Air": 0,
         "AirGap": 0,
         "PM": 6.25e5,
-    },
-    "densities": {
-        "Rotor": 7850,
-        "Al": 2700,
-        "Stator": 0,
-        "Air": 0,
-        "Cu": 0,
-        "AirGap": 0,
-        "PM": 7500,
     },
 }
 
@@ -69,20 +66,12 @@ SLICE_HALF_MODE = "axial"
 _domain_map_three: Dict[str, tuple[int, ...]] = {
     "Air": (1,),
     "AirGap": (2, 3),
-    "Al": (4,),
+    # Shaft + rotor iron share tag 5 (rotor assembly)
     "Rotor": (5,),
     "Stator": (6,),
     # Six separate copper coils (tags 7–12)
     "Cu": (7, 8, 9, 10, 11, 12),
     "PM": (13, 14, 15, 16, 17, 18, 19, 20, 21, 22),
-}
-
-# Currents mapping to the four coil markers
-_currents_three: Dict[int, Dict[str, float]] = {
-    7: {"alpha": 1, "beta": 0},
-    8: {"alpha": -1, "beta": 0},
-    9: {"alpha": 0, "beta": 1},
-    10: {"alpha": 0, "beta": -1},
 }
 
 # Radii (kept from your script)
@@ -394,11 +383,11 @@ def generate_PMSM_mesh(
         gmsh.model.occ.synchronize()
 
         # Curve loops and base surfaces:
-        # Shaft (Al)
+        # Inner shaft (same physical tag as rotor assembly after classification)
         loop_r1 = gmsh.model.occ.addCurveLoop([c_r1])
         shaft_surf = gmsh.model.occ.addPlaneSurface([loop_r1])  # r in [0, r1]
 
-        # Rotor annulus (Rotor) between r1 and r3
+        # Rotor annulus between r1 and r3
         loop_r3 = gmsh.model.occ.addCurveLoop([c_r3])
         rotor_surf = gmsh.model.occ.addPlaneSurface([loop_r3, loop_r1])  # [r1, r3]
 
@@ -419,7 +408,7 @@ def generate_PMSM_mesh(
         # ------------------------------------------------------------
         # Copper coils: explicit standing loop conductors
         # ------------------------------------------------------------
-        # Keep the rest of the motor identical to the reference mesh_3D pipeline.
+        # Keep the rest of the motor identical to the reference mesh pipeline.
         # Only replace the copper slot sectors with explicit loop coils that sit
         # inside the slot-air annulus and span the motor stack in z.
         coil_ring_radius = 0.5 * (r_gap + r4)
@@ -459,9 +448,7 @@ def generate_PMSM_mesh(
         # Collect all 2D surfaces to extrude. Slot-air is extruded separately so
         # the 3D loop coils can be carved out of it afterwards.
         domains_2d_non_cu = []
-        # Shaft (Al)
         domains_2d_non_cu.append((2, shaft_surf))
-        # Rotor iron
         domains_2d_non_cu.extend(rotor_surfaces)
         # True airgap ring (thin)
         domains_2d_non_cu.append((2, airgap_surf))
@@ -619,14 +606,14 @@ def generate_PMSM_mesh(
                 theta += 2.0 * np.pi
 
             # Copper: explicit loop-coil solids. Use interior probes instead of
-            # radial/angular heuristics so the rest of mesh_3D can stay unchanged.
+            # radial/angular heuristics so the rest of mesh.py can stay unchanged.
             for i, probe in enumerate(coil_probes):
                 if _point_inside_volume(int(tag3), probe):
                     cu_marker = domain_map["Cu"][i % len(domain_map["Cu"])]
                     return "Cu", cu_marker
 
             if _point_inside_volume(int(tag3), al_probe):
-                return "Al", domain_map["Al"][0]
+                return "Rotor", domain_map["Rotor"][0]
 
             # Outside the original motor stack, anything that is not Cu is air.
             if z < motor_z_start - tol or z > motor_z_end + tol:
@@ -916,7 +903,6 @@ def generate_PMSM_mesh(
         | set(domain_map["PM"])
         | set(domain_map["Rotor"])
         | set(domain_map["Stator"])
-        | set(domain_map["Al"])
     )
 
     def classify_cell(cell_idx, r, theta, z):
@@ -939,9 +925,9 @@ def generate_PMSM_mesh(
                 if _angle_diff(theta, ang) <= pm_half:
                     return domain_map["PM"][i % len(domain_map["PM"])]
         
-        # Radial bands
+        # Inner shaft and rotor annulus: single rotor-assembly tag (5)
         if r <= r1 + tol:
-            return domain_map["Al"][0]
+            return domain_map["Rotor"][0]
         if r1 < r <= r3 + tol:
             return domain_map["Rotor"][0]
         # True air-gap: ONLY in [r3, r_gap] (2mm annulus)
@@ -1127,6 +1113,6 @@ if __name__ == "__main__":
 
     folder = Path(__file__).parent.resolve()
     folder.mkdir(parents=True, exist_ok=True)
-    fname = folder / "pmesh3D_ipm"
+    fname = folder / "mesh"
 
     generate_PMSM_mesh(fname, False, res, args.L, depth, lc_max_ratio=args.lc_max_ratio, dist_max_ratio=args.dist_max_ratio, optimize="")

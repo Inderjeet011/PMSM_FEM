@@ -1,5 +1,9 @@
-"""3D A-V solver with submesh: forms, assembly, and PETSc solver setup.
-A on parent mesh, V on conductor submesh.
+"""
+Weak forms, assembly, and PETSc solver for the **rod-coil** A–V formulation.
+
+Same block structure as the other 3D variants: coupled A–V with fieldsplit
+preconditioning (Hypre AMS on ``A``, direct on ``V``). Parameters come from
+``utils.make_config``.
 """
 
 from dolfinx import fem  # type: ignore
@@ -11,7 +15,7 @@ import numpy as np  # type: ignore
 
 def build_forms_submesh(mesh_parent, A_space, V_space,
                         sigma, nu, M_vec, A_prev,
-                        dx_parent, dx_rs, dx_rpm, dx_c, dx_pm,
+                        dx_parent, dx_r, dx_rpm, dx_c, dx_pm,
                         config, entity_map, dx_cond_parent):
     mu0 = config.mu0
 
@@ -32,7 +36,7 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
     # dx_c term stabilizes the coil region (coils excluded from V-submesh, so no V-block stabilization there)
     a00 = (
         nu * ufl.inner(curlA, curlv) * dx_parent
-        + (sigma * inv_dt) * ufl.inner(A, v) * dx_rs
+        + (sigma * inv_dt) * ufl.inner(A, v) * dx_r
         + (sigma * inv_dt) * ufl.inner(A, v) * dx_c
         + (sigma * inv_dt) * ufl.inner(A, v) * dx_pm
         - sigma * ufl.inner(ufl.cross(u_rot, curlA), v) * dx_rpm
@@ -49,7 +53,7 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
     a11 = sigma * ufl.inner(ufl.grad(S), ufl.grad(q)) * dx_cond_parent
 
     L0 = (
-        (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_rs
+        (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_r
         + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_c
         + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_pm
         + ufl.inner(nu * mu0 * M_vec, curlv) * dx_pm

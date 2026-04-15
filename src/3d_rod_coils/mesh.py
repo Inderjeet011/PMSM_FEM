@@ -1,4 +1,13 @@
-# Generate a single-phase PMSM model, with a given minimal resolution, encapsulated in a LxL box.
+"""
+3D Gmsh mesh for the **rod-coil** IPM motor (extended copper rods vs. thin loops).
+
+Extends the shared motor-building pipeline with rod-specific sizing/scaling
+(air-gap and coil thickness knobs) before extrusion, air box, and tagging.
+Exports ``mesh.msh`` and ``mesh.xdmf`` / ``mesh.h5``, plus ``model_parameters``,
+``mesh_parameters``, and ``surface_map`` for the solver.
+
+CLI: ``python mesh.py`` (see ``--help``).
+"""
 
 import argparse
 from pathlib import Path
@@ -6,12 +15,10 @@ from typing import Dict, Union
 import numpy as np
 from mpi4py import MPI
 import gmsh
-import dolfinx
 
-_all_ = ["model_parameters", "mesh_parameters", "surface_map"]
+__all__ = ["model_parameters", "mesh_parameters", "surface_map"]
 
-    # Copper coil geometry (rod model):
-# keep original coil width/angles to isolate air-gap effects
+# Copper coil geometry (rod model); keep original coil width/angles to isolate air-gap effects
 _COIL_SHRINK = 1.0
 COIL_HALF_ANGLE = np.pi / 12.0
 
@@ -50,15 +57,6 @@ model_parameters = {
         "AirGap": 0,
         "PM": 6.25e5,
     },
-    "densities": {
-        "Rotor": 7850,
-        "Al": 2700,
-        "Stator": 0,
-        "Air": 0,
-        "Cu": 0,
-        "AirGap": 0,
-        "PM": 7500,
-    },
 }
 
 # Facet markers
@@ -74,14 +72,6 @@ _domain_map_three: Dict[str, tuple[int, ...]] = {
     # Six separate copper coils (tags 7–12)
     "Cu": (7, 8, 9, 10, 11, 12),
     "PM": (13, 14, 15, 16, 17, 18, 19, 20, 21, 22),
-}
-
-# Currents mapping to the four coil markers
-_currents_three: Dict[int, Dict[str, float]] = {
-    7: {"alpha": 1, "beta": 0},
-    8: {"alpha": -1, "beta": 0},
-    9: {"alpha": 0, "beta": 1},
-    10: {"alpha": 0, "beta": -1},
 }
 
 # Radii (kept from your script)
@@ -1011,6 +1001,6 @@ if __name__ == "__main__":
 
     folder = Path(__file__).parent.resolve()
     folder.mkdir(parents=True, exist_ok=True)
-    fname = folder / "pmesh3D_ipm"
+    fname = folder / "mesh"
 
     generate_PMSM_mesh(fname, False, res, args.L, depth, lc_max_ratio=args.lc_max_ratio, dist_max_ratio=args.dist_max_ratio, optimize="")

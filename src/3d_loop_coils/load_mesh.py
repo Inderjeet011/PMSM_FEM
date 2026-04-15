@@ -1,4 +1,12 @@
-"""Setup functions for 3D solver with submesh approach."""
+"""
+Mesh loading and BC setup for ``3d_loop_coils``.
+
+Loads ``mesh.xdmf``, builds the conductor submesh, propagates cell tags, and
+configures **voltage-driven** coil boundaries: time-dependent potentials on the
+lower coil-leg facets per phase (see ``VOLTAGE_MAP`` / ``setup_boundary_conditions_submesh``).
+Also provides materials (\\(\\sigma\\), \\(\\nu\\)), exterior ``A`` BCs, and optional
+``CoilLowerHalves`` tagging for half-coil logic.
+"""
 
 import numpy as np  # type: ignore
 from dolfinx import fem, io  # type: ignore
@@ -8,8 +16,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from mesh_3D import mesh_parameters, model_parameters, surface_map  # type: ignore
+from mesh import mesh_parameters, model_parameters, surface_map  # type: ignore
 
+# Rotor assembly (shaft + annulus); new meshes use tag 5 only; 4 = legacy shaft
 ROTOR = (5,)
 # Six copper coils (volume tags 7–12)
 COILS = (7, 8, 9, 10, 11, 12)
@@ -55,11 +64,6 @@ def omega_c():
     return COILS
 
 
-def omega_rs():
-    """Rotor assembly and stator."""
-    return omega_r() + omega_s()
-
-
 def omega_rpm():
     """Rotor assembly and permanent magnets."""
     return omega_r() + omega_pm()
@@ -100,13 +104,13 @@ def load_mesh_and_extract_submesh(mesh_path):
     entity_map = result[1]
 
     from dolfinx.mesh import meshtags  # type: ignore
-    from entity_map_utils import entity_map_to_dict  # type: ignore
+    from entity_map import entity_map_to_dict  # type: ignore
 
     n_submesh_cells = mesh_conductor.topology.index_map(tdim).size_local
     submesh_cell_indices = np.arange(n_submesh_cells, dtype=np.int32)
     submesh_tags = np.empty(n_submesh_cells, dtype=np.int32)
     cell_to_tag_parent = {int(i): int(v) for i, v in zip(cell_tags_parent.indices, cell_tags_parent.values)}
-    entity_dict = entity_map_to_dict(entity_map, n_submesh_cells, mesh_parent.comm)
+    entity_dict = entity_map_to_dict(entity_map, n_submesh_cells)
 
     # Optional: lower-half labels on the conductor submesh (from CoilLowerHalves DG0 field).
     coil_half_submesh = None
@@ -144,7 +148,7 @@ def setup_materials(mesh, cell_tags, config):
     sigma_dict = model_parameters["sigma"]
 
     marker_to_material = {
-        1: "Air", 2: "AirGap", 3: "AirGap", 4: "Al", 5: "Rotor", 6: "Stator",
+        1: "Air", 2: "AirGap", 3: "AirGap", 4: "Rotor", 5: "Rotor", 6: "Stator",
         **{m: "Cu" for m in COILS}, **{m: "PM" for m in MAGNETS},
     }
 

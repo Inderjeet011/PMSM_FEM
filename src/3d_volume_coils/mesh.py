@@ -1,12 +1,24 @@
-# Generate the three phase PMSM model, with a given minimal resolution, encapsulated in a LxL box.
+"""
+3D Gmsh mesh for the **volume-coil** interior permanent-magnet motor.
+
+Constructs 2D motor slices (shaft, rotor, air-gap, stator, slot copper, PMs),
+extrudes to 3D with optional coil height extension, embeds the stack in a
+bounding air box, fragments and tags volumes/surfaces, then exports ``mesh.msh``
+and DOLFINx ``mesh.xdmf`` / ``mesh.h5``. Cell markers are recomputed from cell
+center coordinates so material tags stay consistent after boolean operations.
+
+Also exports ``model_parameters``, ``mesh_parameters``, and ``surface_map`` for
+the solver and ``load_mesh``.
+
+CLI: ``python mesh.py`` (see ``--help`` for resolution and box grading options).
+"""
 
 import argparse
 from pathlib import Path
-from typing import Dict, Union
+from typing import Dict, List, Union
 import numpy as np
 from mpi4py import MPI
 import gmsh
-import dolfinx
 
 __all__ = ["model_parameters", "mesh_parameters", "surface_map"]
 
@@ -22,28 +34,17 @@ model_parameters = {
         "Cu": 1,
         "Stator": 30,
         "Rotor": 30,
-        "Al": 1,
         "Air": 1,
         "AirGap": 1,
         "PM": 1.04457,
     },
     "sigma": {
         "Rotor": 1.6e6,
-        "Al": 3.72e7,
         "Stator": 0,
         "Cu": 0,
         "Air": 0,
         "AirGap": 0,
         "PM": 6.25e5,
-    },
-    "densities": {
-        "Rotor": 7850,
-        "Al": 2700,
-        "Stator": 0,
-        "Air": 0,
-        "Cu": 0,
-        "AirGap": 0,
-        "PM": 7500,
     },
 }
 
@@ -54,21 +55,11 @@ surface_map: Dict[str, Union[int, str]] = {"Exterior": 1, "MidAir": 2, "restrict
 _domain_map_three: Dict[str, tuple[int, ...]] = {
     "Air": (1,),
     "AirGap": (2, 3),
-    "Al": (4,),
+    # Shaft and rotor iron share one tag (rotor assembly)
     "Rotor": (5,),
     "Stator": (6,),
     "Cu": (7, 8, 9, 10, 11, 12),
     "PM": (13, 14, 15, 16, 17, 18, 19, 20, 21, 22),
-}
-
-# Currents mapping to Cu markers (you already had this)
-_currents_three: Dict[int, Dict[str, float]] = {
-    7: {"alpha": 1, "beta": 0},
-    8: {"alpha": -1, "beta": 2 * np.pi / 3},
-    9: {"alpha": 1, "beta": 4 * np.pi / 3},
-    10: {"alpha": -1, "beta": 0},
-    11: {"alpha": 1, "beta": 2 * np.pi / 3},
-    12: {"alpha": -1, "beta": 4 * np.pi / 3},
 }
 
 # Radii (kept from your script)
@@ -167,8 +158,11 @@ def _angle_diff(a: float, b: float) -> float:
 # ---------------------------------------------------------------------------
 
 def generate_PMSM_mesh(
-    filename: Path, single: bool, res: np.float64, L: np.float64, depth: np.float64,
-    lc_max_ratio: float = 25.0, dist_max_ratio: float = 8.0,
+    filename: Path,
+    res: np.float64,
+    depth: np.float64,
+    lc_max_ratio: float = 25.0,
+    dist_max_ratio: float = 8.0,
     optimize: str = "Netgen",
 ):
     """
@@ -187,7 +181,6 @@ def generate_PMSM_mesh(
 
     # Extract geometry parameters (needed by all ranks for retagging)
     r1 = mesh_parameters["r1"]
-    r2 = mesh_parameters["r2"]
     r3 = mesh_parameters["r3"]
     r4 = mesh_parameters["r4"]
     r5 = mesh_parameters["r5"]
@@ -221,6 +214,42 @@ def generate_PMSM_mesh(
 
     # Tolerance for classification (needed for retagging)
     tol = 1e-3 * r5
+
+    def classify_marker(r: float, theta: float, z: float) -> int:
+        """Gmsh volume tagging and DOLFINx retagging use the same rules (theta in [0, 2π))."""
+        slot_half = np.pi / 8.0
+        if (
+            coil_z_start - tol <= z <= coil_z_end + tol
+            and r_gap - tol <= r <= r4 + tol
+        ):
+            for i, ang in enumerate(slot_angles):
+                if _angle_diff(theta, ang) <= slot_half:
+                    return domain_map["Cu"][i % len(domain_map["Cu"])]
+        if z < motor_z_start - tol or z > motor_z_end + tol:
+            return domain_map["Air"][0]
+        if r > r5 + tol:
+            return domain_map["Air"][0]
+        pm_half = np.pi / 12.0
+        if r6 - tol <= r <= r7 + tol:
+            for i, ang in enumerate(pm_angles):
+                if _angle_diff(theta, ang) <= pm_half:
+                    return domain_map["PM"][i % len(domain_map["PM"])]
+        # Inner shaft and rotor annulus share one rotor-assembly tag (marker 5)
+        if r <= r1 + tol:
+            return domain_map["Rotor"][0]
+        if r1 < r <= r3 + tol:
+            return domain_map["Rotor"][0]
+        if r3 - tol <= r <= r_gap + tol:
+            return (
+                domain_map["AirGap"][0]
+                if r <= r_mid_gap
+                else domain_map["AirGap"][1]
+            )
+        if r_gap - tol < r <= r4 + tol:
+            return domain_map["Air"][0]
+        if r4 - tol <= r <= r5 + tol:
+            return domain_map["Stator"][0]
+        return domain_map["Air"][0]
 
     # Geometry is built only on rank 0 using Gmsh
     if rank == root:
@@ -259,7 +288,6 @@ def generate_PMSM_mesh(
 
         # Base circles
         c_r1 = gmsh.model.occ.addCircle(0, 0, 0, r1)
-        c_r2 = gmsh.model.occ.addCircle(0, 0, 0, r2)
         c_r3 = gmsh.model.occ.addCircle(0, 0, 0, r3)
         c_rgap = gmsh.model.occ.addCircle(0, 0, 0, r_gap)
         c_r4 = gmsh.model.occ.addCircle(0, 0, 0, r4)
@@ -268,11 +296,11 @@ def generate_PMSM_mesh(
         gmsh.model.occ.synchronize()
 
         # Curve loops and base surfaces:
-        # Shaft (Al)
+        # Inner shaft (same physical tag as rotor assembly after classification)
         loop_r1 = gmsh.model.occ.addCurveLoop([c_r1])
         shaft_surf = gmsh.model.occ.addPlaneSurface([loop_r1])  # r in [0, r1]
 
-        # Rotor annulus (Rotor) between r1 and r3
+        # Rotor annulus between r1 and r3
         loop_r3 = gmsh.model.occ.addCurveLoop([c_r3])
         rotor_surf = gmsh.model.occ.addPlaneSurface([loop_r3, loop_r1])  # [r1, r3]
 
@@ -333,9 +361,7 @@ def generate_PMSM_mesh(
 
         domains_2d_non_cu = []
         domains_2d_cu = []
-        # Shaft (Al)
         domains_2d_non_cu.append((2, shaft_surf))
-        # Rotor iron
         domains_2d_non_cu.extend(rotor_surfaces)
         # True airgap ring (thin)
         domains_2d_non_cu.append((2, airgap_surf))
@@ -401,139 +427,22 @@ def generate_PMSM_mesh(
 
         volumes, _ = gmsh.model.occ.fragment([(3, air_box)], motor_volumes)
         gmsh.model.occ.synchronize()
-        
-        # Debug: print total volumes
-        num_volumes = sum(1 for dim, tag in volumes if dim == 3)
-        print(f"\nTotal 3D volumes after fragment: {num_volumes}")
 
         # ------------------------------------------------------------
-        # Step 5: Tag volumes by center-of-mass (robust classification)
+        # Step 5: Tag volumes by center-of-mass (same logic as DOLFINx retag below)
         # ------------------------------------------------------------
-
-        def classify_volume(tag3: int):
-            x, y, z = gmsh.model.occ.getCenterOfMass(3, tag3)
-            r = np.hypot(x, y)
-            theta = np.arctan2(y, x)
-            if theta < 0:
-                theta += 2.0 * np.pi
-
-            # Check Cu slots first, including the small symmetric overhang.
-            slot_half = np.pi / 8.0
-            if (
-                coil_z_start - tol <= z <= coil_z_end + tol
-                and r_gap - tol <= r <= r4 + tol
-            ):
-                for i, ang in enumerate(slot_angles):
-                    if _angle_diff(theta, ang) <= slot_half:
-                        cu_marker = domain_map["Cu"][i % len(domain_map["Cu"])]
-                        return "Cu", cu_marker
-
-            # Outer air box / region outside the main stack
-            if z < motor_z_start - tol or z > motor_z_end + tol:
-                return "Air", domain_map["Air"][0]
-            if r > r5 + tol:
-                return "Air", domain_map["Air"][0]
-
-            # Check PM pockets (must be before rotor check)
-            pm_half = np.pi / 12.0
-            if r6 - tol <= r <= r7 + tol:
-                for i, ang in enumerate(pm_angles):
-                    if _angle_diff(theta, ang) <= pm_half:
-                        pm_marker = domain_map["PM"][i % len(domain_map["PM"])]
-                        return "PM", pm_marker
-
-            # Radial bands for other regions
-            if r <= r1 + tol:
-                return "Al", domain_map["Al"][0]
-            # Rotor: from r1 to r3, excluding PM region (r6-r7 already handled above)
-            if r1 < r <= r3 + tol:
-                return "Rotor", domain_map["Rotor"][0]
-            # True air gap: from r3 to r_gap
-            if r3 - tol <= r <= r_gap + tol:
-                # air gap annulus - split into two regions
-                if r <= r_mid_gap:
-                    return "AirGap", domain_map["AirGap"][0]
-                else:
-                    return "AirGap", domain_map["AirGap"][1]
-            # Remaining slot/air region between air-gap and stator inner radius
-            if r_gap - tol < r <= r4 + tol:
-                return "Air", domain_map["Air"][0]
-            # Stator: from r4 to r5
-            if r4 - tol <= r <= r5 + tol:
-                return "Stator", domain_map["Stator"][0]
-
-            # Anything else inside box but not covered => treat as Air
-            return "Air", domain_map["Air"][0]
-
-        # Add physical groups - collect volumes by marker first
-        volumes_by_marker = {}
-        classification_counts = {}
-        sample_centers = {}  # For debugging
-        all_centers = []  # For debugging - store all volume centers
+        volumes_by_marker: Dict[int, List[int]] = {}
         for dim, tag in volumes:
             if dim != 3:
                 continue
             x, y, z = gmsh.model.occ.getCenterOfMass(3, tag)
             r = np.hypot(x, y)
-            all_centers.append((r, z, tag))
-            name, marker = classify_volume(tag)
-            if marker not in volumes_by_marker:
-                volumes_by_marker[marker] = []
-            volumes_by_marker[marker].append(tag)
-            # Count classifications for debugging
-            if name not in classification_counts:
-                classification_counts[name] = {"count": 0, "marker": marker}
-            classification_counts[name]["count"] += 1
-            # Store sample center for each material type
-            if name not in sample_centers:
-                sample_centers[name] = (r, x, y, z)
-        
-        # Debug: print volume distribution by radial position
-        print("\n=== VOLUME DISTRIBUTION BY RADIUS ===")
-        all_centers.sort(key=lambda x: x[0])  # Sort by radius
-        for r, z, tag in all_centers:
-            if r1 - 0.001 <= r <= r1 + 0.001:
-                region = "r1 (shaft)"
-            elif r1 < r <= r6:
-                region = "r1-r6 (rotor inner)"
-            elif r6 <= r <= r7:
-                region = "r6-r7 (PM region)"
-            elif r7 < r <= r3:
-                region = "r7-r3 (rotor outer)"
-            elif r3 <= r <= r4:
-                region = "r3-r4 (airgap)"
-            elif r4 <= r <= r5:
-                region = "r4-r5 (stator)"
-            elif r > r5:
-                region = ">r5 (air)"
-            else:
-                region = "other"
-            print(f"  Vol {tag:3d}: r={r:.4f}, z={z:.4f}, region={region}")
-        
-        # Print classification summary
-        print("\n=== VOLUME CLASSIFICATION SUMMARY ===")
-        for name in sorted(classification_counts.keys()):
-            count = classification_counts[name]["count"]
-            marker = classification_counts[name]["marker"]
-            r, x, y, z = sample_centers[name]
-            print(f"  {name:10s} (tag {marker:2d}): {count:4d} volumes, sample r={r:.4f}, z={z:.4f}")
-        
-        # Check for missing expected tags
-        expected_tags = set()
-        for tags in domain_map.values():
-            expected_tags.update(tags)
-        found_tags = set(volumes_by_marker.keys())
-        missing_tags = expected_tags - found_tags
-        if missing_tags:
-            print(f"\n⚠️  WARNING: Missing expected tags: {sorted(missing_tags)}")
-            print(f"   Found tags: {sorted(found_tags)}")
-            print(f"   Expected tags: {sorted(expected_tags)}")
-            print(f"\n   Radial boundaries: r1={r1:.4f}, r2={r2:.4f}, r3={r3:.4f}, r4={r4:.4f}, r5={r5:.4f}")
-            print(f"   PM region: r6={r6:.4f}, r7={r7:.4f}")
-            print(f"   Motor z-range: [{motor_z_start:.4f}, {motor_z_end:.4f}]")
-            print(f"   Coil z-range:  [{coil_z_start:.4f}, {coil_z_end:.4f}]")
-        
-        # Add physical groups with all volumes sharing the same marker
+            theta = float(np.arctan2(y, x))
+            if theta < 0:
+                theta += 2.0 * np.pi
+            marker = classify_marker(r, theta, z)
+            volumes_by_marker.setdefault(marker, []).append(tag)
+
         for marker, volume_tags in volumes_by_marker.items():
             gmsh.model.addPhysicalGroup(3, volume_tags, marker)
 
@@ -596,8 +505,10 @@ def generate_PMSM_mesh(
         res_base = float(res)
         lc_max = float(lc_max_ratio) * res_base
         dist_max = float(dist_max_ratio) * r5
-        if rank == root:
-            print(f"\n📐 Mesh grading: LcMin={res_base:.4e} (near motor r<{r5:.4f}), LcMax={lc_max:.4e} (far r>{dist_max:.4f})")
+        print(
+            f"\nMesh grading: LcMin={res_base:.4e} (near motor r<{r5:.4f}), "
+            f"LcMax={lc_max:.4e} (far r>{dist_max:.4f})"
+        )
 
         gmsh.model.mesh.field.add("Distance", 1)
         gmsh.model.mesh.field.setNumbers(1, "EdgesList", [cline])
@@ -616,8 +527,7 @@ def generate_PMSM_mesh(
         gmsh.option.setNumber("General.Terminal", 1)
         gmsh.model.mesh.generate(gdim)
         if optimize and optimize.lower() not in ("none", "off", ""):
-            if rank == root:
-                print(f"\n🔧 Running mesh optimization ({optimize})...")
+            print(f"\nMesh optimization ({optimize})...")
             gmsh.model.mesh.optimize(optimize)
 
         msh_file = str(filename.with_suffix(".msh"))
@@ -628,10 +538,9 @@ def generate_PMSM_mesh(
     comm.barrier()
 
     # ------------------------------------------------------------
-    # Step 8: Read MSH into DOLFINx and retag cells if needed
+    # Step 8: Read MSH into DOLFINx and retag cells (same rules as Gmsh volume tagging)
     # ------------------------------------------------------------
     # In newer DOLFINx (e.g. 0.10+), gmsh I/O lives in dolfinx.io.gmsh.
-    # Avoid shadowing the top-level gmsh module used for geometry creation.
     from dolfinx.io import gmsh as gmshio, XDMFFile
     import dolfinx.mesh as dmesh
 
@@ -639,163 +548,38 @@ def generate_PMSM_mesh(
         str(filename.with_suffix(".msh")), comm, 0, gdim=3
     )
     mesh = result[0]
-    ct = result[1] if len(result) > 1 else None
     ft = result[2] if len(result) > 2 else None
 
-    # Always retag cells based on center coordinates for accurate classification
-    # This ensures the 2mm air-gap is correctly identified regardless of Gmsh classification
-    if rank == root:
-        print("\n🔄 Retagging all cells by center coordinates for accurate domain classification...")
-    
-    # Get cell centers (same approach as load_mesh.py)
     coords = mesh.geometry.x
     dofmap = mesh.geometry.dofmap
-    # dofmap is a 2D array: shape (num_cells, num_vertices_per_cell)
     centers = coords[dofmap].mean(axis=1)
     radii = np.linalg.norm(centers[:, :2], axis=1)
     angles = np.mod(np.arctan2(centers[:, 1], centers[:, 0]), 2 * np.pi)
     z_coords = centers[:, 2]
-    
-    # Classification function for cells
-    def classify_cell(r, theta, z):
-        # Outer air box
-        # Check Cu slots first, including the small symmetric overhang.
-        slot_half = np.pi / 8.0
-        if (
-            coil_z_start - tol <= z <= coil_z_end + tol
-            and r_gap - tol <= r <= r4 + tol
-        ):
-            for i, ang in enumerate(slot_angles):
-                if _angle_diff(theta, ang) <= slot_half:
-                    return domain_map["Cu"][i % len(domain_map["Cu"])]
 
-        if z < motor_z_start - tol or z > motor_z_end + tol:
-            return domain_map["Air"][0]
-        if r > r5 + tol:
-            return domain_map["Air"][0]
-        
-        # Check PM pockets (must be before rotor check)
-        pm_half = np.pi / 12.0
-        if r6 - tol <= r <= r7 + tol:
-            for i, ang in enumerate(pm_angles):
-                if _angle_diff(theta, ang) <= pm_half:
-                    return domain_map["PM"][i % len(domain_map["PM"])]
-        
-        # Radial bands
-        if r <= r1 + tol:
-            return domain_map["Al"][0]
-        if r1 < r <= r3 + tol:
-            return domain_map["Rotor"][0]
-        # True air-gap: ONLY in [r3, r_gap] (2mm annulus)
-        if r3 - tol <= r <= r_gap + tol:
-            if r <= r_mid_gap:
-                return domain_map["AirGap"][0]
-            else:
-                return domain_map["AirGap"][1]
-        # Slot/air region between air-gap and stator inner radius
-        if r_gap - tol < r <= r4 + tol:
-            return domain_map["Air"][0]
-        # Stator: from r4 to r5
-        if r4 - tol <= r <= r5 + tol:
-            return domain_map["Stator"][0]
-        
-        return domain_map["Air"][0]
-    
-    # Retag all cells on all ranks
     n_cells = mesh.topology.index_map(3).size_local
     new_tags = np.empty(n_cells, dtype=np.int32)
     for i in range(n_cells):
-        new_tags[i] = classify_cell(radii[i], angles[i], z_coords[i])
-    
-    # Create new cell tags - this REPLACES the old ct (or creates it if None)
+        new_tags[i] = classify_marker(radii[i], angles[i], z_coords[i])
+
     cell_indices = np.arange(n_cells, dtype=np.int32)
     ct = dmesh.meshtags(mesh, mesh.topology.dim, cell_indices, new_tags)
-    
-    # Validate AirGap tagging (aggregate across all ranks)
-    airgap_mask = np.isin(new_tags, domain_map["AirGap"])
-    airgap_cell_indices = ct.indices[airgap_mask]
-    if len(airgap_cell_indices) > 0:
-        # Get cell centers for AirGap cells
-        mesh.topology.create_connectivity(mesh.topology.dim, 0)
-        c2v = mesh.topology.connectivity(mesh.topology.dim, 0)
-        airgap_centers = np.array([centers[int(idx)] for idx in airgap_cell_indices if int(idx) < len(centers)])
-        airgap_radii = np.linalg.norm(airgap_centers[:, :2], axis=1) if len(airgap_centers) > 0 else np.array([])
-    else:
-        airgap_radii = np.array([])
-    
-    # Gather statistics from all ranks
-    n_airgap_local = len(airgap_radii)
-    n_airgap_total = comm.allreduce(n_airgap_local, op=MPI.SUM)
-    
-    if n_airgap_total > 0:
-        # Find global min/max
-        airgap_min_local = float(airgap_radii.min()) if len(airgap_radii) > 0 else np.inf
-        airgap_max_local = float(airgap_radii.max()) if len(airgap_radii) > 0 else -np.inf
-        airgap_min_global = comm.allreduce(airgap_min_local, op=MPI.MIN)
-        airgap_max_global = comm.allreduce(airgap_max_local, op=MPI.MAX)
-        
-        # Count cells in correct range
-        in_range_local = np.sum((airgap_radii >= r3 - tol) & (airgap_radii <= r_gap + tol)) if len(airgap_radii) > 0 else 0
-        in_range_total = comm.allreduce(in_range_local, op=MPI.SUM)
-        
-        if rank == root:
-            unique_tags = np.unique(new_tags)
-            print(f"✅ Retagged {comm.allreduce(n_cells, op=MPI.SUM)} cells total. Unique tags: {sorted(unique_tags)}")
-            print(f"\n📊 AirGap validation (all ranks):")
-            print(f"   Total AirGap cells: {n_airgap_total}")
-            print(f"   Radius range: [{airgap_min_global:.6f}, {airgap_max_global:.6f}] m")
-            print(f"   Expected range: [{r3:.6f}, {r_gap:.6f}] m")
-            print(f"   Cells in correct range: {in_range_total}/{n_airgap_total} ({100*in_range_total/n_airgap_total:.1f}%)")
-            
-            # Measure actual gap from rotor
-            rotor_mask = (new_tags == domain_map["Rotor"][0])
-            if np.any(rotor_mask):
-                rotor_radii = radii[rotor_mask]
-                rotor_max_local = float(rotor_radii.max())
-                rotor_max_global = comm.allreduce(rotor_max_local, op=MPI.MAX)
-                gap_measured = airgap_min_global - rotor_max_global
-                print(f"   Rotor max radius: {rotor_max_global:.6f} m")
-                print(f"   Measured air-gap: {gap_measured:.6f} m (target: {air_gap:.6f} m)")
-    else:
-        if rank == root:
-            unique_tags = np.unique(new_tags)
-            print(f"✅ Retagged {comm.allreduce(n_cells, op=MPI.SUM)} cells total. Unique tags: {sorted(unique_tags)}")
-            print(f"\n⚠️  No AirGap cells found after retagging!")
 
-    # Write XDMF with function field for ParaView visualization
-    from dolfinx import fem
+    if rank == root:
+        print(
+            f"Retagged {mesh.topology.index_map(3).size_global} cells "
+            f"(markers from cell-center coordinates)."
+        )
 
     with XDMFFile(comm, filename.with_suffix(".xdmf"), "w") as xdmf:
         xdmf.write_mesh(mesh)
-        
         if ct is not None:
-            # Ensure a stable, readable name in XDMF (and avoid clobbering facet tags)
             try:
                 ct.name = "cell_tags"
             except Exception:
                 pass
-            # Write meshtags (default name will be used)
             xdmf.write_meshtags(ct, mesh.geometry)
-            
-            # Create a function field for easier ParaView visualization
-            DG0 = fem.functionspace(mesh, ("DG", 0))
-            cell_tag_function = fem.Function(DG0)
-            cell_tag_function.name = "CellTags"
-            
-            # Map cell tags to function - initialize all to 0 first
-            cell_tag_function.x.array[:] = 0.0
-            
-            # Map tagged cells
-            cell_to_tag = {int(i): int(v) for i, v in zip(ct.indices, ct.values)}
-            for cell_idx, tag in cell_to_tag.items():
-                if cell_idx < cell_tag_function.x.array.size:
-                    cell_tag_function.x.array[cell_idx] = float(tag)
-            
-            # Write function field for ParaView
-            xdmf.write_function(cell_tag_function, 0.0)
-        
         if ft is not None:
-            # Ensure a stable, readable name in XDMF (and avoid clobbering cell tags)
             try:
                 ft.name = "facet_tags"
             except Exception:
@@ -803,7 +587,7 @@ def generate_PMSM_mesh(
             xdmf.write_meshtags(ft, mesh.geometry)
 
     if rank == root:
-        print(f"\n✅ Mesh generated: {filename.with_suffix('.xdmf')}")
+        print(f"Mesh generated: {filename.with_suffix('.xdmf')}")
 
     return mesh, ct, ft
 
@@ -823,13 +607,6 @@ if __name__ == "__main__":
         type=np.float64,
         dest="res",
         help="Base mesh resolution near motor (2mm=0.002). Finer near motor, coarser with distance.",
-    )
-    parser.add_argument(
-        "--L",
-        default=1.0,
-        type=np.float64,
-        dest="L",
-        help="(Unused) legacy parameter for box size",
     )
     parser.add_argument(
         "--depth",
@@ -865,7 +642,14 @@ if __name__ == "__main__":
 
     folder = Path(__file__).resolve().parent
     folder.mkdir(parents=True, exist_ok=True)
-    fname = folder / "pmesh3D_ipm"
+    fname = folder / "mesh"
 
     opt = "" if args.no_optimize else "Netgen"
-    generate_PMSM_mesh(fname, False, res, args.L, depth, lc_max_ratio=args.lc_max_ratio, dist_max_ratio=args.dist_max_ratio, optimize=opt)
+    generate_PMSM_mesh(
+        fname,
+        res,
+        depth,
+        lc_max_ratio=args.lc_max_ratio,
+        dist_max_ratio=args.dist_max_ratio,
+        optimize=opt,
+    )

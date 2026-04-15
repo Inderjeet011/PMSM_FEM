@@ -1,10 +1,24 @@
 #!/usr/bin/env python3
-"""3D A-V solver: A on parent mesh, V on conductor submesh."""
+"""
+Transient 3D A–V driver for the **rod-coil** geometry (extended copper regions).
 
-import sys
+Same submesh formulation as ``3d_loop_coils``: ``A`` on the parent mesh, ``V`` on
+the conductor submesh, with **three-phase terminal voltages** on coil boundaries
+(see ``load_mesh.setup_boundary_conditions_submesh``).
+
+Writes ``result.xdmf`` / ``result.h5``, and optional VTX: ``V.bp`` and ``J.bp``
+(conductor submesh), and motor-region ``B.bp``.
+The companion ``mesh.py`` builds thicker/rod-style coil solids for this variant.
+
+Requires ``mesh.xdmf`` from ``mesh.py`` in this directory.
+
+Run:
+  cd src/3d_rod_coils
+  python main.py
+"""
+
 import time
 import shutil
-from pathlib import Path
 
 import basix.ufl
 import numpy as np
@@ -14,25 +28,23 @@ from dolfinx.io import VTXWriter
 from dolfinx.mesh import create_submesh
 from mpi4py import MPI
 
-sys.path.insert(0, str(Path(__file__).parent))
-
-from load_mesh_submesh import (
+from load_mesh import (
     conducting,
     load_mesh_and_extract_submesh,
     omega_c,
     omega_pm,
     omega_rpm,
-    omega_rs,
+    omega_r,
     setup_boundary_conditions_parent,
     setup_boundary_conditions_submesh,
     setup_materials,
 )
-from solve_equations_submesh import (
+from forms import (
     assemble_system_matrix_submesh,
     build_forms_submesh,
     configure_solver_submesh,
 )
-from solver_utils_submesh import (
+from utils import (
     compute_B_field,
     compute_J_field_conductor,
     initialise_magnetisation,
@@ -61,7 +73,7 @@ def main():
         print("\n=== Setup ===")
 
     dx_parent = ufl.Measure("dx", domain=mesh_parent, subdomain_data=cell_tags_parent)
-    dx_rs = measure_over(dx_parent, omega_rs())
+    dx_r = measure_over(dx_parent, omega_r())
     dx_rpm = measure_over(dx_parent, omega_rpm())
     dx_c = measure_over(dx_parent, omega_c())
     dx_pm = measure_over(dx_parent, omega_pm())
@@ -106,7 +118,7 @@ def main():
     a_blocks, L_blocks, a_block_form = build_forms_submesh(
         mesh_parent, A_space, V_space,
         sigma, nu, M_vec, A_prev,
-        dx_parent, dx_rs, dx_rpm, dx_c, dx_pm,
+        dx_parent, dx_r, dx_rpm, dx_c, dx_pm,
         config, entity_map, dx_cond_parent,
     )
 
@@ -124,10 +136,9 @@ def main():
     A_lag = None
     B_motor_writer = None
     V_bp_writer = None
-    J_total_writer = None
-    J_gradV_writer = None
-    J_dA_dt_writer = None
-    J_legacy_writer = None
+    J_bp_writer = None
+    V_bp_func = None
+    J_bp_func = None
     bp_dir = None
     if config.write_results:
         config.results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -136,14 +147,7 @@ def main():
             for p in [config.results_path, config.results_path.with_suffix(".h5")]:
                 if p.exists():
                     p.unlink()
-            for p in [
-                bp_dir / "V_field_submesh.bp",
-                bp_dir / "J_field_submesh.bp",
-                bp_dir / "J_total_coils.bp",
-                bp_dir / "J_from_gradV_coils.bp",
-                bp_dir / "J_from_dA_dt_coils.bp",
-                bp_dir / "B_field_motor_submesh.bp",
-            ]:
+            for p in [bp_dir / "V.bp", bp_dir / "J.bp", bp_dir / "B.bp"]:
                 if p.exists():
                     shutil.rmtree(p)
         mesh_parent.comm.barrier()
@@ -151,30 +155,18 @@ def main():
         writer.write_mesh(mesh_parent)
         A_lag = fem.Function(fem.functionspace(mesh_parent, ("Lagrange", 1, (3,))), name="A")
 
-        # V and J BP writers on conductor submesh (same folder as other results)
-        V_bp_path = str(bp_dir / "V_field_submesh.bp")
-        V_bp_func = fem.Function(V_space, name="V")
-        V_bp_writer = VTXWriter(mesh_parent.comm, V_bp_path, V_bp_func)
-        J_total_vis = fem.Function(
+        V_bp_func = fem.Function(V_space, name="V_vtx")
+        V_bp_writer = VTXWriter(mesh_parent.comm, str(bp_dir / "V.bp"), V_bp_func)
+        J_bp_func = fem.Function(
             fem.functionspace(mesh_conductor, ("DG", 0, (mesh_conductor.geometry.dim,))),
-            name="J_total",
+            name="J",
         )
-        J_gradV_vis = fem.Function(
-            fem.functionspace(mesh_conductor, ("DG", 0, (mesh_conductor.geometry.dim,))),
-            name="J_from_gradV",
-        )
-        J_dA_dt_vis = fem.Function(
-            fem.functionspace(mesh_conductor, ("DG", 0, (mesh_conductor.geometry.dim,))),
-            name="J_from_dA_dt",
-        )
-        J_total_writer = VTXWriter(mesh_parent.comm, str(bp_dir / "J_total_coils.bp"), J_total_vis)
-        J_gradV_writer = VTXWriter(mesh_parent.comm, str(bp_dir / "J_from_gradV_coils.bp"), J_gradV_vis)
-        J_dA_dt_writer = VTXWriter(mesh_parent.comm, str(bp_dir / "J_from_dA_dt_coils.bp"), J_dA_dt_vis)
-        J_legacy_writer = VTXWriter(mesh_parent.comm, str(bp_dir / "J_field_submesh.bp"), J_total_vis)
+        J_bp_writer = VTXWriter(mesh_parent.comm, str(bp_dir / "J.bp"), J_bp_func)
 
-        # Also prepare a motor-only submesh writer for B, using the parent mesh.
+        # Motor-only submesh writer for B (parent mesh).
         # Motor := everything except air / airgap (tags 1,2,3).
         # Include all six coils (7–12) plus rotor/stator and PMs.
+        # 4: legacy shaft tag; 5: rotor assembly (new meshes)
         motor_tags = [4, 5, 6] + list(range(7, 13)) + list(range(13, 23))
         tdim = mesh_parent.topology.dim
         motor_cells = []
@@ -206,7 +198,7 @@ def main():
                 "parent_cells": parent_cells,
                 "smsh_cells": smsh_cells,
                 "function": B_motor,
-                "writer": VTXWriter(mesh_parent.comm, str(bp_dir / "B_field_motor_submesh.bp"), B_motor),
+                "writer": VTXWriter(mesh_parent.comm, str(bp_dir / "B.bp"), B_motor),
             }
 
     if rank0:
@@ -217,7 +209,6 @@ def main():
         if rank0:
             print(f"\nStep {step+1}/{config.num_steps}: t={t*1e3:.3f} ms")
 
-        # Save A from previous step for J = sigma*E where E uses dA/dt
         A_prev_for_J = fem.Function(A_space, name="A_prev_J")
         A_prev_for_J.x.array[:] = A_prev.x.array[:]
         A_prev_for_J.x.scatter_forward()
@@ -260,12 +251,11 @@ def main():
             )
             bw["writer"].write(t)
 
-        # Write V and J to BP files (conductor submesh)
         if V_bp_writer is not None:
             V_bp_func.x.array[:] = V_sol.x.array[:]
             V_bp_func.x.scatter_forward()
             V_bp_writer.write(t)
-        if J_total_writer is not None:
+        if J_bp_writer is not None:
             J_total = compute_J_field_conductor(
                 mesh_parent,
                 mesh_conductor,
@@ -276,42 +266,10 @@ def main():
                 sigma,
                 config.dt,
                 component="total",
-                degree=config.degree_A,
             )
-            J_from_gradV = compute_J_field_conductor(
-                mesh_parent,
-                mesh_conductor,
-                entity_map,
-                A_sol,
-                A_prev_for_J,
-                V_sol,
-                sigma,
-                config.dt,
-                component="gradV",
-                degree=config.degree_A,
-            )
-            J_from_dA_dt = compute_J_field_conductor(
-                mesh_parent,
-                mesh_conductor,
-                entity_map,
-                A_sol,
-                A_prev_for_J,
-                V_sol,
-                sigma,
-                config.dt,
-                component="dA_dt",
-                degree=config.degree_A,
-            )
-            J_total_vis.x.array[:] = J_total.x.array[:]
-            J_total_vis.x.scatter_forward()
-            J_total_writer.write(t)
-            J_legacy_writer.write(t)
-            J_gradV_vis.x.array[:] = J_from_gradV.x.array[:]
-            J_gradV_vis.x.scatter_forward()
-            J_gradV_writer.write(t)
-            J_dA_dt_vis.x.array[:] = J_from_dA_dt.x.array[:]
-            J_dA_dt_vis.x.scatter_forward()
-            J_dA_dt_writer.write(t)
+            J_bp_func.x.array[:] = J_total.x.array[:]
+            J_bp_func.x.scatter_forward()
+            J_bp_writer.write(t)
 
         if rank0:
             print(
@@ -333,11 +291,8 @@ def main():
         B_motor_writer["writer"].close()
     if V_bp_writer is not None:
         V_bp_writer.close()
-    if J_total_writer is not None:
-        J_total_writer.close()
-        J_legacy_writer.close()
-        J_gradV_writer.close()
-        J_dA_dt_writer.close()
+    if J_bp_writer is not None:
+        J_bp_writer.close()
 
     if rank0:
         print(f"\n=== Done ===  (time: {time.perf_counter() - t_start:.2f} s)")

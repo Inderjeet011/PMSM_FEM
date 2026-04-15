@@ -1,5 +1,11 @@
-"""3D A-V solver with submesh: forms, assembly, and PETSc solver setup.
-A lives on parent mesh, V lives on conductor submesh.
+"""
+Weak forms, assembly, and PETSc solver configuration (volume-coil workflow).
+
+Builds the coupled A–V block (curl–curl + transient conduction on rotor
+assembly ``dx_r`` only, motional term on rotor/PMs, ``J_z`` and magnetization
+sources). Assembles a monolithic PETSc
+matrix and configures the outer FGMRES + fieldsplit Schur preconditioner with
+Hypre AMS on the ``A`` block and a sparse direct solve on ``V``.
 """
 
 from dolfinx import fem  # type: ignore
@@ -13,7 +19,7 @@ _keepalive = []
 
 def build_forms_submesh(mesh_parent, A_space, V_space,
                         sigma, nu, J_z, M_vec, A_prev,
-                        dx_parent, dx_rs, dx_rpm, dx_c, dx_pm,
+                        dx_parent, dx_r, dx_rpm, dx_c, dx_pm,
                         config, entity_map, dx_cond_parent, dx_air=None):
     dt = fem.Constant(mesh_parent, PETSc.ScalarType(config.dt))
     mu0 = config.mu0
@@ -33,7 +39,7 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
     
     a00 = (
         nu * ufl.inner(curlA, curlv) * dx_parent
-        + (sigma * inv_dt) * ufl.inner(A, v) * dx_rs
+        + (sigma * inv_dt) * ufl.inner(A, v) * dx_r
     )
     if dx_air is not None:
         a00 += (sigma * inv_dt) * ufl.inner(A, v) * dx_air
@@ -46,7 +52,7 @@ def build_forms_submesh(mesh_parent, A_space, V_space,
 
     L0 = (
         J_z * v[2] * dx_c
-        + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_rs
+        + (sigma * inv_dt) * ufl.inner(A_prev, v) * dx_r
         + ufl.inner(nu * mu0 * M_vec, curlv) * dx_pm
     )
     if dx_air is not None:
