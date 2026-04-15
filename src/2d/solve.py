@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
-"""
-2D Maxwell A-V Mixed Formulation Solver
-========================================
-Permanent Magnet Synchronous Motor (PMSM) simulation
+"""2D transient A–V (Az, V) Maxwell solver for PMSM: Gmsh mesh, σ/ν regions, PM + 3-phase coils."""
 
-Formulation:
-- Mixed A-V formulation (magnetic vector potential and electric scalar potential)
-- Separate electrical (ω_e) and mechanical (ω_m) speeds
-- Robust V constraint with rotor patch ground + regularization
-- PM excitation via volume term
-- σ and ω terms only in rotating conductor (rotor)
-
-"""
-
-from dolfinx import fem, io, mesh as dmesh
+from dolfinx import fem, io
 from dolfinx.fem.petsc import LinearProblem
 from dolfinx.mesh import locate_entities_boundary
 try:
     from dolfinx.io import gmshio
 except ImportError:
-    # DOLFINx >= 0.10 exposes Gmsh I/O via dolfinx.io.gmsh
     from dolfinx.io import gmsh as gmshio
 from mpi4py import MPI
 import basix.ufl
@@ -30,12 +17,9 @@ import math
 from pathlib import Path
 
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# --- Configuration (time grid, excitation, output policy) ---
 
 class SimulationConfig:
-    """Simulation configuration parameters"""
     def __init__(self, 
                  pole_pairs=5,
                  frequency=50,
@@ -48,42 +32,27 @@ class SimulationConfig:
                  omega_m=None,
                  output_num_timestamps=100,
                  write_every_timestep=True):
-        # Motor geometry
         self.pole_pairs = pole_pairs
         self.n_poles = 2 * pole_pairs
-        
-        # Electrical parameters
-        self.frequency = frequency  # Hz (set 0 for static PM validation)
-        self.J_peak = J_peak  # A/m² (peak current density)
-        
-        # PM parameters
-        self.B_rem = B_rem  # Tesla (remanent flux density)
-        
-        # Time stepping
-        self.T_end = float(T_end)  # simulation duration
+        self.frequency = frequency
+        self.J_peak = J_peak
+        self.B_rem = B_rem
+        self.T_end = float(T_end)
         self.num_steps = None
         self.dt = None
         self._set_time_grid(num_steps=num_steps, dt=dt)
-        # Output controls
         self.output_num_timestamps = int(output_num_timestamps)
         self.write_every_timestep = bool(write_every_timestep)
-        
-        # Material properties
         self.mu0 = 4e-7 * np.pi
-        
-        # Function space
         self.polynomial_degree = polynomial_degree
-        
-        # Derived parameters (computed properties)
         self._omega_e = None
         self._omega_m = None
         self._M_rem = None
         self._pole_angle_step = None
-        self._omega_m_override = omega_m  # Allow manual override
+        self._omega_m_override = omega_m
         self._update_derived()
 
     def _set_time_grid(self, num_steps=None, dt=None):
-        """Create a consistent time grid from either num_steps or dt."""
         if self.T_end <= 0.0:
             raise ValueError("T_end must be positive.")
 
@@ -106,9 +75,7 @@ class SimulationConfig:
         raise ValueError("Provide either num_steps or dt.")
     
     def _update_derived(self):
-        """Update derived parameters"""
         self._omega_e = 2 * np.pi * self.frequency
-        # Allow omega_m to be set independently (for frequency=0, omega_m>0 cases)
         if self._omega_m_override is not None:
             self._omega_m = self._omega_m_override
         else:
@@ -153,9 +120,9 @@ class SimulationConfig:
         else:
             print(f"   Output:        {self.output_num_timestamps} timestamps")
 
+# --- Cell tags (must match mesh.py physical groups) ---
 
 class DomainTags:
-    """Physical domain tags matching mesh generator"""
     OUTER_AIR = 1
     ROTOR = 2
     PM_N = 3
@@ -166,44 +133,33 @@ class DomainTags:
     COIL_0, COIL_1, COIL_2 = 8, 9, 10
     COIL_3, COIL_4, COIL_5 = 11, 12, 13
     EXTERIOR = 100
-    
-    # Three-phase mapping
-    COIL_AP, COIL_AM = COIL_0, COIL_3  # Phase A
-    COIL_BP, COIL_BM = COIL_1, COIL_4  # Phase B
-    COIL_CP, COIL_CM = COIL_2, COIL_5  # Phase C
+
+    COIL_AP, COIL_AM = COIL_0, COIL_3
+    COIL_BP, COIL_BM = COIL_1, COIL_4
+    COIL_CP, COIL_CM = COIL_2, COIL_5
 
 
-# ============================================================================
-# MAXWELL SOLVER CLASS
-# ============================================================================
+# --- Solver ---
 
 class MaxwellSolver2D:
-    """2D Maxwell solver for PM motor using A-V mixed formulation"""
-    
+
     def __init__(self, mesh_file="mesh.msh", config=None):
         self.config = config or SimulationConfig()
         self.tags = DomainTags()
         self.mesh_file = mesh_file
-        
-        # Initialize storage
         self.mesh = None
         self.ct = None
         self.ft = None
-        self.W = None  # Mixed function space
+        self.W = None
         self.w_prev = None
         self.w_sol = None
-        
-        # Material properties
         self.sigma = None
         self.nu = None
-        
-        # Source terms
         self.J_z = None
         self.M_x = None
         self.M_y = None
-        
+
     def load_mesh(self):
-        """Load mesh from file"""
         print("\n📖 Loading mesh...")
         mesh_path = Path(self.mesh_file).expanduser()
         if not mesh_path.is_absolute():
@@ -218,24 +174,20 @@ class MaxwellSolver2D:
         )
         self.ft = rest[0] if rest else None
         print(f"   ✅ {self.ct.values.size} cells loaded")
-        
-        # Create measures
         self.dx = ufl.Measure("dx", domain=self.mesh, subdomain_data=self.ct)
         self.ds = ufl.Measure("ds", domain=self.mesh, subdomain_data=self.ft) if self.ft else ufl.ds
         
     def setup_materials(self):
-        """Setup material properties (conductivity and reluctivity)"""
         print("\n🔧 Setting up materials...")
         
         DG0 = fem.functionspace(self.mesh, ("DG", 0))
         mu0 = self.config.mu0
         
-        # Conductivity (σ) - only rotor conducts
         sigma_vals = {
             self.tags.OUTER_AIR: 0.0,
             self.tags.AIRGAP_INNER: 0.0,
             self.tags.AIRGAP_OUTER: 0.0,
-            self.tags.ROTOR: 2e6,  # Rotor conductivity
+            self.tags.ROTOR: 2e6,
             self.tags.PM_N: 0.0,
             self.tags.PM_S: 0.0,
             self.tags.STATOR: 0.0,
@@ -247,15 +199,14 @@ class MaxwellSolver2D:
             self.tags.COIL_CM: 0.0,
         }
         
-        # Reluctivity (ν = 1/μ)
         nu_vals = {
             self.tags.OUTER_AIR: 1/mu0,
             self.tags.AIRGAP_INNER: 1/mu0,
             self.tags.AIRGAP_OUTER: 1/mu0,
-            self.tags.ROTOR: 1/(mu0*1000),  # High permeability - INCREASED from 100
+            self.tags.ROTOR: 1/(mu0*1000),
             self.tags.PM_N: 1/mu0,
             self.tags.PM_S: 1/mu0,
-            self.tags.STATOR: 1/(mu0*1000),  # High permeability - INCREASED from 100
+            self.tags.STATOR: 1/(mu0*1000),
             self.tags.COIL_AP: 1/(mu0*0.999991),
             self.tags.COIL_AM: 1/(mu0*0.999991),
             self.tags.COIL_BP: 1/(mu0*0.999991),
@@ -264,7 +215,6 @@ class MaxwellSolver2D:
             self.tags.COIL_CM: 1/(mu0*0.999991),
         }
         
-        # Create material functions
         self.sigma = fem.Function(DG0)
         self.nu = fem.Function(DG0)
         
@@ -277,10 +227,7 @@ class MaxwellSolver2D:
         print("   ✅ Materials assigned (σ, ν)")
         
     def setup_function_spaces(self):
-        """Setup mixed function space (Az, V)"""
         print("\n🎯 Setting up function spaces...")
-        
-        # Mixed space: Pk for Az (magnetic vector potential) and V (electric potential)
         deg = self.config.polynomial_degree
         PA = basix.ufl.element("Lagrange", self.mesh.basix_cell(), deg)
         PV = basix.ufl.element("Lagrange", self.mesh.basix_cell(), deg)
@@ -289,18 +236,12 @@ class MaxwellSolver2D:
         )
         
         print(f"   ✅ Mixed DOFs (P{deg}): {self.W.dofmap.index_map.size_global * self.W.dofmap.index_map_bs}")
-        
-        # Initialize solution functions
         self.w_prev = fem.Function(self.W)
         self.w_sol = fem.Function(self.W)
         
     def setup_boundary_conditions(self):
-        """Setup boundary conditions"""
         print("\n🔒 Setting up boundary conditions...")
-        
         tdim = self.mesh.topology.dim
-        
-        # BC 1: Az = 0 on exterior boundary
         W0, _ = self.W.sub(0).collapse()
         
         if self.ft is not None:
@@ -323,8 +264,6 @@ class MaxwellSolver2D:
         zeroAz = fem.Function(W0)
         zeroAz.x.array[:] = 0.0
         self.bcAz = fem.dirichletbc(zeroAz, bdofs_Az, self.W.sub(0))
-        
-        # BC 2: V = 0 on rotor patch (robust ground)
         W1, _ = self.W.sub(1).collapse()
         self.mesh.topology.create_connectivity(tdim, 0)
         self.mesh.topology.create_connectivity(0, tdim)
@@ -332,8 +271,6 @@ class MaxwellSolver2D:
         
         rotor_cells = self.ct.find(self.tags.ROTOR)
         assert rotor_cells.size > 0, "No rotor cells found for V grounding"
-        
-        # Use first 30 rotor cells as patch ground
         patch_cells = np.array(rotor_cells[:min(30, rotor_cells.size)], dtype=np.int32)
         patch_verts = np.unique(
             np.hstack([c2v.links(int(c)) for c in patch_cells])
@@ -349,133 +286,77 @@ class MaxwellSolver2D:
         self.bcs = [self.bcAz, self.bcV]
         
     def initialize_sources(self):
-        """Initialize source terms (currents and magnetization)"""
         print("\n⚡ Initializing sources...")
-        
         DG0 = fem.functionspace(self.mesh, ("DG", 0))
-        
-        # Current density
         self.J_z = fem.Function(DG0)
         print(f"   ✅ Current density: J_peak = {self.config.J_peak:.3e} A/m²")
-        
-        # Magnetization
         self.M_x = fem.Function(DG0)
         self.M_y = fem.Function(DG0)
-        
-        # Initialize PM magnetization
         for pm_tag, sign in [(self.tags.PM_N, +1), (self.tags.PM_S, -1)]:
             cells = self.ct.find(pm_tag)
             if cells.size == 0:
                 continue
             
             for c in cells:
-                # Get cell centroid
                 cell_geom_dofs = self.mesh.geometry.dofmap[c]
                 cx = np.mean(self.mesh.geometry.x[cell_geom_dofs, 0])
                 cy = np.mean(self.mesh.geometry.x[cell_geom_dofs, 1])
-                
-                # Find angular position
                 theta = np.arctan2(cy, cx)
                 if theta < 0:
                     theta += 2 * np.pi
-                
-                # Find which pole and center on it
                 pole_idx = int(np.round(theta / self.config.pole_angle_step))
                 theta_pole_center = (pole_idx + 0.5) * self.config.pole_angle_step
-                
-                # Magnetization points radially
                 self.M_x.x.array[c] = sign * self.config.M_rem * np.cos(theta_pole_center)
                 self.M_y.x.array[c] = sign * self.config.M_rem * np.sin(theta_pole_center)
         
         print(f"   ✅ Magnetization: B_rem = {self.config.B_rem} T, {self.config.n_poles} poles")
         
     def create_variational_form(self, verbose=True):
-        """Create variational formulation"""
+        # Weak form: rotor σ,ω; PM −M·curl(v); coils J_z; tiny ds term for stability.
         if verbose:
             print("\n📐 Creating variational form...")
         
-        # Domain helpers
         def dxc(tags):
-            """Create measure over multiple subdomains"""
             if not tags:
-                return self.dx(999)  # Non-existent tag
+                return self.dx(999)
             m = self.dx(tags[0])
             for t in tags[1:]:
                 m += self.dx(t)
             return m
         
-        # Conducting region (rotor only)
         Omega_conducting = [self.tags.ROTOR]
-        
-        # Coil regions
         Omega_coils = [
             self.tags.COIL_AP, self.tags.COIL_AM,
             self.tags.COIL_BP, self.tags.COIL_BM,
             self.tags.COIL_CP, self.tags.COIL_CM
         ]
-        
-        # PM regions
         Omega_pm = [self.tags.PM_N, self.tags.PM_S]
-        
-        # Trial and test functions
         (Az, V) = ufl.TrialFunctions(self.W)
         (v, q) = ufl.TestFunctions(self.W)
-        
-        # Previous solution
-        Az_prev, V_prev = ufl.split(self.w_prev)
-        
-        # Spatial coordinates and rotation velocity
+        Az_prev, _ = ufl.split(self.w_prev)
         xcoord = ufl.SpatialCoordinate(self.mesh)
         x, y = xcoord[0], xcoord[1]
-        
         omega = fem.Constant(self.mesh, self.config.omega_m)
         dt = fem.Constant(self.mesh, self.config.dt)
-        mu0 = self.config.mu0
-        
-        # Rotation velocity field
         u_rot_x = -omega * y
         u_rot_y = omega * x
-        
-        # Regularization for V
         epsV = fem.Constant(self.mesh, 1e-12)
         
-        # === Bilinear form a(Az, V; v, q) ===
-        
-        # Magnetic diffusion term
         a = self.nu * ufl.inner(ufl.grad(Az), ufl.grad(v)) * self.dx
-        
-        # Motional term in conductor (convection)
         a += self.sigma * (u_rot_x*ufl.grad(Az)[0] + u_rot_y*ufl.grad(Az)[1]) * v * dxc(Omega_conducting)
-        
-        # Time-discrete coupling (A-block)
         a += (self.sigma/dt) * Az * v * dxc(Omega_conducting)
-        
-        # V-equation in conductor
         a += self.sigma * ufl.inner(ufl.grad(V), ufl.grad(q)) * dxc(Omega_conducting)
         a += (self.sigma/dt) * Az * q * dxc(Omega_conducting)
-        
-        # V regularization
         a += epsV * V * q * dxc(Omega_conducting)
-        
-        # Boundary term (optional)
         n = ufl.FacetNormal(self.mesh)
         a += (1e-16) * v * (n[0]*Az.dx(0) - n[1]*Az.dx(1)) * self.ds
         
-        # === Linear form L(v, q) ===
-        
-        # Time-discrete term from previous solution
         L = (self.sigma/dt) * Az_prev * v * dxc(Omega_conducting)
-        
-        # Coil source terms
         for coil in Omega_coils:
             L += self.J_z * v * self.dx(coil)
-        
-        # PM source term: -∫ M · curl(v) dΩ over PM regions
         curl_v = ufl.as_vector((v.dx(1), -v.dx(0)))
         M_vec = ufl.as_vector((self.M_x, self.M_y))
         L += -ufl.inner(M_vec, curl_v) * dxc(Omega_pm)
-        
-        # V-equation RHS (motional term)
         vXB_prev = omega * (y*ufl.grad(Az_prev)[0] - x*ufl.grad(Az_prev)[1])
         L += (self.sigma/dt) * Az_prev * q * dxc(Omega_conducting)
         L += -self.sigma * vXB_prev * q * dxc(Omega_conducting)
@@ -487,23 +368,16 @@ class MaxwellSolver2D:
         self.L = L
         
     def update_currents(self, t):
-        """Update three-phase currents"""
         omega_e = self.config.omega_e
         J_peak = self.config.J_peak
-        
-        # Three-phase currents
-        # When frequency=0 (DC), set all currents to zero (no rotating field)
         if omega_e == 0.0 or self.config.frequency == 0.0:
             IA = 0.0
             IB = 0.0
             IC = 0.0
         else:
-            # AC case: rotating three-phase currents
             IA = J_peak * np.sin(omega_e * t)
             IB = J_peak * np.sin(omega_e * t - 2*np.pi/3)
             IC = J_peak * np.sin(omega_e * t + 2*np.pi/3)
-        
-        # Assign to coils
         for c in self.ct.find(self.tags.COIL_AP): self.J_z.x.array[c] = IA
         for c in self.ct.find(self.tags.COIL_AM): self.J_z.x.array[c] = -IA
         for c in self.ct.find(self.tags.COIL_BP): self.J_z.x.array[c] = IB
@@ -512,49 +386,63 @@ class MaxwellSolver2D:
         for c in self.ct.find(self.tags.COIL_CM): self.J_z.x.array[c] = -IC
         
     def rotate_magnetization(self, t):
-        """Rotate PM magnetization with rotor"""
         theta_rot = self.config.omega_m * t
         
         for pm_tag, sign in [(self.tags.PM_N, +1), (self.tags.PM_S, -1)]:
             cells = self.ct.find(pm_tag)
             for c in cells:
-                # Get cell centroid
                 cell_geom_dofs = self.mesh.geometry.dofmap[c]
                 cx = np.mean(self.mesh.geometry.x[cell_geom_dofs, 0])
                 cy = np.mean(self.mesh.geometry.x[cell_geom_dofs, 1])
-                
-                # Find angular position
                 theta = np.arctan2(cy, cx)
                 if theta < 0:
                     theta += 2 * np.pi
-                
-                # Find pole center
                 pole_idx = int(np.round(theta / self.config.pole_angle_step))
                 theta_pole_center = (pole_idx + 0.5) * self.config.pole_angle_step
-                
-                # Rotate magnetization
                 theta_now = theta_pole_center + theta_rot
                 self.M_x.x.array[c] = sign * self.config.M_rem * np.cos(theta_now)
                 self.M_y.x.array[c] = sign * self.config.M_rem * np.sin(theta_now)
-        
-        # Update ghost values after modifying arrays
         self.M_x.x.scatter_forward()
         self.M_y.x.scatter_forward()
-    
+
+    def _final_brms_report(self, Az_sol):
+        # Domain and air-gap B_rms from Az (diagnostic).
+        Bx = ufl.grad(Az_sol)[1]
+        By = -ufl.grad(Az_sol)[0]
+        b2 = Bx * Bx + By * By
+        area_all = fem.assemble_scalar(fem.form(1.0 * ufl.dx(domain=self.mesh)))
+        val_all = fem.assemble_scalar(fem.form(b2 * ufl.dx(domain=self.mesh)))
+        Brms_all = float(np.sqrt(val_all / max(area_all, 1e-18)))
+
+        def _cell_r(c: int) -> float:
+            g = self.mesh.geometry.dofmap[c]
+            cx = float(np.mean(self.mesh.geometry.x[g, 0]))
+            cy = float(np.mean(self.mesh.geometry.x[g, 1]))
+            return math.hypot(cx, cy)
+
+        pm_cells = np.concatenate([self.ct.find(self.tags.PM_N), self.ct.find(self.tags.PM_S)])
+        stator_cells = self.ct.find(self.tags.STATOR)
+        if pm_cells.size and stator_cells.size:
+            rin = max(_cell_r(int(c)) for c in pm_cells)
+            rout = min(_cell_r(int(c)) for c in stator_cells)
+        else:
+            rin, rout = 0.0, 1.0
+        xcoord = ufl.SpatialCoordinate(self.mesh)
+        r = ufl.sqrt(xcoord[0] ** 2 + xcoord[1] ** 2)
+        mask = ufl.conditional(
+            ufl.lt(r, rout), ufl.conditional(ufl.gt(r, rin), 1.0, 0.0), 0.0
+        )
+        area_gap = fem.assemble_scalar(fem.form(mask * ufl.dx(domain=self.mesh)))
+        val_gap = fem.assemble_scalar(fem.form(b2 * mask * ufl.dx(domain=self.mesh)))
+        Brms_gap = float(np.sqrt(val_gap / max(area_gap, 1e-18)))
+        print(f"   Final B_rms (domain) ≈ {Brms_all:.3e} T, B_rms (air-gap) ≈ {Brms_gap:.3e} T")
+
     def solve(self, output_file=None, target_times_ms=None):
-        """Main time-stepping solver
-        
-        Args:
-            output_file: Output XDMF file path
-            target_times_ms: List of target times in milliseconds. If None, uses T_end/dt steps.
-                            If provided, solver will step to each target time exactly.
-        """
+        # Time integration, XDMF output, optional target times (ms), air-gap B diagnostics.
         print("\n⏱️  Starting time-stepping simulation...")
-        
-        # If target times are specified, use them; otherwise use uniform stepping
         if target_times_ms is not None:
-            target_times = [t_ms / 1000.0 for t_ms in target_times_ms]  # Convert to seconds
-            target_times = sorted(target_times)  # Ensure sorted
+            target_times = [t_ms / 1000.0 for t_ms in target_times_ms]
+            target_times = sorted(target_times)
             T_end = max(target_times)
             print(f"   Target times: {[f'{t*1000:.1f}' for t in target_times]} ms")
             print(f"   Duration: {T_end*1000:.1f} ms")
@@ -565,8 +453,6 @@ class MaxwellSolver2D:
             print(f"   Steps: {num_steps}")
             print(f"   Duration: {T_end*1000:.1f} ms")
         print()
-        
-        # Output file in same folder as this solver by default.
         if output_file is None:
             output_file = Path(__file__).resolve().parent / "result.xdmf"
         output_path = Path(output_file).expanduser()
@@ -576,8 +462,6 @@ class MaxwellSolver2D:
         try:
             out = io.XDMFFile(self.mesh.comm, str(output_path), "w")
         except RuntimeError as exc:
-            # Common on shared/workstation runs: previous .h5 still locked by
-            # another process/viewer. Fall back to a unique output filename.
             if "HDF5" not in str(exc) and "hdf5" not in str(exc):
                 raise
             alt_path = output_path.with_name(
@@ -589,15 +473,11 @@ class MaxwellSolver2D:
             output_path = alt_path
             out = io.XDMFFile(self.mesh.comm, str(output_path), "w")
         out.write_mesh(self.mesh)
-        # Write cell tags if available (needed for post-processing like torque)
         if self.ct is not None:
             try:
                 out.write_meshtags(self.ct)
             except Exception:
                 pass
-        
-        # Create writeable B fields on Lagrange spaces for XDMF output.
-        # (Direct DG vector writes can fail with dof-layout mismatch.)
         deg = self.config.polynomial_degree
         V_B = fem.functionspace(self.mesh, ("Lagrange", deg, (2,)))
         self.B_field = fem.Function(V_B)
@@ -605,8 +485,6 @@ class MaxwellSolver2D:
         V_B_mag = fem.functionspace(self.mesh, ("Lagrange", deg))
         self.B_mag = fem.Function(V_B_mag)
         self.B_mag.name = "B_mag"
-        
-        # PETSc options for solver
         petsc_options = {
             "ksp_type": "gmres",
             "ksp_rtol": 1e-12,
@@ -615,14 +493,11 @@ class MaxwellSolver2D:
             "pc_factor_shift_type": "NONZERO",
         }
 
-        # Air-gap mask setup for per-step B metrics and peak-time reporting.
-        import math as _math
-
         def _cell_r(c: int) -> float:
             g = self.mesh.geometry.dofmap[c]
             cx = float(np.mean(self.mesh.geometry.x[g, 0]))
             cy = float(np.mean(self.mesh.geometry.x[g, 1]))
-            return _math.hypot(cx, cy)
+            return math.hypot(cx, cy)
 
         pm_cells = np.concatenate([self.ct.find(self.tags.PM_N), self.ct.find(self.tags.PM_S)])
         stator_cells = self.ct.find(self.tags.STATOR)
@@ -645,14 +520,10 @@ class MaxwellSolver2D:
         peak_gap_time = 0.0
 
         def _solve_with_residual_trace(prob: LinearProblem, stage_label: str):
-            """Solve and print per-iteration residual decrease."""
             ksp = prob.solver
-            residuals = []
 
             def _monitor(_ksp, its, rnorm):
-                r = float(rnorm)
-                residuals.append(r)
-                print(f"      [{stage_label}] iter {its:3d}: |r|={r:.6e}")
+                print(f"      [{stage_label}] iter {its:3d}: |r|={float(rnorm):.6e}")
 
             ksp.setMonitor(_monitor)
             sol = prob.solve()
@@ -660,9 +531,8 @@ class MaxwellSolver2D:
                 ksp.cancelMonitor()
             except Exception:
                 pass
-            return sol, ksp, residuals
-        
-        # Time loop
+            return sol, ksp
+
         start_time = time.time()
         t = 0.0
         
@@ -680,11 +550,11 @@ class MaxwellSolver2D:
                 petsc_options=petsc_options,
                 petsc_options_prefix="mixed"
             )
-            self.w_sol, ksp, _ = _solve_with_residual_trace(prob, "init t=0.00 ms")
+            self.w_sol, ksp = _solve_with_residual_trace(prob, "init t=0.00 ms")
             ksp_its = int(ksp.getIterationNumber())
             ksp_res = float(ksp.getResidualNorm())
             ksp_reason = int(ksp.getConvergedReason())
-            Az_sol, V_sol = self.w_sol.split()
+            Az_sol, _ = self.w_sol.split()
             
             # Compute B field
             Bx_expr = ufl.grad(Az_sol)[1]
@@ -736,7 +606,7 @@ class MaxwellSolver2D:
                         petsc_options=petsc_options,
                         petsc_options_prefix="mixed"
                     )
-                    self.w_sol, ksp, _ = _solve_with_residual_trace(
+                    self.w_sol, ksp = _solve_with_residual_trace(
                         prob, f"t={t*1e3:.2f} ms"
                     )
                     ksp_its = int(ksp.getIterationNumber())
@@ -744,7 +614,7 @@ class MaxwellSolver2D:
                     ksp_reason = int(ksp.getConvergedReason())
                     
                     # Extract components
-                    Az_sol, V_sol = self.w_sol.split()
+                    Az_sol, _ = self.w_sol.split()
                     
                     # Compute B field
                     Bx_expr = ufl.grad(Az_sol)[1]
@@ -813,7 +683,7 @@ class MaxwellSolver2D:
                     petsc_options=petsc_options,
                     petsc_options_prefix="mixed"
                 )
-                self.w_sol, ksp, _ = _solve_with_residual_trace(
+                self.w_sol, ksp = _solve_with_residual_trace(
                     prob, f"t={t*1e3:.2f} ms"
                 )
                 ksp_its = int(ksp.getIterationNumber())
@@ -821,7 +691,7 @@ class MaxwellSolver2D:
                 ksp_reason = int(ksp.getConvergedReason())
                 
                 # Extract components
-                Az_sol, V_sol = self.w_sol.split()
+                Az_sol, _ = self.w_sol.split()
                 
                 # Compute B field: B = curl(A) = (dAz/dy, -dAz/dx)
                 # Use projection for better accuracy
@@ -865,67 +735,11 @@ class MaxwellSolver2D:
                     f"|r|={ksp_res:.3e}  reason={ksp_reason}  "
                     f"B_rms(gap)={Brms_gap:.3e} T"
                 )
-                # Report final-step average magnetic flux density magnitude (B_rms)
                 if step == num_steps:
-                    Bx = ufl.grad(Az_sol)[1]
-                    By = -ufl.grad(Az_sol)[0]
-                    b2 = Bx*Bx + By*By
-                    # Whole-domain RMS (diagnostic)
-                    area_all = fem.assemble_scalar(fem.form(1.0 * ufl.dx(domain=self.mesh)))
-                    val_all = fem.assemble_scalar(fem.form(b2 * ufl.dx(domain=self.mesh)))
-                    Brms_all = float(np.sqrt(val_all / max(area_all, 1e-18)))
-                    # Air-gap-only RMS
-                    import math as _math
-                    def _cell_r(c: int) -> float:
-                        g = self.mesh.geometry.dofmap[c]
-                        cx = float(np.mean(self.mesh.geometry.x[g, 0]))
-                        cy = float(np.mean(self.mesh.geometry.x[g, 1]))
-                        return _math.hypot(cx, cy)
-                    pm_cells = np.concatenate([self.ct.find(self.tags.PM_N), self.ct.find(self.tags.PM_S)])
-                    stator_cells = self.ct.find(self.tags.STATOR)
-                    if pm_cells.size and stator_cells.size:
-                        rin = max(_cell_r(int(c)) for c in pm_cells)
-                        rout = min(_cell_r(int(c)) for c in stator_cells)
-                    else:
-                        rin, rout = 0.0, 1.0
-                    xcoord = ufl.SpatialCoordinate(self.mesh)
-                    r = ufl.sqrt(xcoord[0]**2 + xcoord[1]**2)
-                    mask = ufl.conditional(ufl.lt(r, rout), ufl.conditional(ufl.gt(r, rin), 1.0, 0.0), 0.0)
-                    area_gap = fem.assemble_scalar(fem.form(mask * ufl.dx(domain=self.mesh)))
-                    val_gap = fem.assemble_scalar(fem.form(b2 * mask * ufl.dx(domain=self.mesh)))
-                    Brms_gap = float(np.sqrt(val_gap / max(area_gap, 1e-18)))
-                    print(f"   Final B_rms (domain) ≈ {Brms_all:.3e} T, B_rms (air-gap) ≈ {Brms_gap:.3e} T")
-        
-        # Report final-step average magnetic flux density magnitude (B_rms) for target_times
+                    self._final_brms_report(Az_sol)
+
         if target_times is not None and step > 0:
-            Bx = ufl.grad(Az_sol)[1]
-            By = -ufl.grad(Az_sol)[0]
-            b2 = Bx*Bx + By*By
-            # Whole-domain RMS (diagnostic)
-            area_all = fem.assemble_scalar(fem.form(1.0 * ufl.dx(domain=self.mesh)))
-            val_all = fem.assemble_scalar(fem.form(b2 * ufl.dx(domain=self.mesh)))
-            Brms_all = float(np.sqrt(val_all / max(area_all, 1e-18)))
-            # Air-gap-only RMS
-            import math as _math
-            def _cell_r(c: int) -> float:
-                g = self.mesh.geometry.dofmap[c]
-                cx = float(np.mean(self.mesh.geometry.x[g, 0]))
-                cy = float(np.mean(self.mesh.geometry.x[g, 1]))
-                return _math.hypot(cx, cy)
-            pm_cells = np.concatenate([self.ct.find(self.tags.PM_N), self.ct.find(self.tags.PM_S)])
-            stator_cells = self.ct.find(self.tags.STATOR)
-            if pm_cells.size and stator_cells.size:
-                rin = max(_cell_r(int(c)) for c in pm_cells)
-                rout = min(_cell_r(int(c)) for c in stator_cells)
-            else:
-                rin, rout = 0.0, 1.0
-            xcoord = ufl.SpatialCoordinate(self.mesh)
-            r = ufl.sqrt(xcoord[0]**2 + xcoord[1]**2)
-            mask = ufl.conditional(ufl.lt(r, rout), ufl.conditional(ufl.gt(r, rin), 1.0, 0.0), 0.0)
-            area_gap = fem.assemble_scalar(fem.form(mask * ufl.dx(domain=self.mesh)))
-            val_gap = fem.assemble_scalar(fem.form(b2 * mask * ufl.dx(domain=self.mesh)))
-            Brms_gap = float(np.sqrt(val_gap / max(area_gap, 1e-18)))
-            print(f"   Final B_rms (domain) ≈ {Brms_all:.3e} T, B_rms (air-gap) ≈ {Brms_gap:.3e} T")
+            self._final_brms_report(Az_sol)
         
         out.close()
         
@@ -939,7 +753,6 @@ class MaxwellSolver2D:
             )
         
     def run(self):
-        """Execute full simulation workflow"""
         self.config.print_info()
         
         self.load_mesh()
@@ -954,10 +767,6 @@ class MaxwellSolver2D:
         print(" ✅ MAXWELL SOLVER COMPLETE")
         print("=" * 70)
 
-
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
 
 if __name__ == "__main__":
     default_mesh = Path(__file__).resolve().parent / "mesh.msh"
