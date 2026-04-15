@@ -501,7 +501,7 @@ class PMMotorMeshGenerator:
     def generate_mesh(self, output_file=None):
         """Main mesh generation workflow"""
         if output_file is None:
-            output_file = Path(__file__).resolve().parent / "motor.msh"
+            output_file = Path(__file__).resolve().parent / "pmsm_2d_mesh.msh"
         output_path = Path(output_file).expanduser()
         if not output_path.is_absolute():
             output_path = (Path.cwd() / output_path).resolve()
