@@ -55,6 +55,16 @@ Verify installation
 ```bash
 python -c "import dolfinx, gmsh; print('OK')"
 ```
+Inside the container:
+
+```bash
+mkdir -p /workspace
+cd /workspace
+git clone https://github.com/Inderjeet011/PMSM_FEM.git
+cd PMSM_FEM
+conda activate pmsm
+python main.py
+```
 
 ### Method 2: Docker workflow
 
