@@ -1,87 +1,99 @@
-# PMSM_FEM
+# ⚡ PMSM_FEM  
+Transient **A–V eddy-current simulations** for Permanent Magnet Synchronous Motors (PMSMs) using **FEniCSx / DOLFINx**
 
-Transient **A–V** eddy-current models for PMSMs using **FEniCSx / DOLFINx**: one **2D** driver and three **3D** drivers (coil geometry / excitation differ).
+---
 
-## Layout
+## 📌 Overview
 
-| Path | What it is |
-|------|------------|
-| `src/2d/` | 2D A–V (`Az`, `V`): `solve.py` |
-| `src/3d_volume_coils/` | 3D: **bulk `J_z`** (three-phase) in coil volumes |
-| `src/3d_loop_coils/` | 3D: **six loops**, **terminal voltages** |
-| `src/3d_rod_coils/` | 3D: **rod-style** coils, same voltage drive as loop |
+This project implements high-fidelity **finite element models (FEM)** for simulating **eddy currents and electromagnetic fields** in PMSMs using the **A–V formulation**.
 
-**Outputs** (when `write_results` in `utils.make_config()`): `result.xdmf` / `result.h5`, plus VTX folders **`V.bp`**, **`J.bp`**, **`B.bp`** (motor-only B). New runs usually wipe prior outputs in that folder.
+It supports both **2D and 3D transient simulations** with different coil modeling strategies.
 
-## Requirements
+---
 
-`dolfinx`, `petsc4py`, `mpi4py`, `numpy`, `gmsh` — see **`requirements.txt`**. Prefer a **conda-forge** DOLFINx env or the official **DOLFINx** image so PETSc/HDF5 match.
+## 🧠 Key Features
 
-```bash
-python -c "import dolfinx, gmsh; print('OK')"
-```
+- Transient **A–V formulation** (`A`, `V`)
+- 2D and multiple 3D configurations
+- Coil modeling:
+  - Volume current excitation
+  - Loop-based voltage excitation
+  - Rod-based coils
+- Configurable solver (time-stepping, PETSc)
+- MPI parallel support
+- ParaView-ready outputs
 
-## Run
+---
 
-Generate mesh and solver **from the case directory** (paths are relative to each `main.py`).
+## 📁 Project Structure
+
+
+PMSM_FEM/
+│
+├── src/
+│ ├── 2d/
+│ ├── 3d_volume_coils/
+│ ├── 3d_loop_coils/
+│ ├── 3d_rod_coils/
+│
+└── requirements.txt
+
+
+
+---
+
+## 🚀 Running the Project
+
+### ▶️ 3D Example
 
 ```bash
 cd src/3d_loop_coils
-python mesh.py --res 0.005 --depth 0.057   # python mesh.py --help
+python mesh.py --res 0.005 --depth 0.057
 python main.py
-```
 
-```bash
-cd src/2d && python solve.py
-```
+Parallel Execution
+mpirun -np 4 python main.py
 
-**MPI:** `mpirun -np 4 python main.py` (same cwd as `mesh.xdmf`).
-
-## Config & files
-
-- **Tuning:** `utils.py` → `make_config()` (`dt`, `num_steps`, `V_amp` / currents, `write_results`, KSP, paths).
-- **Materials / tags:** `mesh.py` → `model_parameters`; **`load_mesh.setup_materials`**. Typical 3D: air, airgap, rotor (tags 4–5 may both map to rotor on old/new meshes), stator, coils ~7–12, PMs ~13–22 — confirm in each `mesh.py`.
-- **Per 3D folder:** `mesh.py`, `load_mesh.py`, `entity_map.py`, `forms.py`, `utils.py`, `main.py`.
+📊 Outputs
+result.xdmf, result.h5
+V.bp, J.bp, B.bp
 
 
-
-
-# PMSM FEM Docker Workflow
-
-## 1. Pull the Docker image
-
-```bash
+⚙️ Setup Methods
+🐳 Method 1: Docker (Recommended)
+Pull image
 docker pull jeet0003/my-app:v2
-```
-
-## 2. Run the container
-
-```bash
+Run container
 docker run -it --name pmsm_container jeet0003/my-app:v2 bash
-```
-
-## 3. Create and move to workspace
-
-```bash
+Setup workspace
 mkdir -p /workspace
 cd /workspace
-```
-
-## 4. Clone the repository
-
-```bash
+Clone repo
 git clone https://github.com/Inderjeet011/PMSM_FEM.git
 cd PMSM_FEM
-```
-
-## 5. Activate conda environment
-
-```bash
+Activate environment
 conda activate pmsm
-```
+🧪 Method 2: Miniconda (Tested Working)
+Install Miniconda
+cd ~
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh
+source ~/.bashrc
 
-## 6. Run the project
+Check:
 
-```bash
-python main.py
-```
+conda --version
+Create environment
+conda create -n pmsm -c conda-forge python=3.12
+conda activate pmsm
+Install DOLFINx stack
+conda install -c conda-forge \
+  fenics-dolfinx=0.10.0 \
+  fenics-basix=0.10.0 \
+  fenics-ufl=2025.2.1 \
+  petsc4py=3.24.3 \
+  mpi4py=4.1.1
+Install Gmsh
+conda install -c conda-forge python-gmsh
+Verify
+python -c "import dolfinx, gmsh; print('Setup OK')"
