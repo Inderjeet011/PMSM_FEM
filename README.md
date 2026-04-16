@@ -60,7 +60,7 @@ docker pull jeet0003/my-app:v1
 Run container:
 
 ```bash
-docker run -it --name pmsm_container jeet0003/my-app:v2 bash
+docker run -it --name pmsm_container jeet0003/my-app:v1 bash
 ```
 
 Inside the container:
