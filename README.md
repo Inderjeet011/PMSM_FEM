@@ -17,37 +17,33 @@ Transient **A–V** eddy-current models for PMSMs using **FEniCSx / DOLFINx**: o
 
 Use either of the following methods.
 
-### Method 1: Local Conda environment
+# Pull Python image
+docker pull python:3.10
 
-Install Miniconda:
+# Start container
+docker run -it python:3.10 bash
 
-```bash
+# Install Miniconda
 cd ~
+apt update && apt install -y wget
 wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 bash Miniconda3-latest-Linux-x86_64.sh
 source ~/.bashrc
 conda --version
-```
 
-Create and activate environment:
-
-```bash
+# Create and activate environment
 conda create -n pmsm -c conda-forge python=3.12
 conda activate pmsm
-```
 
-Install FEM dependencies:
-
-```bash
+# Install FEM dependencies
 conda install -c conda-forge fenics-dolfinx=0.10.0 fenics-basix=0.10.0 fenics-ufl=2025.2.1 petsc4py=3.24.3 mpi4py=4.1.1
 conda install -c conda-forge python-gmsh
-```
 
-Quick check:
-
-```bash
+# Verify installation
 python -c "import dolfinx, gmsh; print('OK')"
-```
+
+# (Optional) Save container as image
+docker commit <container_id> pmsm_env:v1
 
 ### Method 2: Docker workflow
 
