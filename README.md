@@ -14,7 +14,7 @@ Transient **A–V** eddy-current models for PMSMs using **FEniCSx / DOLFINx**: o
 **Outputs** (when `write_results` in `utils.make_config()`): `result.xdmf` / `result.h5`, plus VTX folders **`V.bp`**, **`J.bp`**, **`B.bp`** (motor-only B). New runs usually wipe prior outputs in that folder.
 
 
-### Method 2: Docker workflow
+### Method 1: Docker workflow
 Setup
 
 Use either of the following methods.
