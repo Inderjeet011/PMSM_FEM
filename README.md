@@ -39,9 +39,8 @@ bash Miniconda3-latest-Linux-x86_64.sh
 source ~/.bashrc
 conda --version
 ```
-
-```bash
 Create and activate environment
+```bash
 conda create -n pmsm -c conda-forge python=3.12
 conda activate pmsm
 ```
