@@ -1,99 +1,97 @@
-# ⚡ PMSM_FEM  
-Transient **A–V eddy-current simulations** for Permanent Magnet Synchronous Motors (PMSMs) using **FEniCSx / DOLFINx**
+# PMSM_FEM
 
----
+Transient **A–V** eddy-current models for PMSMs using **FEniCSx / DOLFINx**: one **2D** driver and three **3D** drivers (coil geometry / excitation differ).
 
-## 📌 Overview
+## Layout
 
-This project implements high-fidelity **finite element models (FEM)** for simulating **eddy currents and electromagnetic fields** in PMSMs using the **A–V formulation**.
+| Path | What it is |
+|------|------------|
+| `src/2d/` | 2D A–V (`Az`, `V`): `solve.py` |
+| `src/3d_volume_coils/` | 3D: **bulk `J_z`** (three-phase) in coil volumes |
+| `src/3d_loop_coils/` | 3D: **six loops**, **terminal voltages** |
+| `src/3d_rod_coils/` | 3D: **rod-style** coils, same voltage drive as loop |
 
-It supports both **2D and 3D transient simulations** with different coil modeling strategies.
+**Outputs** (when `write_results` in `utils.make_config()`): `result.xdmf` / `result.h5`, plus VTX folders **`V.bp`**, **`J.bp`**, **`B.bp`** (motor-only B). New runs usually wipe prior outputs in that folder.
 
----
+## Setup
 
-## 🧠 Key Features
+Use either of the following methods.
 
-- Transient **A–V formulation** (`A`, `V`)
-- 2D and multiple 3D configurations
-- Coil modeling:
-  - Volume current excitation
-  - Loop-based voltage excitation
-  - Rod-based coils
-- Configurable solver (time-stepping, PETSc)
-- MPI parallel support
-- ParaView-ready outputs
+### Method 1: Local Conda environment
 
----
-
-## 📁 Project Structure
-
-
-PMSM_FEM/
-│
-├── src/
-│ ├── 2d/
-│ ├── 3d_volume_coils/
-│ ├── 3d_loop_coils/
-│ ├── 3d_rod_coils/
-│
-└── requirements.txt
-
-
-
----
-
-## 🚀 Running the Project
-
-### ▶️ 3D Example
+Install Miniconda:
 
 ```bash
-cd src/3d_loop_coils
-python mesh.py --res 0.005 --depth 0.057
-python main.py
-
-Parallel Execution
-mpirun -np 4 python main.py
-
-📊 Outputs
-result.xdmf, result.h5
-V.bp, J.bp, B.bp
-
-
-⚙️ Setup Methods
-🐳 Method 1: Docker (Recommended)
-Pull image
-docker pull jeet0003/my-app:v2
-Run container
-docker run -it --name pmsm_container jeet0003/my-app:v2 bash
-Setup workspace
-mkdir -p /workspace
-cd /workspace
-Clone repo
-git clone https://github.com/Inderjeet011/PMSM_FEM.git
-cd PMSM_FEM
-Activate environment
-conda activate pmsm
-🧪 Method 2: Miniconda (Tested Working)
-Install Miniconda
 cd ~
 wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 bash Miniconda3-latest-Linux-x86_64.sh
 source ~/.bashrc
-
-Check:
-
 conda --version
-Create environment
+```
+
+Create and activate environment:
+
+```bash
 conda create -n pmsm -c conda-forge python=3.12
 conda activate pmsm
-Install DOLFINx stack
-conda install -c conda-forge \
-  fenics-dolfinx=0.10.0 \
-  fenics-basix=0.10.0 \
-  fenics-ufl=2025.2.1 \
-  petsc4py=3.24.3 \
-  mpi4py=4.1.1
-Install Gmsh
+```
+
+Install FEM dependencies:
+
+```bash
+conda install -c conda-forge fenics-dolfinx=0.10.0 fenics-basix=0.10.0 fenics-ufl=2025.2.1 petsc4py=3.24.3 mpi4py=4.1.1
 conda install -c conda-forge python-gmsh
-Verify
-python -c "import dolfinx, gmsh; print('Setup OK')"
+```
+
+Quick check:
+
+```bash
+python -c "import dolfinx, gmsh; print('OK')"
+```
+
+### Method 2: Docker workflow
+
+Pull image:
+
+```bash
+docker pull jeet0003/my-app:v2
+```
+
+Run container:
+
+```bash
+docker run -it --name pmsm_container jeet0003/my-app:v2 bash
+```
+
+Inside the container:
+
+```bash
+mkdir -p /workspace
+cd /workspace
+git clone https://github.com/Inderjeet011/PMSM_FEM.git
+cd PMSM_FEM
+conda activate pmsm
+python main.py
+```
+
+## Run
+
+Generate mesh and solver **from the case directory** (paths are relative to each `main.py`).
+
+```bash
+cd src/3d_loop_coils
+python mesh.py --res 0.005 --depth 0.057   # python mesh.py --help
+python main.py
+```
+
+```bash
+cd src/2d && python solve.py
+```
+
+**MPI:** `mpirun -np 4 python main.py` (same cwd as `mesh.xdmf`).
+
+## Config & files
+
+- **Tuning:** `utils.py` → `make_config()` (`dt`, `num_steps`, `V_amp` / currents, `write_results`, KSP, paths).
+- **Materials / tags:** `mesh.py` → `model_parameters`; **`load_mesh.setup_materials`**. Typical 3D: air, airgap, rotor (tags 4–5 may both map to rotor on old/new meshes), stator, coils ~7–12, PMs ~13–22 — confirm in each `mesh.py`.
+- **Per 3D folder:** `mesh.py`, `load_mesh.py`, `entity_map.py`, `forms.py`, `utils.py`, `main.py`.
