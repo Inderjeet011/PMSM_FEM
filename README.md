@@ -42,3 +42,46 @@ cd src/2d && python solve.py
 - **Tuning:** `utils.py` → `make_config()` (`dt`, `num_steps`, `V_amp` / currents, `write_results`, KSP, paths).
 - **Materials / tags:** `mesh.py` → `model_parameters`; **`load_mesh.setup_materials`**. Typical 3D: air, airgap, rotor (tags 4–5 may both map to rotor on old/new meshes), stator, coils ~7–12, PMs ~13–22 — confirm in each `mesh.py`.
 - **Per 3D folder:** `mesh.py`, `load_mesh.py`, `entity_map.py`, `forms.py`, `utils.py`, `main.py`.
+
+
+
+
+# PMSM FEM Docker Workflow
+
+## 1. Pull the Docker image
+
+```bash
+docker pull jeet0003/my-app:v2
+```
+
+## 2. Run the container
+
+```bash
+docker run -it --name pmsm_container jeet0003/my-app:v2 bash
+```
+
+## 3. Create and move to workspace
+
+```bash
+mkdir -p /workspace
+cd /workspace
+```
+
+## 4. Clone the repository
+
+```bash
+git clone https://github.com/Inderjeet011/PMSM_FEM.git
+cd PMSM_FEM
+```
+
+## 5. Activate conda environment
+
+```bash
+conda activate pmsm
+```
+
+## 6. Run the project
+
+```bash
+python main.py
+```
