@@ -54,7 +54,7 @@ python -c "import dolfinx, gmsh; print('OK')"
 Pull image:
 
 ```bash
-docker pull jeet0003/my-app:v2
+docker pull jeet0003/my-app:v1
 ```
 
 Run container:
