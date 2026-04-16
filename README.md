@@ -20,30 +20,41 @@ Setup
 Use either of the following methods.
 
 Pull Python image
+```bash
 docker pull python:3.10
+```
 
 Start container
+```bash
 docker run -it python:3.10 bash
+```
 
 Install Miniconda
+```bash
 cd ~
 apt update && apt install -y wget
 wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 bash Miniconda3-latest-Linux-x86_64.sh
 source ~/.bashrc
 conda --version
+```
 
+```bash
 Create and activate environment
 conda create -n pmsm -c conda-forge python=3.12
 conda activate pmsm
+```
 
 Install FEM dependencies
+```bash
 conda install -c conda-forge fenics-dolfinx=0.10.0 fenics-basix=0.10.0 fenics-ufl=2025.2.1 petsc4py=3.24.3 mpi4py=4.1.1
 conda install -c conda-forge python-gmsh
+```
 
 Verify installation
+```bash
 python -c "import dolfinx, gmsh; print('OK')"
-
+```
 
 ### Method 2: Docker workflow
 
