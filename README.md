@@ -63,8 +63,6 @@ cd /workspace
 git clone https://github.com/Inderjeet011/PMSM_FEM.git
 cd PMSM_FEM
 conda activate pmsm
-python mesh.py
-python main.py
 ```
 
 ### Method 2: Docker workflow
