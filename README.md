@@ -89,8 +89,6 @@ cd /workspace
 git clone https://github.com/Inderjeet011/PMSM_FEM.git
 cd PMSM_FEM
 conda activate pmsm
-python mesh.py
-python main.py
 ```
 
 ## Run
@@ -99,15 +97,13 @@ Generate mesh and solver **from the case directory** (paths are relative to each
 
 ```bash
 cd src/3d_loop_coils
-python mesh.py --res 0.005 --depth 0.057   # python mesh.py --help
+python mesh.py
 python main.py
 ```
 
 ```bash
 cd src/2d && python solve.py
 ```
-
-**MPI:** `mpirun -np 4 python main.py` (same cwd as `mesh.xdmf`).
 
 ## Config & files
 
