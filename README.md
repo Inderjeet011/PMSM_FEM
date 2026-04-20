@@ -99,9 +99,6 @@ python mesh.py
 python main.py
 ```
 
-```bash
-cd src/2d && python solve.py
-```
 
 ## Config & files
 
