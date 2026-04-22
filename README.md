@@ -110,11 +110,13 @@ Open these files in ParaView.
 
 ### ParaView tips
 
-- `result.xdmf` is the best starting point if you want the full solution history in one file. To get results out of this file you need to use slice function in paraview
-- `V.bp` and `J.bp` are useful when you want to inspect conductor-submesh quantities only.
-- `B.bp` is useful when you want a cleaner magnetic-field view on the motor region without the outer air box.
+- `result.xdmf` is the best starting point if you want the full solution history in one file.
+- `mesh.xdmf` can be opened in ParaView to inspect the mesh and visualize different regions by coloring or filtering with the cell-tag data.
+- `V.bp` stores the scalar electric potential `V` on the conductor submesh.
+- `J.bp` stores the current-density field `J` on the conductor submesh.
+- `B.bp` stores the magnetic flux density `B` on the motor-region mesh, which is useful when you want to view `B` without the outer air box.
 - After opening a time-dependent file, use the time controls in ParaView to step through timestamps.
-
+- 
 ## Config & files
 
 - **Tuning:** `utils.py` → `make_config()` (`dt`, `num_steps`, `V_amp` / currents, `write_results`, KSP, paths).
