@@ -116,7 +116,7 @@ Open these files in ParaView.
 - `J.bp` stores the current-density field `J` on the conductor submesh.
 - `B.bp` stores the magnetic flux density `B` on the motor-region mesh, which is useful when you want to view `B` without the outer air box.
 - After opening a time-dependent file, use the time controls in ParaView to step through timestamps.
-- 
+ 
 ## Config & files
 
 - **Tuning:** `utils.py` → `make_config()` (`dt`, `num_steps`, `V_amp` / currents, `write_results`, KSP, paths).
