@@ -110,7 +110,7 @@ Open these files in ParaView.
 
 ### ParaView tips
 
-- `result.xdmf` is the best starting point if you want the full solution history in one file.
+- `result.xdmf` is the best starting point if you want the full solution history in one file. To get results out of this file you need to use slice function in paraview
 - `V.bp` and `J.bp` are useful when you want to inspect conductor-submesh quantities only.
 - `B.bp` is useful when you want a cleaner magnetic-field view on the motor region without the outer air box.
 - After opening a time-dependent file, use the time controls in ParaView to step through timestamps.
